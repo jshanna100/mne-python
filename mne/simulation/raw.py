@@ -67,7 +67,7 @@ def simulate_raw(raw, stc, trans, src, bem, cov='simple',
                  blink=False, ecg=False, chpi=False, head_pos=None,
                  mindist=1.0, interp='cos2', iir_filter=None, n_jobs=1,
                  random_state=None, use_cps=True, forward=None,
-                 duration=None, verbose=None):
+                 duration=None, ref_meg=False, verbose=None):
     u"""Simulate raw data.
 
     Head movements can optionally be simulated using the ``head_pos``
@@ -146,6 +146,7 @@ def simulate_raw(raw, stc, trans, src, bem, cov='simple',
         The duration to simulate. Can be None to use the duration of ``raw``.
         Must be supplied if ``raw`` is an instance of :class:`mne.Info`.
 
+    ref_meg : make use of reference channels in forward model
         .. versionadded:: 0.18
     %(verbose)s
 
@@ -306,7 +307,7 @@ def simulate_raw(raw, stc, trans, src, bem, cov='simple',
                 % (approx_events, _pl(approx_events)))
 
     # Extract necessary info
-    meeg_picks = pick_types(info, meg=True, eeg=True, exclude=[])  # for sim
+    meeg_picks = pick_types(info, meg=True, eeg=True, ref_meg=ref_meg, exclude=[])  # for sim
     meg_picks = pick_types(info, meg=True, eeg=False, exclude=[])  # for CHPI
     fwd_info = pick_info(info, meeg_picks)
     fwd_info.update(projs=[], bads=[])  # Ensure no 'projs' or 'bads'
@@ -419,7 +420,7 @@ def simulate_raw(raw, stc, trans, src, bem, cov='simple',
     for fi, (fwd, fwd_blink, fwd_ecg, fwd_chpi) in \
         enumerate(_iter_forward_solutions(
             fwd_info, trans, src, bem, exg_bem, dev_head_ts, mindist,
-            hpi_rrs, blink_rrs, ecg_rr, n_jobs, forward)):
+            hpi_rrs, blink_rrs, ecg_rr, n_jobs, forward, ref_meg=ref_meg)):
         # must be fixed orientation
         # XXX eventually we could speed this up by allowing the forward
         # solution code to only compute the normal direction
@@ -506,14 +507,14 @@ def simulate_raw(raw, stc, trans, src, bem, cov='simple',
 
 def _iter_forward_solutions(info, trans, src, bem, exg_bem, dev_head_ts,
                             mindist, hpi_rrs, blink_rrs, ecg_rrs, n_jobs,
-                            forward):
+                            forward, ref_meg=False):
     """Calculate a forward solution for a subject."""
     logger.info('Setting up forward solutions')
     mri_head_t, trans = _get_trans(trans)
     megcoils, meg_info, compcoils, megnames, eegels, eegnames, rr, info, \
         update_kwargs, bem = _prepare_for_forward(
             src, mri_head_t, info, bem, mindist, n_jobs, allow_bem_none=True,
-            verbose=False)
+            ref_meg=ref_meg, verbose=False)
     del (src, mindist)
 
     if forward is None:

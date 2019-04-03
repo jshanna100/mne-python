@@ -6,7 +6,7 @@
 
 import numpy as np
 
-from ..source_estimate import SourceEstimate, VolSourceEstimate
+from ..source_estimate import SourceEstimate, VolSourceEstimate, MixedSourceEstimate
 from ..source_space import _ensure_src
 from ..utils import check_random_state, warn, _check_option
 
@@ -208,7 +208,12 @@ def simulate_sparse_stc(src, n_dipoles, times,
 
     tmin, tstep = times[0], np.diff(times[:2])[0]
     assert datas.shape == data.shape
-    cls = SourceEstimate if len(vs) == 2 else VolSourceEstimate
+    if len(vs) == 1:
+        cls = VolSourceEstimate
+    elif len(vs) == 2:
+        cls = SourceEstimate
+    else:
+        cls = MixedSourceEstimate
     stc = cls(datas, vertices=vs, tmin=tmin, tstep=tstep, subject=subject)
     return stc
 

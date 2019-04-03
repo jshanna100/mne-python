@@ -259,7 +259,7 @@ def _setup_bem(bem, bem_extra, neeg, mri_head_t, allow_none=False,
 @verbose
 def _prep_meg_channels(info, accurate=True, exclude=(), ignore_ref=False,
                        head_frame=True, do_es=False, do_picking=True,
-                       verbose=None):
+                       ref_meg=False, verbose=None):
     """Prepare MEG coil definitions for forward calculation.
 
     Parameters
@@ -280,6 +280,9 @@ def _prep_meg_channels(info, accurate=True, exclude=(), ignore_ref=False,
         If True, compute and store ex, ey, ez, and r0_exey.
     do_picking : bool
         If True, pick info and return it.
+
+    ref_meg : bool
+        Include reference channels with data channels
     %(verbose)s
 
     Returns
@@ -298,7 +301,7 @@ def _prep_meg_channels(info, accurate=True, exclude=(), ignore_ref=False,
     megnames, megcoils, compcoils = [], [], []
 
     # Find MEG channels
-    picks = pick_types(info, meg=True, eeg=False, ref_meg=False,
+    picks = pick_types(info, meg=True, eeg=False, ref_meg=ref_meg,
                        exclude=exclude)
 
     # Make sure MEG coils exist
@@ -413,7 +416,8 @@ def _prep_eeg_channels(info, exclude=(), verbose=None):
 def _prepare_for_forward(src, mri_head_t, info, bem, mindist, n_jobs,
                          bem_extra='', trans='', info_extra='',
                          meg=True, eeg=True, ignore_ref=False,
-                         allow_bem_none=False, verbose=None):
+                         allow_bem_none=False, verbose=None,
+                         ref_meg=False, src_filt=True):
     """Prepare for forward computation."""
     # Read the source locations
     logger.info('')
@@ -453,7 +457,7 @@ def _prepare_for_forward(src, mri_head_t, info, bem, mindist, n_jobs,
 
     if meg and len(pick_types(info, ref_meg=False, exclude=[])) > 0:
         megcoils, compcoils, megnames, meg_info = \
-            _prep_meg_channels(info, ignore_ref=ignore_ref)
+            _prep_meg_channels(info, ignore_ref=ignore_ref, ref_meg=ref_meg)
     if eeg and len(pick_types(info, meg=False, eeg=True, ref_meg=False,
                               exclude=[])) > 0:
         eegels, eegnames = _prep_eeg_channels(info)
@@ -463,7 +467,7 @@ def _prepare_for_forward(src, mri_head_t, info, bem, mindist, n_jobs,
         raise RuntimeError('No MEG or EEG channels found.')
 
     # pick out final info
-    info = pick_info(info, pick_types(info, meg=meg, eeg=eeg, ref_meg=False,
+    info = pick_info(info, pick_types(info, meg=meg, eeg=eeg, ref_meg=ref_meg,
                                       exclude=[]))
 
     # Transform the source spaces into the appropriate coordinates
@@ -478,7 +482,7 @@ def _prepare_for_forward(src, mri_head_t, info, bem, mindist, n_jobs,
                      allow_none=allow_bem_none)
 
     # Circumvent numerical problems by excluding points too close to the skull
-    if bem is not None and not bem['is_sphere']:
+    if bem is not None and not bem['is_sphere'] and src_filt:
         inner_skull = _bem_find_surface(bem, 'inner_skull')
         _filter_source_spaces(inner_skull, mindist, mri_head_t, src, n_jobs)
         logger.info('')
@@ -493,6 +497,7 @@ def _prepare_for_forward(src, mri_head_t, info, bem, mindist, n_jobs,
     update_kwargs = dict(nchan=len(info['ch_names']), nsource=len(rr),
                          info=info, src=src, source_nn=source_nn,
                          source_rr=rr, surf_ori=False, mri_head_t=mri_head_t)
+
     return megcoils, meg_info, compcoils, megnames, eegels, eegnames, rr, \
         info, update_kwargs, bem
 
@@ -500,7 +505,7 @@ def _prepare_for_forward(src, mri_head_t, info, bem, mindist, n_jobs,
 @verbose
 def make_forward_solution(info, trans, src, bem, meg=True, eeg=True,
                           mindist=0.0, ignore_ref=False, n_jobs=1,
-                          verbose=None):
+                          src_filt=True, ref_meg=False, verbose=None):
     """Calculate a forward solution for a subject.
 
     Parameters
@@ -534,6 +539,11 @@ def make_forward_solution(info, trans, src, bem, meg=True, eeg=True,
         with reference channels is not currently supported.
     n_jobs : int
         Number of jobs to run in parallel.
+
+    src_filt: bool
+        Filter points not laying on head.
+    ref_meg: bool
+        Calculate forward solution for reference channels
     %(verbose)s
 
     Returns
@@ -592,7 +602,8 @@ def make_forward_solution(info, trans, src, bem, meg=True, eeg=True,
     megcoils, meg_info, compcoils, megnames, eegels, eegnames, rr, info, \
         update_kwargs, bem = _prepare_for_forward(
             src, mri_head_t, info, bem, mindist, n_jobs, bem_extra, trans,
-            info_extra, meg, eeg, ignore_ref)
+            info_extra, meg, eeg, ignore_ref, src_filt=src_filt,
+            ref_meg=ref_meg)
     del (src, mri_head_t, trans, info_extra, bem_extra, mindist,
          meg, eeg, ignore_ref)
 
