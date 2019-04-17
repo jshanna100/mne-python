@@ -217,7 +217,6 @@ def simulate_sparse_stc(src, n_dipoles, times,
     stc = cls(datas, vertices=vs, tmin=tmin, tstep=tstep, subject=subject)
     return stc
 
-
 def simulate_stc(src, labels, stc_data, tmin, tstep, value_fun=None):
     """Simulate sources time courses from waveforms and labels.
 
