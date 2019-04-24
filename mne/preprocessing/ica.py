@@ -34,7 +34,7 @@ from ..io.tree import dir_tree_find
 from ..io.open import fiff_open
 from ..io.tag import read_tag
 from ..io.meas_info import write_meas_info, read_meas_info
-from ..io.constants import Bunch, FIFF
+from ..io.constants import FIFF
 from ..io.base import BaseRaw
 from ..epochs import BaseEpochs
 from ..viz import (plot_ica_components, plot_ica_scores,
@@ -47,9 +47,9 @@ from ..io.write import start_file, end_file, write_id
 from ..utils import (check_version, logger, check_fname, verbose,
                      _reject_data_segments, check_random_state, _validate_type,
                      compute_corr, _get_inst_data, _ensure_int,
-                     copy_function_doc_to_method_doc, _pl, warn,
+                     copy_function_doc_to_method_doc, _pl, warn, Bunch,
                      _check_preload, _check_compensation_grade, fill_doc,
-                     _check_option)
+                     _check_option, _PCA)
 from ..utils.check import _check_all_same_channel_names
 
 from ..fixes import _get_args
@@ -313,9 +313,9 @@ class ICA(ContainsMixin):
                  "in 0.19. If you want to use Extended Infomax, specify "
                  "method='infomax' together with "
                  "fit_params=dict(extended=True).", DeprecationWarning)
-        if not check_version('sklearn', '0.15'):
-            raise RuntimeError('the scikit-learn package (version >= 0.15) '
-                               'is required for ICA')
+        if method == 'fastica' and not check_version('sklearn', '0.15'):
+            raise RuntimeError('The scikit-learn package (version >= 0.15) '
+                               'is required for FastICA.')
 
         self.noise_cov = noise_cov
 
@@ -609,14 +609,7 @@ class ICA(ContainsMixin):
     def _fit(self, data, max_pca_components, fit_type):
         """Aux function."""
         random_state = check_random_state(self.random_state)
-
-        from sklearn.decomposition import PCA
-        if not check_version('sklearn', '0.18'):
-            pca = PCA(n_components=max_pca_components, whiten=True, copy=True)
-        else:
-            pca = PCA(n_components=max_pca_components, whiten=True, copy=True,
-                      svd_solver='full')
-
+        pca = _PCA(n_components=max_pca_components, whiten=True)
         data = pca.fit_transform(data.T)
 
         if isinstance(self.n_components, float):
@@ -644,10 +637,6 @@ class ICA(ContainsMixin):
         self.pca_mean_ = pca.mean_
         self.pca_components_ = pca.components_
         self.pca_explained_variance_ = exp_var = pca.explained_variance_
-        if not check_version('sklearn', '0.16'):
-            # sklearn < 0.16 did not apply whitening to the components, so we
-            # need to do this manually
-            self.pca_components_ *= np.sqrt(exp_var[:, None])
         del pca
         # update number of components
         self.n_components_ = sel.stop

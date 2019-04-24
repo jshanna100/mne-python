@@ -12,9 +12,8 @@ import collections
 
 import numpy as np
 
-from .utils import _pl, check_fname, _validate_type, verbose, warn, logger
-from .utils import _check_pandas_installed
-from .utils import _Counter as Counter
+from .utils import (_pl, check_fname, _validate_type, verbose, warn, logger,
+                    _check_pandas_installed, _Counter, _mask_to_onsets_offsets)
 from .io.write import (start_block, end_block, write_float, write_name_list,
                        write_double, start_file)
 from .io.constants import FIFF
@@ -508,21 +507,6 @@ def _annotations_starts_stops(raw, kinds, name='unknown', invert=False):
     return onsets, ends
 
 
-def _mask_to_onsets_offsets(mask):
-    """Group boolean mask into contiguous onset:offset pairs."""
-    assert mask.dtype == bool and mask.ndim == 1
-    mask = mask.astype(int)
-    diff = np.diff(mask)
-    onsets = np.where(diff > 0)[0] + 1
-    if mask[0]:
-        onsets = np.concatenate([[0], onsets])
-    offsets = np.where(diff < 0)[0] + 1
-    if mask[-1]:
-        offsets = np.concatenate([offsets, [len(mask)]])
-    assert len(onsets) == len(offsets)
-    return onsets, offsets
-
-
 def _write_annotations(fid, annotations):
     """Write annotations."""
     start_block(fid, FIFF.FIFFB_MNE_ANNOTATIONS)
@@ -591,10 +575,17 @@ def read_annotations(fname, sfreq='auto', uint16_codec=None):
     -------
     annot : instance of Annotations | None
         The annotations.
+
+    Notes
+    -----
+    The annotations stored in a .csv require the onset columns to be
+    timestamps. If you have onsets as floats (in seconds), you should use the
+    .txt extension.
     """
     from .io.brainvision.brainvision import _read_annotations_brainvision
     from .io.eeglab.eeglab import _read_annotations_eeglab
     from .io.edf.edf import _read_annotations_edf
+    from .io.cnt.cnt import _read_annotations_cnt
 
     name = op.basename(fname)
     if name.endswith(('fif', 'fif.gz')):
@@ -614,6 +605,9 @@ def read_annotations(fname, sfreq='auto', uint16_codec=None):
 
     elif name.endswith('csv'):
         annotations = _read_annotations_csv(fname)
+
+    elif name.endswith('cnt'):
+        annotations = _read_annotations_cnt(fname)
 
     elif name.endswith('set'):
         annotations = _read_annotations_eeglab(fname,
@@ -660,6 +654,14 @@ def _read_annotations_csv(fname):
     description = df['description'].values
     if orig_time == 0:
         orig_time = None
+
+    if onset_dt.unique().size != onset.unique().size:
+        warn("The number of onsets in the '.csv' file (%d) does not match "
+             "the number of onsets in the Annotations created (%d). If "
+             "this happens because you did not encode your onsets as "
+             "timestamps you should save your files as '.txt'." %
+             (onset_dt.unique().size, onset.unique().size))
+
     return Annotations(onset, duration, description, orig_time)
 
 
@@ -777,7 +779,7 @@ def _select_annotations_based_on_description(descriptions, event_id, regexp):
     regexp_comp = re.compile('.*' if regexp is None else regexp)
 
     if event_id is None:
-        event_id = Counter()
+        event_id = _Counter()
 
     event_id_ = dict()
     dropped = []

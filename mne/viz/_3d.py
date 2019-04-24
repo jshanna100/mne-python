@@ -26,8 +26,8 @@ from ..fixes import einsum, _crop_colorbar
 from ..io import _loc_to_coil_trans
 from ..io.pick import pick_types
 from ..io.constants import FIFF
-from ..io.meas_info import read_fiducials
-from ..source_space import SourceSpaces, _create_surf_spacing, _check_spacing
+from ..io.meas_info import read_fiducials, create_info
+from ..source_space import _ensure_src, _create_surf_spacing, _check_spacing
 
 from ..surface import (get_meg_helmet_surf, read_surface,
                        transform_surface_to, _project_onto_surface,
@@ -37,7 +37,7 @@ from ..transforms import (read_trans, _find_trans, apply_trans, rot_to_quat,
                           combine_transforms, _get_trans, _ensure_trans,
                           invert_transform, Transform)
 from ..utils import (get_subjects_dir, logger, _check_subject, verbose, warn,
-                     SilenceStdout, has_nibabel, check_version,
+                     has_nibabel, check_version,
                      _ensure_int, _validate_type, _check_option)
 from .utils import (mne_analyze_colormap, _prepare_trellis, _get_color_list,
                     plt_show, tight_layout, figure_nobar, _check_time_unit)
@@ -382,27 +382,22 @@ def plot_evoked_field(evoked, surf_maps, time=None, time_label='t = %0.0f ms',
         # Make a solid surface
         vlim = np.max(np.abs(data))
         alpha = alphas[ii]
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.surface(surface=surf, color=colors[ii],
-                             opacity=alpha)
+        renderer.surface(surface=surf, color=colors[ii],
+                         opacity=alpha)
 
         # Now show our field pattern
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.surface(surface=surf, vmin=-vlim, vmax=vlim,
-                             scalars=data, colormap=colormap)
+        renderer.surface(surface=surf, vmin=-vlim, vmax=vlim,
+                         scalars=data, colormap=colormap)
 
         # And the field lines on top
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.contour(surface=surf, scalars=data, contours=21,
-                             vmin=-vlim, vmax=vlim, opacity=alpha,
-                             colormap=colormap_lines)
+        renderer.contour(surface=surf, scalars=data, contours=21,
+                         vmin=-vlim, vmax=vlim, opacity=alpha,
+                         colormap=colormap_lines)
 
     if '%' in time_label:
         time_label %= (1e3 * evoked.times[time_idx])
-    with warnings.catch_warnings(record=True):  # traits
-        renderer.text(x=0.01, y=0.01, text=time_label, width=0.4)
-        with SilenceStdout():  # setting roll
-            renderer.set_camera(azimuth=10, elevation=60)
+    renderer.text(x=0.01, y=0.01, text=time_label, width=0.4)
+    renderer.set_camera(azimuth=10, elevation=60)
     renderer.show()
     return renderer.scene()
 
@@ -524,7 +519,7 @@ def _plot_mri_contours(mri_fname, surf_fnames, orientation='coronal',
 
 
 @verbose
-def plot_alignment(info, trans=None, subject=None, subjects_dir=None,
+def plot_alignment(info=None, trans=None, subject=None, subjects_dir=None,
                    surfaces='head', coord_frame='head',
                    meg=None, eeg='original',
                    dig=False, ecog=True, src=None, mri_fiducials=False,
@@ -534,8 +529,9 @@ def plot_alignment(info, trans=None, subject=None, subjects_dir=None,
 
     Parameters
     ----------
-    info : dict
+    info : dict | None
         The measurement info.
+        If None (default), no sensor information will be shown.
     trans : str | 'auto' | dict | None
         The full path to the head<->MRI transform ``*-trans.fif`` file
         produced during coregistration. If trans is None, an identity matrix
@@ -669,6 +665,7 @@ def plot_alignment(info, trans=None, subject=None, subjects_dir=None,
         raise ValueError('eeg must only contain "original" and '
                          '"projected", got %s' % (eeg,))
 
+    info = create_info(1, 1000., 'misc') if info is None else info
     _validate_type(info, "info")
 
     if isinstance(surfaces, str):
@@ -686,9 +683,7 @@ def plot_alignment(info, trans=None, subject=None, subjects_dir=None,
 
     _check_option('coord_frame', coord_frame, ['head', 'meg', 'mri'])
     if src is not None:
-        if not isinstance(src, SourceSpaces):
-            raise TypeError('src must be None or SourceSpaces, got %s'
-                            % (type(src),))
+        src = _ensure_src(src)
         src_subject = src[0].get('subject_his_id', None)
         subject = src_subject if subject is None else subject
         if src_subject is not None and subject != src_subject:
@@ -1031,10 +1026,9 @@ def plot_alignment(info, trans=None, subject=None, subjects_dir=None,
                   rh=(0.5,) * 3)
     colors.update(skull_colors)
     for key, surf in surfs.items():
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.surface(surface=surf, color=colors[key],
-                             opacity=alphas[key],
-                             backface_culling=(key != 'helmet'))
+        renderer.surface(surface=surf, color=colors[key],
+                         opacity=alphas[key],
+                         backface_culling=(key != 'helmet'))
     if brain and 'lh' not in surfs:  # one layer sphere
         assert bem['coord_frame'] == FIFF.FIFFV_COORD_HEAD
         center = bem['r0'].copy()
@@ -1086,38 +1080,33 @@ def plot_alignment(info, trans=None, subject=None, subjects_dir=None,
 
     for data, color, alpha, scale in zip(datas, colors, alphas, scales):
         if len(data) > 0:
-            with warnings.catch_warnings(record=True):  # traits
-                renderer.sphere(center=data, color=color, scale=scale,
-                                opacity=alpha, backface_culling=True)
+            renderer.sphere(center=data, color=color, scale=scale,
+                            opacity=alpha, backface_culling=True)
     if len(eegp_loc) > 0:
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.quiver3d(
-                x=eegp_loc[:, 0], y=eegp_loc[:, 1], z=eegp_loc[:, 2],
-                u=eegp_nn[:, 0], v=eegp_nn[:, 1], w=eegp_nn[:, 2],
-                color=defaults['eegp_color'], mode='cylinder',
-                scale=defaults['eegp_scale'], opacity=0.6,
-                glyph_height=defaults['eegp_height'],
-                glyph_center=(0., -defaults['eegp_height'], 0),
-                glyph_resolution=20,
-                backface_culling=True)
+        renderer.quiver3d(
+            x=eegp_loc[:, 0], y=eegp_loc[:, 1], z=eegp_loc[:, 2],
+            u=eegp_nn[:, 0], v=eegp_nn[:, 1], w=eegp_nn[:, 2],
+            color=defaults['eegp_color'], mode='cylinder',
+            scale=defaults['eegp_scale'], opacity=0.6,
+            glyph_height=defaults['eegp_height'],
+            glyph_center=(0., -defaults['eegp_height'], 0),
+            glyph_resolution=20,
+            backface_culling=True)
     if len(meg_rrs) > 0:
         color, alpha = (0., 0.25, 0.5), 0.25
         surf = dict(rr=meg_rrs, tris=meg_tris)
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.surface(surface=surf, color=color,
-                             opacity=alpha, backface_culling=True)
+        renderer.surface(surface=surf, color=color,
+                         opacity=alpha, backface_culling=True)
     if len(src_rr) > 0:
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.quiver3d(
-                x=src_rr[:, 0], y=src_rr[:, 1], z=src_rr[:, 2],
-                u=src_nn[:, 0], v=src_nn[:, 1], w=src_nn[:, 2],
-                color=(1., 1., 0.), mode='cylinder', scale=3e-3,
-                opacity=0.75, glyph_height=0.25,
-                glyph_center=(0., 0., 0.), glyph_resolution=20,
-                backface_culling=True)
-    with SilenceStdout():
-        renderer.set_camera(azimuth=90, elevation=90,
-                            focalpoint=(0., 0., 0.), distance=0.6)
+        renderer.quiver3d(
+            x=src_rr[:, 0], y=src_rr[:, 1], z=src_rr[:, 2],
+            u=src_nn[:, 0], v=src_nn[:, 1], w=src_nn[:, 2],
+            color=(1., 1., 0.), mode='cylinder', scale=3e-3,
+            opacity=0.75, glyph_height=0.25,
+            glyph_center=(0., 0., 0.), glyph_resolution=20,
+            backface_culling=True)
+    renderer.set_camera(azimuth=90, elevation=90,
+                        focalpoint=(0., 0., 0.), distance=0.6)
     renderer.show()
     return renderer.scene()
 
@@ -2339,12 +2328,11 @@ def plot_sparse_source_estimates(src, stcs, colors=None, linewidth=2,
     color_converter = ColorConverter()
 
     renderer = _Renderer(bgcolor=bgcolor, size=(600, 600), name=fig_name)
-    with warnings.catch_warnings(record=True):  # traits warnings
-        surface = renderer.mesh(x=points[:, 0], y=points[:, 1],
-                                z=points[:, 2], triangles=use_faces,
-                                color=brain_color, opacity=opacity,
-                                backface_culling=True, shading=True,
-                                **kwargs)
+    surface = renderer.mesh(x=points[:, 0], y=points[:, 1],
+                            z=points[:, 2], triangles=use_faces,
+                            color=brain_color, opacity=opacity,
+                            backface_culling=True, shading=True,
+                            **kwargs)
 
     # Show time courses
     fig = plt.figure(fig_number)
@@ -2379,10 +2367,9 @@ def plot_sparse_source_estimates(src, stcs, colors=None, linewidth=2,
 
         x, y, z = points[v]
         nx, ny, nz = normals[v]
-        with warnings.catch_warnings(record=True):  # traits
-            renderer.quiver3d(x=x, y=y, z=z, u=nx, v=ny, w=nz,
-                              color=color_converter.to_rgb(c),
-                              mode=mode, scale=scale_factor)
+        renderer.quiver3d(x=x, y=y, z=z, u=nx, v=ny, w=nz,
+                          color=color_converter.to_rgb(c),
+                          mode=mode, scale=scale_factor)
 
         for k in ind:
             vertno = vertnos[k]
@@ -2520,7 +2507,13 @@ def snapshot_brain_montage(fig, montage, hide_sensors=True):
     from .. import Info
     # Update the backend
     from .backends.renderer import _Renderer
+    from .backends.renderer import get_3d_backend
 
+    if get_3d_backend() == 'vtki':
+        raise RuntimeError('This feature is not available yet with VTKI')
+
+    if fig is None:
+        raise ValueError('The figure must have a scene')
     if isinstance(montage, (Montage, DigMontage)):
         chs = montage.dig_ch_pos
         ch_names, xyz = zip(*[(ich, ixyz) for ich, ixyz in chs.items()])
@@ -2543,8 +2536,7 @@ def snapshot_brain_montage(fig, montage, hide_sensors=True):
     if hide_sensors is True:
         proj.visible(False)
 
-    with warnings.catch_warnings(record=True):
-        im = renderer.screenshot()
+    im = renderer.screenshot()
     proj.visible(True)
     return proj.xy, im
 

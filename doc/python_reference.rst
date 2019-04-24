@@ -141,6 +141,7 @@ File I/O
    write_trans
    io.read_info
    io.show_fiff
+   io.DigPoint
 
 Base class:
 
@@ -182,6 +183,7 @@ Datasets
    brainstorm.bst_raw.data_path
    eegbci.load_data
    fetch_aparc_sub_parcellation
+   fetch_fsaverage
    fetch_hcp_mmp_parcellation
    hf_sef.data_path
    kiloword.data_path
@@ -262,6 +264,9 @@ Visualization
    plot_alignment
    snapshot_brain_montage
    plot_arrowmap
+   set_3d_backend
+   get_3d_backend
+   use_3d_backend
 
 
 Preprocessing
@@ -333,8 +338,10 @@ Projections:
    ica_find_ecg_events
    ica_find_eog_events
    infomax
+   mark_flat
    maxwell_filter
    oversampled_temporal_projection
+   peak_finder
    read_ica
    run_ica
    corrmap
@@ -434,6 +441,7 @@ Events
    :toctree: generated/
 
    define_target_events
+   shift_time_events
 
 :py:mod:`mne.epochs`:
 
@@ -945,10 +953,12 @@ Realtime
 .. autosummary::
    :toctree: generated/
 
+   FieldTripClient
+   LSLClient
+   MockLSLStream
+   MockRtClient
    RtEpochs
    RtClient
-   MockRtClient
-   FieldTripClient
    StimServer
    StimClient
 

@@ -8,7 +8,6 @@ trigger:
 
 jobs:
 - job: Windows
-  condition: not(or(contains(variables['Build.SourceVersionMessage'], '[ci skip]'), contains(variables['Build.SourceVersionMessage'], '[skip azp]')))
   pool:
     vmIMage: 'VS2017-Win2016'
   variables:
@@ -43,9 +42,17 @@ jobs:
       Set-StrictMode -Version Latest
       $ErrorActionPreference = "Stop"
       $PSDefaultParameterValues['*:ErrorAction']='Stop'
+      git clone --depth 1 git://github.com/vtkiorg/gl-ci-helpers.git
+      powershell gl-ci-helpers/appveyor/install_opengl.ps1
+    displayName: Install OpenGL
+  - powershell: |
+      Set-StrictMode -Version Latest
+      $ErrorActionPreference = "Stop"
+      $PSDefaultParameterValues['*:ErrorAction']='Stop'
       pip install --upgrade numpy scipy vtk
       pip install --upgrade -r requirements.txt
       pip install $env:PIP_DEPENDENCIES
+      pip install pylsl
     condition: eq(variables['TEST_MODE'], 'pip')
     displayName: 'Install dependencies with pip'
   - powershell: |
@@ -57,6 +64,7 @@ jobs:
       powershell ci-helpers/appveyor/install-miniconda.ps1
       $env:PATH = $env:PYTHON + "\envs\test;" + $env:PYTHON + "\envs\test\Scripts;" + $env:PYTHON + ";" + $env:PYTHON + "\Scripts;" + $env:PATH
       pip uninstall -yq mne
+      pip install pylsl
       Write-Host ("##vso[task.setvariable variable=PATH]" + $env:PATH)
     condition: eq(variables['TEST_MODE'], 'conda')
     displayName: 'Install dependencies with conda'

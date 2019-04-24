@@ -69,10 +69,15 @@ def _fig_to_img(fig, image_format='png', scale=None, **kwargs):
         try:
             mlab = _import_mlab()
         # on some systems importing Mayavi raises SystemExit (!)
-        except Exception as e:
-            warn('Could not import mayavi (%r). Trying to render'
-                 '`mayavi.core.api.Scene` figure instances'
-                 ' will throw an error.' % (e,))
+        except Exception:
+            is_mayavi = False
+        else:
+            import mayavi
+            is_mayavi = isinstance(fig, mayavi.core.scene.Scene)
+        if not is_mayavi:
+            raise TypeError('Each fig must be a matplotlib Figure, mayavi '
+                            'Scene, or NumPy ndarray, got %s (type %s)'
+                            % (fig, type(fig)))
         if fig.scene is not None:
             img = mlab.screenshot(figure=fig)
         else:  # Testing mode
@@ -510,7 +515,7 @@ def _build_html_slider(slices_range, slides_klass, slider_id,
 
 header_template = Template(u"""
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="{{lang}}">
 <head>
 {{include}}
 <script type="text/javascript">
@@ -886,6 +891,7 @@ class Report(object):
         self.html = []
         self.fnames = []  # List of file names rendered
         self.sections = []  # List of sections
+        self.lang = 'en-us'  # language setting for the HTML file
         self._sectionlabels = []  # Section labels
         self._sectionvars = {}  # Section variable names in js
         # boolean to specify if sections should be ordered in natural
@@ -1315,7 +1321,7 @@ class Report(object):
         slider_klass = sectionvar
 
         self._add_or_replace(
-            '%s-#-%s-#-custom' % (section, sectionvar), sectionvar,
+            '%s-#-%s-#-custom' % (title, sectionvar), sectionvar,
             slider_full_template.substitute(id=global_id, title=title,
                                             div_klass=slider_klass,
                                             slider_id=slider_id, html=html,
@@ -1498,7 +1504,7 @@ class Report(object):
                  '_sectionlabels', 'sections', '_sectionvars',
                  '_sort_sections', 'subjects_dir', 'subject', 'title',
                  'verbose'],
-                ['data_path', '_sort'])
+                ['data_path', 'lang', '_sort'])
 
     def __getstate__(self):
         """Get the state of the report as a dictionary."""
@@ -1681,10 +1687,10 @@ class Report(object):
         self.fnames = fnames
         self._sectionlabels = sectionlabels
 
-        html_header = header_template.substitute(title=self.title,
-                                                 include=self.include,
-                                                 sections=self.sections,
-                                                 sectionvars=self._sectionvars)
+        lang = getattr(self, 'lang', 'en-us')
+        html_header = header_template.substitute(
+            title=self.title, include=self.include, lang=lang,
+            sections=self.sections, sectionvars=self._sectionvars)
         self.html.insert(0, html_header)  # Insert header at position 0
         self.html.insert(1, html_toc)  # insert TOC
 

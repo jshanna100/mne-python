@@ -20,9 +20,8 @@ from mne import create_info, read_annotations, events_from_annotations
 from mne import Epochs, Annotations
 from mne.utils import (run_tests_if_main, _TempDir, requires_version,
                        catch_logging)
-from mne.utils.testing import assert_and_remove_boundary_annot
+from mne.utils import assert_and_remove_boundary_annot, _raw_annot
 from mne.io import read_raw_fif, RawArray, concatenate_raws
-from mne.io.tests.test_raw import _raw_annot
 from mne.annotations import _sync_onset, _handle_meas_date
 from mne.annotations import _read_annotations_txt_parse_header
 from mne.datasets import testing
@@ -97,6 +96,18 @@ def test_basics():
                        [1.5, .5, .5, .5, .5, .5, .5])
     assert_array_equal(raw.annotations.description,
                        ['y', 'x', 'x', 'x', 'x', 'x', 'x'])
+
+    # These three things should be equivalent
+    expected_orig_time = (raw.info['meas_date'][0] +
+                          raw.info['meas_date'][1] / 1000000)
+    for empty_annot in (
+            Annotations([], [], [], expected_orig_time),
+            Annotations([], [], [], None),
+            None):
+        raw.set_annotations(empty_annot)
+        assert isinstance(raw.annotations, Annotations)
+        assert len(raw.annotations) == 0
+        assert raw.annotations.orig_time == expected_orig_time
 
 
 def test_crop():
@@ -675,8 +686,22 @@ def dummy_annotation_csv_file(tmpdir_factory):
     return fname
 
 
+@pytest.fixture(scope='session')
+def dummy_broken_annotation_csv_file(tmpdir_factory):
+    """Create csv file for testing."""
+    content = ("onset,duration,description\n"
+               "1.,1.0,AA\n"
+               "3.,2.425,BB")
+
+    fname = tmpdir_factory.mktemp('data').join('annotations_broken.csv')
+    fname.write(content)
+    return fname
+
+
 @requires_version('pandas', '0.16')
-def test_io_annotation_csv(dummy_annotation_csv_file, tmpdir_factory):
+def test_io_annotation_csv(dummy_annotation_csv_file,
+                           dummy_broken_annotation_csv_file,
+                           tmpdir_factory):
     """Test CSV input/output."""
     annot = read_annotations(str(dummy_annotation_csv_file))
     assert annot.orig_time == 1038942071.7201
@@ -695,6 +720,10 @@ def test_io_annotation_csv(dummy_annotation_csv_file, tmpdir_factory):
     annot.save(fname)
     annot2 = read_annotations(fname)
     _assert_annotations_equal(annot, annot2)
+
+    # Test broken .csv that does not use timestamps
+    with pytest.warns(RuntimeWarning, match='The number of onsets in the'):
+        annot2 = read_annotations(str(dummy_broken_annotation_csv_file))
 
 
 # Test for IO with .txt files
