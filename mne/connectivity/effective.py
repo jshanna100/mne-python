@@ -8,7 +8,21 @@ import numpy as np
 
 from ..utils import logger, verbose
 from .spectral import spectral_connectivity
+from .entropy import _instant_phase
 
+@verbose
+def phase_transfer_entropy(data, freqs, sfreq, phase_method="wavelet",
+                           cwt_n_cycle=7, freq_band=2, n_jobs=1):
+    # get instantaneous phase
+    if phase == "wavelet" or phase == "hilbert":
+        inst_phases = _instant_phase(data, method=phase_method,
+                                     cwt_n_cycle=cyc_n_cycle,
+                                     freq_band=freq_band,
+                                     n_jobs=n_jobs)
+    else:
+        raise ValueError("{} not a recognised phase transform.".format(phase))
+
+    return inst_phases
 
 @verbose
 def phase_slope_index(data, indices=None, sfreq=2 * np.pi,
