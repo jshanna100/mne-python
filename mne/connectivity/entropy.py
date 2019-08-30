@@ -19,7 +19,6 @@ def _instant_phase(data, freqs, sfreq, method="wavelet", freq_band=2,
                 temp_data = filter_data(data, sfreq, l_freq=freq-freq_band/2,
                                         h_freq=freq+freq_band/2, n_jobs=n_jobs)
             analytic_signal = hilbert(temp_data)
-            ## fix: what's going on here?
             phases[:,:,freq_idx,:] = np.angle(analytic_signal)
 
     return phases
