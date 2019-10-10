@@ -10,6 +10,7 @@ import numbers
 
 import numpy as np
 from .tfr import cwt, morlet
+from ..fixes import rfftfreq
 from ..io.pick import pick_channels, _picks_to_idx
 from ..utils import logger, verbose, warn, copy_function_doc_to_method_doc
 from ..viz.misc import plot_csd
@@ -563,8 +564,7 @@ def csd_fourier(epochs, fmin=0, fmax=np.inf, tmin=None, tmax=None, picks=None,
     projs : list of Projection | None
         List of projectors to store in the CSD object. Defaults to ``None``,
         which means the projectors defined in the Epochs object will by copied.
-    n_jobs : int
-        Number of jobs to run in parallel. Defaults to 1.
+    %(n_jobs)s
     %(verbose)s
 
     Returns
@@ -622,8 +622,7 @@ def csd_array_fourier(X, sfreq, t0=0, fmin=0, fmax=np.inf, tmin=None,
     projs : list of Projection | None
         List of projectors to store in the CSD object. Defaults to ``None``,
         which means no projectors are stored.
-    n_jobs : int
-        Number of jobs to run in parallel. Defaults to 1.
+    %(n_jobs)s
     %(verbose)s
 
     Returns
@@ -639,9 +638,6 @@ def csd_array_fourier(X, sfreq, t0=0, fmin=0, fmax=np.inf, tmin=None,
     csd_morlet
     csd_multitaper
     """
-    # Local import to keep "import mne" fast
-    # from scipy.fftpack import fftfreq
-
     X, times, tmin, tmax, fmin, fmax = _prepare_csd_array(
         X, sfreq, t0, tmin, tmax, fmin, fmax)
 
@@ -655,7 +651,7 @@ def csd_array_fourier(X, sfreq, t0=0, fmin=0, fmax=np.inf, tmin=None,
 
     # Preparing frequencies of interest
     # orig_frequencies = fftfreq(n_fft, 1. / sfreq)
-    orig_frequencies = np.fft.rfftfreq(n_fft, 1. / sfreq)
+    orig_frequencies = rfftfreq(n_fft, 1. / sfreq)
     freq_mask = (orig_frequencies > fmin) & (orig_frequencies < fmax)
     frequencies = orig_frequencies[freq_mask]
 
@@ -705,8 +701,7 @@ def csd_multitaper(epochs, fmin=0, fmax=np.inf, tmin=None, tmax=None,
     projs : list of Projection | None
         List of projectors to store in the CSD object. Defaults to ``None``,
         which means the projectors defined in the Epochs object will by copied.
-    n_jobs : int
-        Number of jobs to run in parallel. Defaults to 1.
+    %(n_jobs)s
     %(verbose)s
 
     Returns
@@ -774,8 +769,7 @@ def csd_array_multitaper(X, sfreq, t0=0, fmin=0, fmax=np.inf, tmin=None,
     projs : list of Projection | None
         List of projectors to store in the CSD object. Defaults to ``None``,
         which means no projectors are stored.
-    n_jobs : int
-        Number of jobs to run in parallel. Defaults to 1.
+    %(n_jobs)s
     %(verbose)s
 
     Returns
@@ -806,7 +800,7 @@ def csd_array_multitaper(X, sfreq, t0=0, fmin=0, fmax=np.inf, tmin=None,
         _compute_mt_params(n_times, sfreq, bandwidth, low_bias, adaptive)
 
     # Preparing frequencies of interest
-    orig_frequencies = np.fft.rfftfreq(n_fft, 1. / sfreq)
+    orig_frequencies = rfftfreq(n_fft, 1. / sfreq)
     freq_mask = (orig_frequencies > fmin) & (orig_frequencies < fmax)
     frequencies = orig_frequencies[freq_mask]
 
@@ -858,8 +852,7 @@ def csd_morlet(epochs, frequencies, tmin=None, tmax=None, picks=None,
     projs : list of Projection | None
         List of projectors to store in the CSD object. Defaults to ``None``,
         which means the projectors defined in the Epochs object will be copied.
-    n_jobs : int
-        Number of jobs to run in parallel. Defaults to 1.
+    %(n_jobs)s
     %(verbose)s
 
     Returns
@@ -926,8 +919,7 @@ def csd_array_morlet(X, sfreq, frequencies, t0=0, tmin=None, tmax=None,
     projs : list of Projection | None
         List of projectors to store in the CSD object. Defaults to ``None``,
         which means the projectors defined in the Epochs object will be copied.
-    n_jobs : int
-        Number of jobs to run in parallel. Defaults to 1.
+    %(n_jobs)s
     %(verbose)s
 
     Returns
@@ -1066,8 +1058,7 @@ def _execute_csd_function(X, times, frequencies, csd_function, params, n_fft,
     projs : list of Projection | None
         List of projectors to store in the CSD object. Defaults to ``None``,
         which means the projectors defined in the Epochs object will be copied.
-    n_jobs : int
-        Number of jobs to run in parallel. Defaults to 1.
+    %(n_jobs)s
     %(verbose)s
 
     Returns

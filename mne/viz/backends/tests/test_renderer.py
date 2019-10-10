@@ -1,4 +1,4 @@
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #          Eric Larson <larson.eric.d@gmail.com>
 #          Joan Massich <mailsik@gmail.com>
 #          Guillaume Favelier <guillaume.favelier@gmail.com>
@@ -11,11 +11,9 @@ import importlib
 import numpy as np
 from mne.viz.backends.renderer import get_3d_backend
 from mne.viz.backends.tests._utils import (skips_if_not_mayavi,
-                                           skips_if_not_vtki)
+                                           skips_if_not_pyvista)
 
 DEFAULT_3D_BACKEND = 'mayavi'  # This should be done with the import
-
-print(DEFAULT_3D_BACKEND)
 
 
 @pytest.fixture
@@ -30,7 +28,7 @@ def backend_mocker():
 
 @pytest.mark.parametrize('backend', [
     pytest.param('mayavi', marks=skips_if_not_mayavi),
-    pytest.param('vtki', marks=skips_if_not_vtki),
+    pytest.param('pyvista', marks=skips_if_not_pyvista),
     pytest.param('foo', marks=pytest.mark.xfail(raises=ValueError)),
 ])
 def test_backend_environment_setup(backend, backend_mocker, monkeypatch):
@@ -46,10 +44,17 @@ def test_backend_environment_setup(backend, backend_mocker, monkeypatch):
     assert get_3d_backend() == backend
 
 
-def test_3d_backend(backends_3d):
-    """Test default plot."""
-    from mne.viz.backends.renderer import _Renderer
+def test_3d_functions(renderer):
+    """Test figure management functions."""
+    fig = renderer.create_3d_figure((300, 300))
+    renderer._check_figure(fig)
+    renderer.set_3d_view(figure=fig)
+    renderer.set_3d_title(figure=fig, title='foo')
+    renderer._close_all()
 
+
+def test_3d_backend(renderer):
+    """Test default plot."""
     # set data
     win_size = (600, 600)
     win_color = (0, 0, 0)
@@ -90,43 +95,55 @@ def test_3d_backend(backends_3d):
     txt_x = 0.0
     txt_y = 0.0
     txt_text = "renderer"
-    txt_width = 1.0
+    txt_size = 14
 
     cam_distance = 5 * tet_size
 
     # init scene
-    renderer = _Renderer(size=win_size, bgcolor=win_color)
-    renderer.set_interactive()
+    rend = renderer._Renderer(size=win_size, bgcolor=win_color)
+    rend.set_interactive()
 
     # use mesh
-    renderer.mesh(x=tet_x, y=tet_y, z=tet_z,
-                  triangles=tet_indices,
-                  color=tet_color)
+    rend.mesh(x=tet_x, y=tet_y, z=tet_z,
+              triangles=tet_indices,
+              color=tet_color)
 
     # use contour
-    renderer.contour(surface=ct_surface, scalars=ct_scalars,
-                     contours=ct_levels)
+    rend.contour(surface=ct_surface, scalars=ct_scalars,
+                 contours=ct_levels)
 
     # use sphere
-    renderer.sphere(center=sph_center, color=sph_color,
-                    scale=sph_scale)
+    rend.sphere(center=sph_center, color=sph_color,
+                scale=sph_scale)
 
     # use quiver3d
-    renderer.quiver3d(x=qv_center[:, 0],
-                      y=qv_center[:, 1],
-                      z=qv_center[:, 2],
-                      u=qv_dir[:, 0],
-                      v=qv_dir[:, 1],
-                      w=qv_dir[:, 2],
-                      color=qv_color,
-                      scale=qv_scale,
-                      scale_mode=qv_scale_mode,
-                      scalars=qv_scalars,
-                      mode=qv_mode)
+    rend.quiver3d(x=qv_center[:, 0],
+                  y=qv_center[:, 1],
+                  z=qv_center[:, 2],
+                  u=qv_dir[:, 0],
+                  v=qv_dir[:, 1],
+                  w=qv_dir[:, 2],
+                  color=qv_color,
+                  scale=qv_scale,
+                  scale_mode=qv_scale_mode,
+                  scalars=qv_scalars,
+                  mode=qv_mode)
+
+    # use tube
+    rend.tube(origin=np.array([[0, 0, 0]]),
+              destination=np.array([[0, 1, 0]]))
+    tube = rend.tube(origin=np.array([[1, 0, 0]]),
+                     destination=np.array([[1, 1, 0]]),
+                     scalars=np.array([[1.0, 1.0]]))
+
+    # scalar bar
+    rend.scalarbar(source=tube, title="Scalar Bar")
 
     # use text
-    renderer.text(x=txt_x, y=txt_y, text=txt_text, width=txt_width)
-    renderer.set_camera(azimuth=180.0, elevation=90.0,
-                        distance=cam_distance,
-                        focalpoint=center)
-    renderer.show()
+    rend.text2d(x=txt_x, y=txt_y, text=txt_text,
+                size=txt_size, justification='right')
+    rend.text3d(x=0, y=0, z=0, text=txt_text, scale=1.0)
+    rend.set_camera(azimuth=180.0, elevation=90.0,
+                    distance=cam_distance,
+                    focalpoint=center)
+    rend.show()

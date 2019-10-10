@@ -1,4 +1,4 @@
-# Author: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Author: Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #         Daniel Strohmeier <daniel.strohmeier@gmail.com>
 #
 # License: Simplified BSD
@@ -9,7 +9,7 @@ import numpy as np
 from scipy import linalg
 
 from .mxne_debiasing import compute_bias
-from ..utils import logger, verbose, sum_squared, warn
+from ..utils import logger, verbose, sum_squared, warn, dgemm
 from ..time_frequency.stft import stft_norm1, stft_norm2, stft, istft
 
 
@@ -133,7 +133,7 @@ def prox_l1(Y, alpha, n_orient):
 
     References
     ----------
-    .. [1] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hamalainen, M. Kowalski
+    .. [1] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hämäläinen, M. Kowalski
        "Time-Frequency Mixed-Norm Estimates: Sparse M/EEG imaging with
        non-stationary source activations",
        Neuroimage, Volume 70, pp. 410-422, 15 April 2013.
@@ -202,7 +202,7 @@ def dgap_l21(M, G, X, active_set, alpha, n_orient):
 
     References
     ----------
-    .. [1] A. Gramfort, M. Kowalski, M. Hamalainen,
+    .. [1] A. Gramfort, M. Kowalski, M. Hämäläinen,
        "Mixed-norm estimates for the M/EEG inverse problem using accelerated
        gradient methods", Physics in Medicine and Biology, 2012.
        https://doi.org/10.1088/0031-9155/57/7/1937
@@ -319,9 +319,6 @@ def _mixed_norm_solver_bcd(M, G, alpha, lipschitz_constant, maxit=200,
                            tol=1e-8, verbose=None, init=None, n_orient=1,
                            dgap_freq=10):
     """Solve L21 inverse problem with block coordinate descent."""
-    # First make G fortran for faster access to blocks of columns
-    G = np.asfortranarray(G)
-
     n_sensors, n_times = M.shape
     n_sensors, n_sources = G.shape
     n_positions = n_sources // n_orient
@@ -339,30 +336,26 @@ def _mixed_norm_solver_bcd(M, G, alpha, lipschitz_constant, maxit=200,
 
     alpha_lc = alpha / lipschitz_constant
 
+    # First make G fortran for faster access to blocks of columns
+    G = np.asfortranarray(G)
+    # Ensure these are correct for dgemm
+    assert R.dtype == np.float64
+    assert G.dtype == np.float64
+    one_ovr_lc = 1. / lipschitz_constant
+
+    # assert that all the multiplied matrices are fortran contiguous
+    assert X.T.flags.f_contiguous
+    assert R.T.flags.f_contiguous
+    assert G.flags.f_contiguous
+    # storing list of contiguous arrays
+    list_G_j_c = []
+    for j in range(n_positions):
+        idx = slice(j * n_orient, (j + 1) * n_orient)
+        list_G_j_c.append(np.ascontiguousarray(G[:, idx]))
+
     for i in range(maxit):
-        for j in range(n_positions):
-            idx = slice(j * n_orient, (j + 1) * n_orient)
-
-            G_j = G[:, idx]
-            X_j = X[idx]
-
-            X_j_new = np.dot(G_j.T, R) / lipschitz_constant[j]
-
-            was_non_zero = np.any(X_j)
-            if was_non_zero:
-                R += np.dot(G_j, X_j)
-                X_j_new += X_j
-
-            block_norm = linalg.norm(X_j_new, 'fro')
-            if block_norm <= alpha_lc[j]:
-                X_j.fill(0.)
-                active_set[idx] = False
-            else:
-                shrink = np.maximum(1.0 - alpha_lc[j] / block_norm, 0.0)
-                X_j_new *= shrink
-                R -= np.dot(G_j, X_j_new)
-                X_j[:] = X_j_new
-                active_set[idx] = True
+        _bcd(G, X, R, active_set, one_ovr_lc, n_orient, n_positions,
+             alpha_lc, list_G_j_c)
 
         if (i + 1) % dgap_freq == 0:
             _, p_obj, d_obj, _ = dgap_l21(M, G, X[active_set], active_set,
@@ -381,6 +374,63 @@ def _mixed_norm_solver_bcd(M, G, alpha, lipschitz_constant, maxit=200,
     X = X[active_set]
 
     return X, active_set, E
+
+
+def _bcd(G, X, R, active_set, one_ovr_lc, n_orient, n_positions,
+         alpha_lc, list_G_j_c):
+    """Implement one full pass of BCD.
+
+    BCD stands for Block Coordinate Descent.
+    This function make use of scipy.linalg.get_blas_funcs to speed reasons.
+
+    Parameters
+    ----------
+    G : array, shape (n_sensors, n_active)
+        The gain matrix a.k.a. lead field.
+    X : array, shape (n_sources, n_times)
+        Sources, modified in place.
+    R : array, shape (n_sensors, n_times)
+        The residuals: R = M - G @ X, modified in place.
+    active_set : array of bool, shape (n_sources, )
+        Mask of active sources, modified in place.
+    one_ovr_lc : array, shape (n_positions, )
+        One over the lipschitz constants.
+    n_orient : int
+        Number of dipoles per positions (typically 1 or 3).
+    n_positions : int
+        Number of source positions.
+    alpha_lc: array, shape (n_positions, )
+        alpha * (Lipschitz constants).
+    """
+    X_j_new = np.zeros_like(X[0:n_orient, :], order='C')
+
+    for j, G_j_c in enumerate(list_G_j_c):
+        idx = slice(j * n_orient, (j + 1) * n_orient)
+        G_j = G[:, idx]
+        X_j = X[idx]
+        dgemm(alpha=one_ovr_lc[j], beta=0., a=R.T, b=G_j, c=X_j_new.T,
+              overwrite_c=True)
+        # X_j_new = G_j.T @ R
+        # Mathurin's trick to avoid checking all the entries
+        was_non_zero = X_j[0, 0] != 0
+        # was_non_zero = np.any(X_j)
+        if was_non_zero:
+            dgemm(alpha=1., beta=1., a=X_j.T, b=G_j_c.T, c=R.T,
+                  overwrite_c=True)
+            # R += np.dot(G_j, X_j)
+            X_j_new += X_j
+        block_norm = sqrt(sum_squared(X_j_new))
+        if block_norm <= alpha_lc[j]:
+            X_j.fill(0.)
+            active_set[idx] = False
+        else:
+            shrink = max(1.0 - alpha_lc[j] / block_norm, 0.0)
+            X_j_new *= shrink
+            dgemm(alpha=-1., beta=1., a=X_j_new.T, b=G_j_c.T, c=R.T,
+                  overwrite_c=True)
+            # R -= np.dot(G_j, X_j_new)
+            X_j[:] = X_j_new
+            active_set[idx] = True
 
 
 @verbose
@@ -430,7 +480,7 @@ def mixed_norm_solver(M, G, alpha, maxit=3000, tol=1e-8, verbose=None,
 
     References
     ----------
-    .. [1] A. Gramfort, M. Kowalski, M. Hamalainen,
+    .. [1] A. Gramfort, M. Kowalski, M. Hämäläinen,
        "Mixed-norm estimates for the M/EEG inverse problem using accelerated
        gradient methods", Physics in Medicine and Biology, 2012.
        https://doi.org/10.1088/0031-9155/57/7/1937
@@ -975,7 +1025,7 @@ def dgap_l21l1(M, G, Z, active_set, alpha_space, alpha_time, phi, phiT,
 
     References
     ----------
-    .. [1] A. Gramfort, M. Kowalski, M. Hamalainen,
+    .. [1] A. Gramfort, M. Kowalski, M. Hämäläinen,
        "Mixed-norm estimates for the M/EEG inverse problem using accelerated
        gradient methods", Physics in Medicine and Biology, 2012.
        https://doi.org/10.1088/0031-9155/57/7/1937
@@ -1119,7 +1169,7 @@ def _tf_mixed_norm_solver_bcd_(M, G, Z, active_set, candidates, alpha_space,
 def _tf_mixed_norm_solver_bcd_active_set(M, G, alpha_space, alpha_time,
                                          lipschitz_constant, phi, phiT,
                                          Z_init=None, n_orient=1, maxit=200,
-                                         tol=1e-8,  dgap_freq=10,
+                                         tol=1e-8, dgap_freq=10,
                                          verbose=None):
 
     n_sensors, n_times = M.shape
@@ -1250,13 +1300,13 @@ def tf_mixed_norm_solver(M, G, alpha_space, alpha_time, wsize=64, tstep=4,
 
     References
     ----------
-    .. [1] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hamalainen, M. Kowalski
+    .. [1] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hämäläinen, M. Kowalski
        "Time-Frequency Mixed-Norm Estimates: Sparse M/EEG imaging with
        non-stationary source activations",
        Neuroimage, Volume 70, pp. 410-422, 15 April 2013.
        DOI: 10.1016/j.neuroimage.2012.12.051
 
-    .. [2] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hamalainen, M. Kowalski
+    .. [2] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hämäläinen, M. Kowalski
        "Functional Brain Imaging with M/EEG Using Structured Sparsity in
        Time-Frequency Dictionaries",
        Proceedings Information Processing in Medical Imaging

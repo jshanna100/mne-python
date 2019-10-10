@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """Conversion tool from Brain Vision EEG to FIF."""
-
 # Authors: Teon Brooks <teon.brooks@gmail.com>
 #          Christian Brodbeck <christianbrodbeck@nyu.edu>
 #          Eric Larson <larson.eric.d@gmail.com>
@@ -21,12 +20,13 @@ from io import StringIO
 
 import numpy as np
 
-from ...utils import verbose, logger, warn, fill_doc
+from ...utils import verbose, logger, warn, fill_doc, _DefaultEventParser
 from ..constants import FIFF
 from ..meas_info import _empty_info
-from ..base import BaseRaw, _check_update_montage
-from ..utils import _read_segments_file, _mult_cal_one, _deprecate_stim_channel
+from ..base import BaseRaw
+from ..utils import _read_segments_file, _mult_cal_one
 from ...annotations import Annotations, read_annotations
+from ...channels import make_dig_montage
 
 
 @fill_doc
@@ -37,11 +37,6 @@ class RawBrainVision(BaseRaw):
     ----------
     vhdr_fname : str
         Path to the EEG header file.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions. If None,
-        read sensor locations from header file if present, otherwise (0, 0, 0).
-        See the documentation of :func:`mne.channels.read_montage` for more
-        information.
     eog : list or tuple
         Names of channels or list of indices that should be designated
         EOG channels. Values should correspond to the vhdr file.
@@ -54,14 +49,7 @@ class RawBrainVision(BaseRaw):
     scale : float
         The scaling factor for EEG data. Unless specified otherwise by
         header file, units are in microvolts. Default scale factor is 1.
-    preload : bool
-        If True, all data are loaded at initialization.
-        If False, data are not read until save.
-    stim_channel : False
-        Deprecated, will be removed in 0.19; migrate code to use
-        :func:`mne.events_from_annotations` instead.
-
-        .. versionadded:: 0.17
+    %(preload)s
     %(verbose)s
 
     See Also
@@ -70,20 +58,17 @@ class RawBrainVision(BaseRaw):
     """
 
     @verbose
-    def __init__(self, vhdr_fname, montage=None,
+    def __init__(self, vhdr_fname,
                  eog=('HEOGL', 'HEOGR', 'VEOGb'), misc='auto',
-                 scale=1., preload=False, stim_channel=False,
-                 verbose=None):  # noqa: D107
-        _deprecate_stim_channel(stim_channel)
+                 scale=1., preload=False, verbose=None):  # noqa: D107
         # Channel info and events
         logger.info('Extracting parameters from %s...' % vhdr_fname)
         vhdr_fname = op.abspath(vhdr_fname)
         (info, data_fname, fmt, order, n_samples, mrk_fname, montage,
-         orig_units) = _get_vhdr_info(vhdr_fname, eog, misc, scale, montage)
+         orig_units) = _get_vhdr_info(vhdr_fname, eog, misc, scale)
         self._order = order
         self._n_samples = n_samples
 
-        _check_update_montage(info, montage)
         with open(data_fname, 'rb') as f:
             if isinstance(fmt, dict):  # ASCII, this will be slow :(
                 if self._order == 'F':  # multiplexed, channels in columns
@@ -106,6 +91,8 @@ class RawBrainVision(BaseRaw):
             info, last_samps=[n_samples - 1], filenames=[data_fname],
             orig_format=fmt, preload=preload, verbose=verbose,
             raw_extras=[offsets], orig_units=orig_units)
+
+        self.set_montage(montage)
 
         # Get annotations from vmrk file
         annots = read_annotations(mrk_fname, info['sfreq'])
@@ -164,8 +151,9 @@ def _read_vmrk(fname):
         The onsets in seconds.
     description : array, shape (n_annots,)
         The description of each annotation.
-    orig_time : str
-        The origin time as a string.
+    date_str : str
+        The recording time as a string. Defaults to empty string if no
+        recording time is found.
     """
     # read vmrk file
     with open(fname, 'rb') as fid:
@@ -207,7 +195,8 @@ def _read_vmrk(fname):
     # extract Marker Infos block
     m = re.search(r"\[Marker Infos\]", txt, re.IGNORECASE)
     if not m:
-        return np.zeros((0, 3))
+        return np.array(list()), np.array(list()), np.array(list()), ''
+
     mk_txt = txt[m.end():]
     m = re.search(r"^\[.*\]$", mk_txt)
     if m:
@@ -216,13 +205,15 @@ def _read_vmrk(fname):
     # extract event information
     items = re.findall(r"^Mk\d+=(.*)", mk_txt, re.MULTILINE)
     onset, duration, description = list(), list(), list()
-    date_str = None
+    date_str = ''
     for info in items:
-        mtype, mdesc, this_onset, this_duration = info.split(',')[:4]
-        if date_str is None and mtype == 'New Segment':
+        info_data = info.split(',')
+        mtype, mdesc, this_onset, this_duration = info_data[:4]
+        if date_str == '' and len(info_data) == 5 and mtype == 'New Segment':
             # to handle the origin of time and handle the presence of multiple
-            # New Segment annotations. We only keep the first one for date_str.
-            date_str = info.split(',')[-1]
+            # New Segment annotations. We only keep the first one that is
+            # different from an empty string for date_str.
+            date_str = info_data[-1]
 
         this_duration = (int(this_duration)
                          if this_duration.isdigit() else 0)
@@ -270,7 +261,6 @@ def _read_annotations_brainvision(fname, sfreq='auto'):
     annotations = Annotations(onset=onset, duration=duration,
                               description=description,
                               orig_time=orig_time)
-
     return annotations
 
 
@@ -323,7 +313,7 @@ _unit_dict = {'V': 1.,  # V stands for Volt
 def _str_to_meas_date(date_str):
     date_str = date_str.strip()
 
-    if date_str in ['0', '00000000000000000000']:
+    if date_str in ['', '0', '00000000000000000000']:
         return None
 
     try:
@@ -396,7 +386,7 @@ def _aux_vhdr_info(vhdr_fname):
     return settings, cfg, cinfostr, info
 
 
-def _get_vhdr_info(vhdr_fname, eog, misc, scale, montage):
+def _get_vhdr_info(vhdr_fname, eog, misc, scale):
     """Extract all the information from the header file.
 
     Parameters
@@ -414,11 +404,6 @@ def _get_vhdr_info(vhdr_fname, eog, misc, scale, montage):
     scale : float
         The scaling factor for EEG data. Unless specified otherwise by
         header file, units are in microvolts. Default scale factor is 1.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions. If None,
-        read sensor locations from header file if present, otherwise (0, 0, 0).
-        See the documentation of :func:`mne.channels.read_montage` for more
-        information.
 
     Returns
     -------
@@ -434,7 +419,7 @@ def _get_vhdr_info(vhdr_fname, eog, misc, scale, montage):
         Number of data points in the binary data file.
     mrk_fname : str
         Path to the marker file.
-    montage : Montage
+    montage : DigMontage
         Coordinates of the channels, if present in the header file.
     orig_units : dict
         Dictionary mapping channel names to their units as specified in
@@ -475,7 +460,7 @@ def _get_vhdr_info(vhdr_fname, eog, misc, scale, montage):
 
     # Try to get measurement date from marker file
     # Usually saved with a marker "New Segment", see BrainVision documentation
-    regexp = r'^Mk\d+=New Segment,.*,\d+,\d+,\d+,(\d{20})$'
+    regexp = r'^Mk\d+=New Segment,.*,\d+,\d+,-?\d+,(\d{20})$'
     with open(mrk_fname, 'r') as tmp_mrk_f:
         lines = tmp_mrk_f.readlines()
 
@@ -537,27 +522,40 @@ def _get_vhdr_info(vhdr_fname, eog, misc, scale, montage):
                               else FIFF.FIFF_UNIT_NONE)
     misc = list(misc_chs.keys()) if misc == 'auto' else misc
 
-    # create montage
-    if cfg.has_section('Coordinates') and montage is None:
+    # create montage: 'Coordinates' section in VHDR file corresponds to "BVEF"
+    # BrainVision Electrode File. The data are based on BrainVision Analyzer
+    # coordinate system: Defined between standard electrode positions: X-axis
+    # from T7 to T8, Y-axis from Oz to Fpz, Z-axis orthogonal from XY-plane
+    # through Cz, fit to a sphere if idealized (when radius=1), specified in mm
+    montage = None
+    if cfg.has_section('Coordinates'):
         from ...transforms import _sph_to_cart
-        from ...channels.montage import Montage
         montage_pos = list()
         montage_names = list()
         to_misc = list()
+        # Go through channels
         for ch in cfg.items('Coordinates'):
             ch_name = ch_dict[ch[0]]
             montage_names.append(ch_name)
-            radius, theta, phi = [float(c) for c in ch[1].split(',')]
             # 1: radius, 2: theta, 3: phi
+            rad, theta, phi = [float(c) for c in ch[1].split(',')]
             pol = np.deg2rad(theta)
             az = np.deg2rad(phi)
-            pos = _sph_to_cart(np.array([[radius * 85., az, pol]]))[0]
+            # Coordinates could be "idealized" (spherical head model)
+            if rad == 1:
+                # scale up to realistic head radius (8.5cm == 85mm)
+                rad *= 85.
+            pos = _sph_to_cart(np.array([[rad, az, pol]]))[0]
             if (pos == 0).all() and ch_name not in list(eog) + misc:
                 to_misc.append(ch_name)
             montage_pos.append(pos)
-        montage_sel = np.arange(len(montage_pos))
-        montage = Montage(montage_pos, montage_names, 'Brainvision',
-                          montage_sel)
+        # Make a montage, normalizing from BrainVision units "mm" to "m", the
+        # unit used for montages in MNE
+        montage_pos = np.array(montage_pos) / 1e3
+        montage = make_dig_montage(
+            ch_pos=dict(zip(montage_names, montage_pos)),
+            coord_frame='head'
+        )
         if len(to_misc) > 0:
             misc += to_misc
             warn('No coordinate information found for channels {}. '
@@ -782,20 +780,15 @@ def _get_vhdr_info(vhdr_fname, eog, misc, scale, montage):
 
 
 @fill_doc
-def read_raw_brainvision(vhdr_fname, montage=None,
+def read_raw_brainvision(vhdr_fname,
                          eog=('HEOGL', 'HEOGR', 'VEOGb'), misc='auto',
-                         scale=1., preload=False, stim_channel=False,
-                         verbose=None):
+                         scale=1., preload=False, verbose=None):
     """Reader for Brain Vision EEG file.
 
     Parameters
     ----------
     vhdr_fname : str
         Path to the EEG header file.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions.
-        If None, sensor locations are (0,0,0). See the documentation of
-        :func:`mne.channels.read_montage` for more information.
     eog : list or tuple of str
         Names of channels or list of indices that should be designated
         EOG channels. Values should correspond to the vhdr file
@@ -808,14 +801,7 @@ def read_raw_brainvision(vhdr_fname, montage=None,
     scale : float
         The scaling factor for EEG data. Unless specified otherwise by
         header file, units are in microvolts. Default scale factor is 1.
-    preload : bool
-        If True, all data are loaded at initialization.
-        If False, data are not read until save.
-    stim_channel : False
-        Deprecated, will be removed in 0.19; migrate code to use
-        :func:`mne.events_from_annotations` instead.
-
-        .. versionadded:: 0.17
+    %(preload)s
     %(verbose)s
 
     Returns
@@ -828,6 +814,40 @@ def read_raw_brainvision(vhdr_fname, montage=None,
     mne.io.Raw : Documentation of attribute and methods.
 
     """
-    return RawBrainVision(vhdr_fname=vhdr_fname, montage=montage, eog=eog,
+    return RawBrainVision(vhdr_fname=vhdr_fname, eog=eog,
                           misc=misc, scale=scale, preload=preload,
-                          stim_channel=stim_channel, verbose=verbose)
+                          verbose=verbose)
+
+
+_BV_EVENT_IO_OFFSETS = {'Event/': 0, 'Stimulus/S': 0, 'Response/R': 1000,
+                        'Optic/O': 2000}
+_OTHER_ACCEPTED_MARKERS = {
+    'New Segment/': 99999, 'SyncStatus/Sync On': 99998
+}
+_OTHER_OFFSET = 10001  # where to start "unknown" event_ids
+
+
+class _BVEventParser(_DefaultEventParser):
+    """Parse standard brainvision events, accounting for non-standard ones."""
+
+    def __call__(self, description):
+        """Parse BrainVision event codes (like `Stimulus/S 11`) to ints."""
+        offsets = _BV_EVENT_IO_OFFSETS
+
+        maybe_digit = description[-3:].strip()
+        kind = description[:-3]
+        if maybe_digit.isdigit() and kind in offsets:
+            code = int(maybe_digit) + offsets[kind]
+        elif description in _OTHER_ACCEPTED_MARKERS:
+            code = _OTHER_ACCEPTED_MARKERS[description]
+        else:
+            code = (super(_BVEventParser, self)
+                    .__call__(description, offset=_OTHER_OFFSET))
+        return code
+
+
+def _check_bv_annot(descriptions):
+    markers_basename = set([dd.rstrip('0123456789 ') for dd in descriptions])
+    bv_markers = (set(_BV_EVENT_IO_OFFSETS.keys())
+                  .union(set(_OTHER_ACCEPTED_MARKERS.keys())))
+    return len(markers_basename - bv_markers) == 0

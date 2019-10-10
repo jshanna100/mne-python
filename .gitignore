@@ -44,6 +44,7 @@ build
 coverage
 .cache/
 .pytest_cache/
+__pycache__/
 prof/
 
 dist/
@@ -54,12 +55,12 @@ doc/auto_tutorials/
 doc/modules/generated/
 doc/sphinxext/cachedir
 pip-log.txt
-.coverage
+.coverage*
 tags
 doc/coverages
 doc/samples
 cover
-examples/visualization/foobar.html
+*.html
 
 *.orig
 
@@ -78,3 +79,4 @@ examples/visualization/foobar.html
 
 .venv/
 venv/
+*.json

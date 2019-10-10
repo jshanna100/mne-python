@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Single-dipole functions and classes."""
 
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #          Eric Larson <larson.eric.d@gmail.com>
 #
 # License: Simplified BSD
@@ -26,13 +26,14 @@ from .forward._make_forward import (_get_trans, _setup_bem,
 from .forward._compute_forward import (_compute_forwards_meeg,
                                        _prep_field_computation)
 
-from .surface import transform_surface_to, _compute_nearest
+from .surface import (transform_surface_to, _compute_nearest,
+                      _points_outside_surface)
 from .bem import _bem_find_surface, _surf_name
-from .source_space import (_make_volume_source_space, SourceSpaces,
-                           _points_outside_surface)
+from .source_space import _make_volume_source_space, SourceSpaces
 from .parallel import parallel_func
 from .utils import (logger, verbose, _time_mask, warn, _check_fname,
-                    check_fname, _pl, fill_doc, _check_option)
+                    check_fname, _pl, fill_doc, _check_option,
+                    _svd_lwork, _repeated_svd, ddot, dgemv, dgemm)
 
 
 @fill_doc
@@ -163,7 +164,8 @@ class Dipole(object):
                 fid.write(('## Name "%s dipoles" Style "Dipoles"'
                            % self.name).encode('utf-8'))
 
-    def crop(self, tmin=None, tmax=None):
+    @fill_doc
+    def crop(self, tmin=None, tmax=None, include_tmax=True):
         """Crop data to a given time interval.
 
         Parameters
@@ -172,6 +174,7 @@ class Dipole(object):
             Start time of selection in seconds.
         tmax : float | None
             End time of selection in seconds.
+        %(include_tmax)s
 
         Returns
         -------
@@ -181,7 +184,8 @@ class Dipole(object):
         sfreq = None
         if len(self.times) > 1:
             sfreq = 1. / np.median(np.diff(self.times))
-        mask = _time_mask(self.times, tmin, tmax, sfreq=sfreq)
+        mask = _time_mask(self.times, tmin, tmax, sfreq=sfreq,
+                          include_tmax=include_tmax)
         for attr in ('times', 'pos', 'gof', 'amplitude', 'ori',
                      'khi2', 'nfree'):
             if getattr(self, attr) is not None:
@@ -204,6 +208,7 @@ class Dipole(object):
     def plot_locations(self, trans, subject, subjects_dir=None,
                        mode='orthoview', coord_frame='mri', idx='gof',
                        show_all=True, ax=None, block=False, show=True,
+                       scale=5e-3, color=(1.0, 0.0, 0.0), fig=None,
                        verbose=None):
         """Plot dipole locations in 3d.
 
@@ -219,7 +224,7 @@ class Dipole(object):
             It corresponds to Freesurfer environment variable SUBJECTS_DIR.
             The default is None.
         mode : str
-            Currently only ``'orthoview'`` is supported.
+            Can be ``'arrow'``, ``'sphere'`` or ``'orthoview'``.
 
             .. versionadded:: 0.14.0
         coord_frame : str
@@ -256,6 +261,15 @@ class Dipole(object):
             Show figure if True. Defaults to True.
             Only used if mode equals 'orthoview'.
 
+        scale: float
+            The scale of the dipoles if ``mode`` is 'arrow' or 'sphere'.
+        color : tuple
+            The color of the dipoles if ``mode`` is 'arrow' or 'sphere'.
+        fig : mayavi.mlab.Figure | None
+            Mayavi Scene in which to plot the alignment.
+            If ``None``, creates a new 600x600 pixel figure with black
+            background.
+
             .. versionadded:: 0.14.0
         %(verbose_meth)s
 
@@ -268,19 +282,12 @@ class Dipole(object):
         -----
         .. versionadded:: 0.9.0
         """
+        _check_option('mode', mode, [None, 'arrow', 'sphere', 'orthoview'])
+
         from .viz import plot_dipole_locations
-        dipoles = self
-        if mode in [None, 'cone', 'sphere']:  # support old behavior
-            dipoles = []
-            for t in self.times:
-                dipoles.append(self.copy())
-                dipoles[-1].crop(t, t)
-        elif mode != 'orthoview':
-            raise ValueError("mode must be 'cone', 'sphere' or 'orthoview'. "
-                             "Got %s." % mode)
         return plot_dipole_locations(
-            dipoles, trans, subject, subjects_dir, mode, coord_frame, idx,
-            show_all, ax, block, show)
+            self, trans, subject, subjects_dir, mode, coord_frame, idx,
+            show_all, ax, block, show, scale=scale, color=color, fig=fig)
 
     def plot_amplitudes(self, color='k', show=True):
         """Plot the dipole amplitudes as a function of time.
@@ -609,13 +616,13 @@ def _read_dipole_text(fname):
 
 def _dipole_forwards(fwd_data, whitener, rr, n_jobs=1):
     """Compute the forward solution and do other nice stuff."""
-    B = _compute_forwards_meeg(rr, fwd_data, n_jobs, verbose=False)
+    B = _compute_forwards_meeg(rr, fwd_data, n_jobs, silent=True)
     B = np.concatenate(B, axis=1)
     assert np.isfinite(B).all()
     B_orig = B.copy()
 
     # Apply projection and whiten (cov has projections already)
-    B = np.dot(B, whitener.T)
+    B = dgemm(1., B, whitener.T)
 
     # column normalization doesn't affect our fitting, so skip for now
     # S = np.sum(B * B, axis=1)  # across channels
@@ -646,11 +653,12 @@ def _make_guesses(surf, grid, exclude, mindist, n_jobs):
     return SourceSpaces([src])
 
 
-def _fit_eval(rd, B, B2, fwd_svd=None, fwd_data=None, whitener=None):
+def _fit_eval(rd, B, B2, fwd_svd=None, fwd_data=None, whitener=None,
+              lwork=None):
     """Calculate the residual sum of squares."""
     if fwd_svd is None:
         fwd = _dipole_forwards(fwd_data, whitener, rd[np.newaxis, :])[0]
-        uu, sing, vv = linalg.svd(fwd, overwrite_a=True, full_matrices=False)
+        uu, sing, vv = _repeated_svd(fwd, lwork, overwrite_a=True)
     else:
         uu, sing, vv = fwd_svd
     gof = _dipole_gof(uu, sing, vv, B, B2)[0]
@@ -661,8 +669,8 @@ def _fit_eval(rd, B, B2, fwd_svd=None, fwd_data=None, whitener=None):
 def _dipole_gof(uu, sing, vv, B, B2):
     """Calculate the goodness of fit from the forward SVD."""
     ncomp = 3 if sing[2] / (sing[0] if sing[0] > 0 else 1.) > 0.2 else 2
-    one = np.dot(vv[:ncomp], B)
-    Bm2 = np.sum(one * one)
+    one = dgemv(1., vv[:ncomp], B)  # np.dot(vv[:ncomp], B)
+    Bm2 = ddot(one, one)  # np.sum(one * one)
     gof = Bm2 / B2
     return gof, one
 
@@ -928,7 +936,9 @@ def _fit_dipole(min_dist_to_inner_skull, B_orig, t, guess_rrs,
     idx = np.argmin([_fit_eval(guess_rrs[[fi], :], B, B2, fwd_svd)
                      for fi, fwd_svd in enumerate(guess_data['fwd_svd'])])
     x0 = guess_rrs[idx]
-    fun = partial(_fit_eval, B=B, B2=B2, fwd_data=fwd_data, whitener=whitener)
+    lwork = _svd_lwork((3, B.shape[0]))
+    fun = partial(_fit_eval, B=B, B2=B2, fwd_data=fwd_data, whitener=whitener,
+                  lwork=lwork)
 
     # Tested minimizers:
     #    Simplex, BFGS, CG, COBYLA, L-BFGS-B, Powell, SLSQP, TNC
@@ -1011,9 +1021,8 @@ def fit_dipole(evoked, cov, bem, trans=None, min_dist=5., n_jobs=1,
         Must be positive. Note that because this is a constraint passed to
         a solver it is not strict but close, i.e. for a ``min_dist=5.`` the
         fits could be 4.9 mm from the inner skull.
-    n_jobs : int
-        Number of jobs to run in parallel (used in field computation
-        and fitting).
+    %(n_jobs)s
+        It is used in field computation and fitting.
     pos : ndarray, shape (3,) | None
         Position of the dipole to use. If None (default), sequential
         fitting (different position and orientation for each time instance)
@@ -1337,6 +1346,7 @@ def get_phantom_dipoles(kind='vectorview'):
         c = [22.9, 23.5, 25.5, 23.1, 52.0, 46.4, 41.0, 33.0]
         d = [44.4, 34.0, 21.6, 12.7, 62.4, 51.5, 39.1, 27.9]
         z = np.concatenate((c, c, d, d))
+        signs = ([1, -1] * 4 + [-1, 1] * 4) * 2
     elif kind == 'otaniemi':
         # these values were pulled from an Neuromag manual
         # (NM20456A, 13.7.1999, p.65)
@@ -1346,18 +1356,20 @@ def get_phantom_dipoles(kind='vectorview'):
         x = np.concatenate((a, b, c, c, -a, -b, c, c))
         y = np.concatenate((c, c, -a, -b, c, c, b, a))
         z = np.concatenate((b, a, b, a, b, a, a, b))
+        signs = [-1] * 8 + [1] * 16 + [-1] * 8
     pos = np.vstack((x, y, z)).T / 1000.
     # Locs are always in XZ or YZ, and so are the oris. The oris are
     # also in the same plane and tangential, so it's easy to determine
     # the orientation.
     ori = list()
-    for this_pos in pos:
+    for pi, this_pos in enumerate(pos):
         this_ori = np.zeros(3)
         idx = np.where(this_pos == 0)[0]
         # assert len(idx) == 1
         idx = np.setdiff1d(np.arange(3), idx[0])
         this_ori[idx] = (this_pos[idx][::-1] /
                          np.linalg.norm(this_pos[idx])) * [1, -1]
+        this_ori *= signs[pi]
         # Now we have this quality, which we could uncomment to
         # double-check:
         # np.testing.assert_allclose(np.dot(this_ori, this_pos) /

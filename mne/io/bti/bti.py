@@ -1,9 +1,10 @@
-
 # Authors: Denis A. Engemann  <denis.engemann@gmail.com>
 #          Martin Luessi <mluessi@nmr.mgh.harvard.edu>
-#          Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
-#          Matti Hamalainen <msh@nmr.mgh.harvard.edu>
+#          Alexandre Gramfort <alexandre.gramfort@inria.fr>
+#          Matti Hämäläinen <msh@nmr.mgh.harvard.edu>
 #          Yuval Harpaz <yuvharpaz@gmail.com>
+#          Joan Massich <mailsik@gmail.com>
+#          Teon Brooks <teon.brooks@gmail.com>
 #
 #          simplified BSD-3 license
 
@@ -13,9 +14,10 @@ from itertools import count
 
 import numpy as np
 
-from ...utils import logger, verbose, sum_squared
-from ...transforms import (combine_transforms, invert_transform, apply_trans,
+from ...utils import logger, verbose
+from ...transforms import (combine_transforms, invert_transform,
                            Transform)
+from .._digitization import _make_bti_dig_points
 from ..constants import FIFF
 from .. import BaseRaw, _coil_trans_to_loc, _loc_to_coil_trans, _empty_info
 from ..utils import _mult_cal_one, read_str
@@ -140,6 +142,7 @@ def _rename_channels(names, ecg_ch='E31', eog_ch=('E63', 'E64')):
     return new
 
 
+# XXX: This is the guy reading the points
 def _read_head_shape(fname):
     """Read the head shape."""
     with _bti_open(fname, 'rb') as fid:
@@ -148,101 +151,11 @@ def _read_head_shape(fname):
         idx_points = read_double_matrix(fid, BTI.DATA_N_IDX_POINTS, 3)
         dig_points = read_double_matrix(fid, _n_dig_points, 3)
 
-    return idx_points, dig_points
+    # XXX : reorder to lpa, rpa, nasion so = is direct.
+    nasion, lpa, rpa = [idx_points[_, :] for _ in [2, 0, 1]]
+    hpi = idx_points[3:len(idx_points), :]
 
-
-def _get_ctf_head_to_head_t(idx_points):
-    """Get the CTF head transform."""
-    fp = idx_points.astype('>f8')
-    dp = np.sum(fp[2] * (fp[0] - fp[1]))
-    tmp1, tmp2 = sum_squared(fp[2]), sum_squared(fp[0] - fp[1])
-    dcos = -dp / np.sqrt(tmp1 * tmp2)
-    dsin = np.sqrt(1. - dcos * dcos)
-    dt = dp / np.sqrt(tmp2)
-
-    # do the transformation
-    t = np.array([[dcos, -dsin, 0., dt],
-                  [dsin, dcos, 0., 0.],
-                  [0., 0., 1., 0.],
-                  [0., 0., 0., 1.]])
-    return Transform('ctf_head', 'head', t)
-
-
-def _flip_fiducials(idx_points_nm):
-    """Adjust order of fiducials to Neuromag."""
-    # XXX presumably swap LPA and RPA
-    idx_points_nm[[1, 2]] = idx_points_nm[[2, 1]]
-    return idx_points_nm
-
-
-def _process_bti_headshape(fname, convert=True, use_hpi=True):
-    """Read index points and dig points from BTi head shape file.
-
-    Parameters
-    ----------
-    fname : str
-        The absolute path to the head shape file
-    use_hpi : bool
-        Whether to treat additional hpi coils as digitization points or not.
-        If False, hpi coils will be discarded.
-
-    Returns
-    -------
-    dig : list of dicts
-        The list of dig point info structures needed for the fiff info
-        structure.
-    t : dict
-        The transformation that was used.
-    """
-    idx_points, dig_points = _read_head_shape(fname)
-    if convert:
-        ctf_head_t = _get_ctf_head_to_head_t(idx_points)
-    else:
-        ctf_head_t = Transform('ctf_head', 'ctf_head')
-
-    if dig_points is not None:
-        # dig_points = apply_trans(ctf_head_t['trans'], dig_points)
-        all_points = np.r_[idx_points, dig_points]
-    else:
-        all_points = idx_points
-
-    if convert:
-        all_points = _convert_hs_points(all_points, ctf_head_t)
-
-    dig = _points_to_dig(all_points, len(idx_points), use_hpi)
-    return dig, ctf_head_t
-
-
-def _convert_hs_points(points, t):
-    """Convert headshape points to Neuromag."""
-    points = apply_trans(t['trans'], points)
-    points = _flip_fiducials(points).astype(np.float32)
-    return points
-
-
-def _points_to_dig(points, n_idx_points, use_hpi):
-    """Put points in info dig structure."""
-    idx_idents = list(range(1, 4)) + list(range(1, (n_idx_points + 1) - 3))
-    dig = []
-    for idx in range(points.shape[0]):
-        point_info = dict(zip(FIFF_INFO_DIG_FIELDS, FIFF_INFO_DIG_DEFAULTS))
-        point_info['r'] = points[idx]
-        if idx < 3:
-            point_info['kind'] = FIFF.FIFFV_POINT_CARDINAL
-            point_info['ident'] = idx_idents[idx]
-        if 2 < idx < n_idx_points and use_hpi:
-            point_info['kind'] = FIFF.FIFFV_POINT_HPI
-            point_info['ident'] = idx_idents[idx]
-        elif idx > 4:
-            point_info['kind'] = FIFF.FIFFV_POINT_EXTRA
-            point_info['ident'] = (idx + 1) - len(idx_idents)
-
-        if 2 < idx < n_idx_points and not use_hpi:
-            pass
-        else:
-            dig += [point_info]
-
-    return dig
+    return nasion, lpa, rpa, hpi, dig_points
 
 
 def _check_nan_dev_head_t(dev_ctf_t):
@@ -659,10 +572,10 @@ def _read_channel(fid):
                 'ymax': read_double(fid),
                 'index': read_int32(fid),
                 'checksum': read_int32(fid),
-                'off_flag': read_str(fid, 16),
+                'off_flag': read_str(fid, 4),
                 'offset': read_float(fid)})
 
-    fid.seek(12, 1)
+    fid.seek(24, 1)
 
     return out
 
@@ -715,7 +628,7 @@ def _read_process(fid):
             fid.seek(32, 1)
         elif ptype in BTI.PROC_BPFILTER:
             this_step['high_freq'] = read_float(fid)
-            this_step['low_frew'] = read_float(fid)
+            this_step['low_freq'] = read_float(fid)
         else:
             jump = this_step['user_space_size'] = read_int32(fid)
             fid.seek(32, 1)
@@ -913,6 +826,10 @@ def _read_bti_header(pdf_fname, config_fname, sort_by_ch_name=True):
         chans_cfg = [c for c in cfg['chs'] if c['chan_no']
                      in [c_['chan_no'] for c_ in chans]]
 
+        # sort chans_cfg and chans
+        chans = sorted(chans, key=lambda k: k['chan_no'])
+        chans_cfg = sorted(chans_cfg, key=lambda k: k['chan_no'])
+
         # check all pdf channels are present in config
         match = [c['chan_no'] for c in chans_cfg] == \
                 [c['chan_no'] for c in chans]
@@ -1011,14 +928,9 @@ class RawBTi(BaseRaw):
     eog_ch : tuple of str | None
         The 4D names of the EOG channels. If None, the channels will be treated
         as regular EEG channels.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing.
-        If True, the data will be preloaded into memory (fast, requires
-        large amount of memory). If preload is a string, preload is the
-        file name of a memory-mapped file which is used to store the data
-        on the hard drive (slower, requires less memory).
+    %(preload)s
 
-        ..versionadded:: 0.11
+        .. versionadded:: 0.11
 
     %(verbose)s
     """
@@ -1077,6 +989,28 @@ class RawBTi(BaseRaw):
                 for ii, b_i_o in enumerate(bti_info['order']):
                     one[ii] = block[:, b_i_o] * read_cals[b_i_o]
                 _mult_cal_one(data_view, one, idx, cals, mult)
+
+
+def _make_bti_digitization(
+        info, head_shape_fname, convert, use_hpi, bti_dev_t, dev_ctf_t):
+    if head_shape_fname:
+        logger.info('... Reading digitization points from %s' %
+                    head_shape_fname)
+
+        nasion, lpa, rpa, hpi, dig_points = _read_head_shape(head_shape_fname)
+        info['dig'], dev_head_t, ctf_head_t = _make_bti_dig_points(
+            nasion, lpa, rpa, hpi, dig_points,
+            convert, use_hpi, bti_dev_t, dev_ctf_t)
+    else:
+        logger.info('... no headshape file supplied, doing nothing.')
+        info['dig'] = None
+        dev_head_t = Transform('meg', 'head', trans=None)
+        ctf_head_t = Transform('ctf_head', 'head', trans=None)
+
+    info.update(dev_head_t=dev_head_t, dev_ctf_t=dev_ctf_t,
+                ctf_head_t=ctf_head_t)
+
+    return info
 
 
 def _get_bti_info(pdf_fname, config_fname, head_shape_fname, rotation_x,
@@ -1265,30 +1199,9 @@ def _get_bti_info(pdf_fname, config_fname, head_shape_fname, rotation_x,
 
     info['chs'] = chs
 
-    if head_shape_fname:
-        logger.info('... Reading digitization points from %s' %
-                    head_shape_fname)
-        if convert:
-            logger.info('... putting digitization points in Neuromag c'
-                        'oordinates')
-        info['dig'], ctf_head_t = _process_bti_headshape(
-            head_shape_fname, convert=convert, use_hpi=use_hpi)
-
-        logger.info('... Computing new device to head transform.')
-        # DEV->CTF_DEV->CTF_HEAD->HEAD
-        if convert:
-            t = combine_transforms(invert_transform(bti_dev_t), dev_ctf_t,
-                                   'meg', 'ctf_head')
-            dev_head_t = combine_transforms(t, ctf_head_t, 'meg', 'head')
-        else:
-            dev_head_t = Transform('meg', 'head')
-        logger.info('Done.')
-    else:
-        logger.info('... no headshape file supplied, doing nothing.')
-        dev_head_t = Transform('meg', 'head')
-        ctf_head_t = Transform('ctf_head', 'head')
-    info.update(dev_head_t=dev_head_t, dev_ctf_t=dev_ctf_t,
-                ctf_head_t=ctf_head_t)
+    # ### Dig stuff
+    info = _make_bti_digitization(
+        info, head_shape_fname, convert, use_hpi, bti_dev_t, dev_ctf_t)
 
     logger.info(
         'Currently direct inclusion of 4D weight tables is not supported.'
@@ -1348,15 +1261,9 @@ def read_raw_bti(pdf_fname, config_fname='config',
     eog_ch : tuple of str | None
         The 4D names of the EOG channels. If None, the channels will be treated
         as regular EEG channels.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing.
-        If True, the data will be preloaded into memory (fast, requires
-        large amount of memory). If preload is a string, preload is the
-        file name of a memory-mapped file which is used to store the data
-        on the hard drive (slower, requires less memory).
+    %(preload)s
 
-        ..versionadded:: 0.11
-
+        .. versionadded:: 0.11
     %(verbose)s
 
     Returns

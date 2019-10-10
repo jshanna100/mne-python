@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
-#          Matti Hamalainen <msh@nmr.mgh.harvard.edu>
+# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
+#          Matti Hämäläinen <msh@nmr.mgh.harvard.edu>
 #          Martin Luessi <mluessi@nmr.mgh.harvard.edu>
 #          Denis Engemann <denis.engemann@gmail.com>
 #          Teon Brooks <teon.brooks@gmail.com>
@@ -23,7 +23,6 @@ from .meas_info import write_meas_info
 from .proj import setup_proj, activate_proj, _proj_equal, ProjMixin
 from ..channels.channels import (ContainsMixin, UpdateChannelsMixin,
                                  SetChannelsMixin, InterpolationMixin)
-from ..channels.montage import read_montage, _set_montage, Montage
 from .compensator import set_current_comp, make_compensator
 from .write import (start_file, end_file, start_block, end_block,
                     write_dau_pack16, write_float, write_double,
@@ -32,15 +31,14 @@ from .write import (start_file, end_file, start_block, end_block,
 
 from ..annotations import (_annotations_starts_stops, _write_annotations,
                            _handle_meas_date)
-from ..filter import (filter_data, notch_filter, resample, next_fast_len,
-                      _resample_stim_channels, _filt_check_picks,
-                      _filt_update_info)
+from ..filter import (FilterMixin, notch_filter, resample,
+                      _resample_stim_channels, _check_fun)
 from ..parallel import parallel_func
 from ..utils import (_check_fname, _check_pandas_installed, sizeof_fmt,
-                     _check_pandas_index_arguments, _pl, fill_doc,
-                     check_fname, _get_stim_channel, deprecated,
+                     _check_pandas_index_arguments, fill_doc, copy_doc,
+                     check_fname, _get_stim_channel,
                      logger, verbose, _time_mask, warn, SizeMixin,
-                     copy_function_doc_to_method_doc,
+                     copy_function_doc_to_method_doc, _validate_type,
                      _check_preload, _get_argvalues, _check_option)
 from ..viz import plot_raw, plot_raw_psd, plot_raw_psd_topo
 from ..defaults import _handle_default
@@ -49,12 +47,20 @@ from ..annotations import Annotations, _combine_annotations, _sync_onset
 from ..annotations import _ensure_annotation_object
 
 
+def _set_pandas_dtype(df, columns, dtype):
+    """Try to set the right columns to dtype."""
+    for column in columns:
+        df[column] = df[column].astype(dtype)
+        logger.info('Converting "%s" to "%s"...' % (column, dtype))
+
+
 class ToDataFrameMixin(object):
     """Class to add to_data_frame capabilities to certain classes."""
 
     @fill_doc
     def to_data_frame(self, picks=None, index=None, scaling_time=1e3,
-                      scalings=None, copy=True, start=None, stop=None):
+                      scalings=None, copy=True, start=None, stop=None,
+                      long_format=False):
         """Export data in tabular structure as a pandas DataFrame.
 
         Columns and indices will depend on the object being converted.
@@ -85,6 +91,14 @@ class ToDataFrameMixin(object):
             If it is a Raw object, this defines a stop index for creating
             the dataframe from a slice. The times will be interpolated from the
             index and the sampling rate of the signal.
+        long_format : bool
+            If True, the dataframe is returned in long format where each row
+            is one observation of the signal at a unique coordinate of
+            channels, time points, epochs and conditions. The number of
+            factors depends on the data container. For convenience,
+            a `ch_type` column is added when using this option that will
+            facilitate subsetting the resulting dataframe.
+            Defaults to False.
 
         Returns
         -------
@@ -100,6 +114,7 @@ class ToDataFrameMixin(object):
 
         pd = _check_pandas_installed()
         mindex = list()
+        ch_map = None
         # Treat SourceEstimates special because they don't have the same info
         if isinstance(self, _BaseSourceEstimate):
             if self.subject is None:
@@ -149,19 +164,20 @@ class ToDataFrameMixin(object):
                 data = data.T
                 col_names = [self.ch_names[k] for k in picks]
 
-            types = [channel_type(self.info, idx) for idx in picks]
-            n_channel_types = 0
-            ch_types_used = []
+            ch_types = [channel_type(self.info, idx) for idx in picks]
+            ch_map = dict(
+                zip([self.info['ch_names'][pp] for pp in picks],
+                    ch_types))
 
+            ch_types_used = list()
             scalings = _handle_default('scalings', scalings)
-            for t in scalings.keys():
-                if t in types:
-                    n_channel_types += 1
-                    ch_types_used.append(t)
+            for tt in scalings.keys():
+                if tt in ch_types:
+                    ch_types_used.append(tt)
 
-            for t in ch_types_used:
-                scaling = scalings[t]
-                idx = [i for i in range(len(picks)) if types[i] == t]
+            for tt in ch_types_used:
+                scaling = scalings[tt]
+                idx = [ii for ii in range(len(picks)) if ch_types[ii] == tt]
                 if len(idx) > 0:
                     data[:, idx] *= scaling
         else:
@@ -187,12 +203,30 @@ class ToDataFrameMixin(object):
         for i, (k, v) in enumerate(mindex):
             df.insert(i, k, v)
         if index is not None:
-            if 'time' in index:
-                logger.info('Converting time column to int64...')
-                df['time'] = df['time'].astype(np.int64)
+            if 'time' in index and not long_format:
+                _set_pandas_dtype(df, ['time'], np.int64)
             df.set_index(index, inplace=True)
         if all(i in default_index for i in index):
-            df.columns.name = 'signal'
+            if isinstance(self, _BaseSourceEstimate):
+                df.columns.name = 'source'
+            else:
+                df.columns.name = 'channel'
+
+        if long_format:
+            df = df.stack().reset_index()
+            columns = list(df.columns)
+            sig_idx = columns.index(0)
+            columns[sig_idx] = 'observation'
+            df.columns = columns
+
+            if not isinstance(self, _BaseSourceEstimate):
+                df['ch_type'] = df.channel.map(ch_map)
+
+            columns = list(df.columns)
+            to_factor = [
+                cc for cc in columns if cc not in ['observation', 'time']]
+            _set_pandas_dtype(df, to_factor, 'category')
+
         return df
 
 
@@ -227,21 +261,10 @@ class TimeMixin(object):
         return index.astype(int)
 
 
-def _check_fun(fun, d, *args, **kwargs):
-    """Check shapes."""
-    want_shape = d.shape
-    d = fun(d, *args, **kwargs)
-    if not isinstance(d, np.ndarray):
-        raise TypeError('Return value must be an ndarray')
-    if d.shape != want_shape:
-        raise ValueError('Return data must have shape %s not %s'
-                         % (want_shape, d.shape))
-    return d
-
-
 @fill_doc
 class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
-              InterpolationMixin, ToDataFrameMixin, TimeMixin, SizeMixin):
+              InterpolationMixin, ToDataFrameMixin, TimeMixin, SizeMixin,
+              FilterMixin):
     """Base class for Raw data.
 
     Parameters
@@ -325,15 +348,14 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
             if last_samps is None:
                 raise ValueError('last_samps must be given unless preload is '
                                  'an ndarray')
-            if preload is False:
+            if not preload:
                 self.preload = False
                 load_from_disk = False
-            elif preload is not True and not isinstance(preload, str):
-                raise ValueError('bad preload: %s' % preload)
             else:
                 load_from_disk = True
         self._last_samps = np.array(last_samps)
         self._first_samps = np.array(first_samps)
+        orig_ch_names = info['ch_names']
         info._check_consistency()  # make sure subclass did a good job
         self.info = info
         self.buffer_size_sec = float(buffer_size_sec)
@@ -357,14 +379,21 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
         self._filenames = list(filenames)
         self.orig_format = orig_format
         # Sanity check and set original units, if provided by the reader:
+
         if orig_units:
             if not isinstance(orig_units, dict):
                 raise ValueError('orig_units must be of type dict, but got '
                                  ' {}'.format(type(orig_units)))
 
-            # original units need to be truncated to 15 chars, which is what
-            # the MNE IO procedure also does with the other channels
-            orig_units_trunc = [ch[:15] for ch in orig_units]
+            # original units need to be truncated to 15 chars or renamed
+            # to match MNE conventions (channel name unique and less than
+            # 15 characters).
+            orig_units = deepcopy(orig_units)
+            for old_ch, new_ch in zip(orig_ch_names, info['ch_names']):
+                if old_ch in orig_units:
+                    this_unit = orig_units[old_ch]
+                    del orig_units[old_ch]
+                    orig_units[new_ch] = this_unit
 
             # STI 014 channel is native only to fif ... for all other formats
             # this was artificially added by the IO procedure, so remove it
@@ -375,7 +404,7 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
 
             # Each channel in the data must have a corresponding channel in
             # the original units.
-            ch_correspond = [ch in orig_units_trunc for ch in ch_names]
+            ch_correspond = [ch in orig_units for ch in ch_names]
             if not all(ch_correspond):
                 ch_without_orig_unit = ch_names[ch_correspond.index(False)]
                 raise ValueError('Channel {} has no associated original '
@@ -496,12 +525,8 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
                 raise ValueError('data_buffer has incorrect shape: %s != %s'
                                  % (data_buffer.shape, data_shape))
             data = data_buffer
-        elif isinstance(data_buffer, str):
-            # use a memmap
-            data = np.memmap(data_buffer, mode='w+',
-                             dtype=dtype, shape=data_shape)
         else:
-            data = np.zeros(data_shape, dtype=dtype)
+            data = _allocate_data(data_buffer, data_shape, dtype)
 
         # deal with having multiple files accessed by the raw object
         cumul_lens = np.concatenate(([0], np.array(self._raw_lengths,
@@ -636,8 +661,9 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
     @verbose
     def _preload_data(self, preload, verbose=None):
         """Actually preload the data."""
-        data_buffer = preload if isinstance(preload, (str,
-                                                      np.ndarray)) else None
+        data_buffer = preload
+        if isinstance(preload, (bool, np.bool_)) and not preload:
+            data_buffer = None
         logger.info('Reading %d ... %d  =  %9.3f ... %9.3f secs...' %
                     (0, len(self.times) - 1, 0., self.times[-1]))
         self._data = self._read_segment(data_buffer=data_buffer)
@@ -1079,206 +1105,58 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
 
         return self
 
-    @verbose
-    def apply_hilbert(self, picks=None, envelope=False, n_jobs=1, n_fft='auto',
-                      verbose=None):
-        """Compute analytic signal or envelope for a subset of channels.
-
-        If envelope=False, the analytic signal for the channels defined in
-        "picks" is computed and the data of the Raw object is converted to
-        a complex representation (the analytic signal is complex valued).
-
-        If envelope=True, the absolute value of the analytic signal for the
-        channels defined in "picks" is computed, resulting in the envelope
-        signal.
-
-        .. warning: Do not use ``envelope=True`` if you intend to compute
-                    an inverse solution from the raw data. If you want to
-                    compute the envelope in source space, use
-                    ``envelope=False`` and compute the envelope after the
-                    inverse solution has been obtained.
-
-        .. note:: If envelope=False, more memory is required since the
-                  original raw data as well as the analytic signal have
-                  temporarily to be stored in memory.
-
-        .. note:: If n_jobs > 1, more memory is required as
-                  ``len(picks) * n_times`` additional time points need to
-                  be temporaily stored in memory.
-
-        Parameters
-        ----------
-        %(picks_all_data_noref)s
-        envelope : bool (default: False)
-            Compute the envelope signal of each channel.
-        n_jobs: int
-            Number of jobs to run in parallel.
-        n_fft : int | None | str
-            Points to use in the FFT for Hilbert transformation. The signal
-            will be padded with zeros before computing Hilbert, then cut back
-            to original length. If None, n == self.n_times. If 'auto',
-            the next highest fast FFT length will be use.
-        %(verbose_meth)s
-
-        Returns
-        -------
-        self : instance of Raw
-            The raw object with transformed data.
-
-        Notes
-        -----
-        The analytic signal "x_a(t)" of "x(t)" is::
-
-            x_a = F^{-1}(F(x) 2U) = x + i y
-
-        where "F" is the Fourier transform, "U" the unit step function,
-        and "y" the Hilbert transform of "x". One usage of the analytic
-        signal is the computation of the envelope signal, which is given by
-        "e(t) = abs(x_a(t))". Due to the linearity of Hilbert transform and the
-        MNE inverse solution, the enevlope in source space can be obtained
-        by computing the analytic signal in sensor space, applying the MNE
-        inverse, and computing the envelope in source space.
-
-        Also note that the n_fft parameter will allow you to pad the signal
-        with zeros before performing the Hilbert transform. This padding
-        is cut off, but it may result in a slightly different result
-        (particularly around the edges). Use at your own risk.
-        """
-        if n_fft is None:
-            n_fft = len(self.times)
-        elif isinstance(n_fft, str):
-            if n_fft != 'auto':
-                raise ValueError('n_fft must be an integer, string, or None, '
-                                 'got %s' % (type(n_fft),))
-            n_fft = next_fast_len(len(self.times))
-        n_fft = int(n_fft)
-        if n_fft < self.n_times:
-            raise ValueError("n_fft must be greater than n_times")
-        if envelope is True:
-            dtype = None
-        else:
-            dtype = np.complex64
-        return self.apply_function(_my_hilbert, picks, dtype, n_jobs, n_fft,
-                                   envelope=envelope)
-
-    @verbose
+    # Need a separate method because the default pad is different for raw
+    @copy_doc(FilterMixin.filter)
     def filter(self, l_freq, h_freq, picks=None, filter_length='auto',
                l_trans_bandwidth='auto', h_trans_bandwidth='auto', n_jobs=1,
                method='fir', iir_params=None, phase='zero',
                fir_window='hamming', fir_design='firwin',
                skip_by_annotation=('edge', 'bad_acq_skip'),
-               pad='reflect_limited', verbose=None):
-        """Filter a subset of channels.
+               pad='reflect_limited', verbose=None):  # noqa: D102
+        return super().filter(
+            l_freq, h_freq, picks, filter_length, l_trans_bandwidth,
+            h_trans_bandwidth, n_jobs, method, iir_params, phase,
+            fir_window, fir_design, skip_by_annotation, pad, verbose)
 
-        Applies a zero-phase low-pass, high-pass, band-pass, or band-stop
-        filter to the channels selected by ``picks``. By default the data
-        of the Raw object is modified inplace.
-
-        The Raw object has to have the data loaded e.g. with ``preload=True``
-        or ``self.load_data()``.
-
-        ``l_freq`` and ``h_freq`` are the frequencies below which and above
-        which, respectively, to filter out of the data. Thus the uses are:
-
-            * ``l_freq < h_freq``: band-pass filter
-            * ``l_freq > h_freq``: band-stop filter
-            * ``l_freq is not None and h_freq is None``: high-pass filter
-            * ``l_freq is None and h_freq is not None``: low-pass filter
-
-        ``self.info['lowpass']`` and ``self.info['highpass']`` are only
-        updated with picks=None.
-
-        .. note:: If n_jobs > 1, more memory is required as
-                  ``len(picks) * n_times`` additional time points need to
-                  be temporaily stored in memory.
+    @verbose
+    def notch_filter(self, freqs, picks=None, filter_length='auto',
+                     notch_widths=None, trans_bandwidth=1.0, n_jobs=1,
+                     method='fir', iir_params=None, mt_bandwidth=None,
+                     p_value=0.05, phase='zero', fir_window='hamming',
+                     fir_design='firwin', pad='reflect_limited', verbose=None):
+        """Notch filter a subset of channels.
 
         Parameters
         ----------
-        l_freq : float | None
-            Low cut-off frequency in Hz. If None the data are only low-passed.
-        h_freq : float | None
-            High cut-off frequency in Hz. If None the data are only
-            high-passed.
+        freqs : float | array of float | None
+            Specific frequencies to filter out from data, e.g.,
+            np.arange(60, 241, 60) in the US or np.arange(50, 251, 50) in
+            Europe. None can only be used with the mode 'spectrum_fit',
+            where an F test is used to find sinusoidal components.
         %(picks_all_data)s
-        filter_length : str | int
-            Length of the FIR filter to use (if applicable):
-
-            * 'auto' (default): the filter length is chosen based
-              on the size of the transition regions (6.6 times the reciprocal
-              of the shortest transition band for fir_window='hamming'
-              and fir_design="firwin2", and half that for "firwin").
-            * str: a human-readable time in
-              units of "s" or "ms" (e.g., "10s" or "5500ms") will be
-              converted to that number of samples if ``phase="zero"``, or
-              the shortest power-of-two length at least that duration for
-              ``phase="zero-double"``.
-            * int: specified length in samples. For fir_design="firwin",
-              this should not be used.
-
-        l_trans_bandwidth : float | str
-            Width of the transition band at the low cut-off frequency in Hz
-            (high pass or cutoff 1 in bandpass). Can be "auto"
-            (default) to use a multiple of ``l_freq``::
-
-                min(max(l_freq * 0.25, 2), l_freq)
-
+        %(filter_length)s
+        notch_widths : float | array of float | None
+            Width of each stop band (centred at each freq in freqs) in Hz.
+            If None, freqs / 200 is used.
+        trans_bandwidth : float
+            Width of the transition band in Hz.
             Only used for ``method='fir'``.
-        h_trans_bandwidth : float | str
-            Width of the transition band at the high cut-off frequency in Hz
-            (low pass or cutoff 2 in bandpass). Can be "auto"
-            (default) to use a multiple of ``h_freq``::
-
-                min(max(h_freq * 0.25, 2.), info['sfreq'] / 2. - h_freq)
-
-            Only used for ``method='fir'``.
-        n_jobs : int | str
-            Number of jobs to run in parallel.
-            Can be 'cuda' if ``cupy`` is installed properly and method='fir'.
-        method : str
-            'fir' will use overlap-add FIR filtering, 'iir' will use IIR
-            forward-backward filtering (via filtfilt).
-        iir_params : dict | None
-            Dictionary of parameters to use for IIR filtering.
-            See mne.filter.construct_iir_filter for details. If iir_params
-            is None and method="iir", 4th order Butterworth will be used.
-        phase : str
-            Phase of the filter, only used if ``method='fir'``.
-            By default, a symmetric linear-phase FIR filter is constructed.
-            If ``phase='zero'`` (default), the delay of this filter
-            is compensated for. If ``phase=='zero-double'``, then this filter
-            is applied twice, once forward, and once backward. If 'minimum',
-            then a minimum-phase, causal filter will be used.
-
-            .. versionadded:: 0.13
-        fir_window : str
-            The window to use in FIR design, can be "hamming" (default),
-            "hann" (default in 0.13), or "blackman".
-
-            .. versionadded:: 0.13
-        fir_design : str
-            Can be "firwin" (default) to use :func:`scipy.signal.firwin`,
-            or "firwin2" to use :func:`scipy.signal.firwin2`. "firwin" uses
-            a time-domain design technique that generally gives improved
-            attenuation using fewer samples than "firwin2".
-
-            .. versionadded:: 0.15
-        skip_by_annotation : str | list of str
-            If a string (or list of str), any annotation segment that begins
-            with the given string will not be included in filtering, and
-            segments on either side of the given excluded annotated segment
-            will be filtered separately (i.e., as independent signals).
-            The default (``('edge', 'bad_acq_skip')`` will separately filter
-            any segments that were concatenated by :func:`mne.concatenate_raws`
-            or :meth:`mne.io.Raw.append`, or separated during acquisition.
-            To disable, provide an empty list.
-
-            .. versionadded:: 0.16.
-        pad : str
-            The type of padding to use. Supports all :func:`numpy.pad` ``mode``
-            options. Can also be "reflect_limited" (default), which pads with a
-            reflected version of each vector mirrored on the first and last
-            values of the vector, followed by zeros.
-            Only used for ``method='fir'``.
+        %(n_jobs-fir)s
+        %(method-fir)s
+        %(iir_params)s
+        mt_bandwidth : float | None
+            The bandwidth of the multitaper windowing function in Hz.
+            Only used in 'spectrum_fit' mode.
+        p_value : float
+            p-value to use in F-test thresholding to determine significant
+            sinusoidal components to remove when method='spectrum_fit' and
+            freqs=None. Note that this will be Bonferroni corrected for the
+            number of frequencies, so large p-values may be justified.
+        %(phase)s
+        %(fir_window)s
+        %(fir_design)s
+        %(pad-fir)s
+            The default is ``'reflect_limited'``.
 
             .. versionadded:: 0.15
         %(verbose_meth)s
@@ -1290,51 +1168,11 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
 
         See Also
         --------
-        mne.Epochs.savgol_filter
-        mne.io.Raw.notch_filter
-        mne.io.Raw.resample
-        mne.filter.filter_data
-        mne.filter.construct_iir_filter
+        mne.filter.notch_filter
+        mne.io.Raw.filter
 
         Notes
         -----
-        For more information, see the tutorials
-        :ref:`sphx_glr_auto_tutorials_plot_background_filtering.py`
-        and
-        :ref:`sphx_glr_auto_tutorials_plot_artifacts_correction_filtering.py`.
-        """
-        _check_preload(self, 'raw.filter')
-        update_info, picks = _filt_check_picks(self.info, picks,
-                                               l_freq, h_freq)
-        # Deal with annotations
-        onsets, ends = _annotations_starts_stops(
-            self, skip_by_annotation, 'skip_by_annotation', invert=True)
-        logger.info('Filtering raw data in %d contiguous segment%s'
-                    % (len(onsets), _pl(onsets)))
-        max_idx = (ends - onsets).argmax()
-        for si, (start, stop) in enumerate(zip(onsets, ends)):
-            # Only output filter params once (for info level), and only warn
-            # once about the length criterion (longest segment is too short)
-            use_verbose = verbose if si == max_idx else 'error'
-            filter_data(
-                self._data[:, start:stop], self.info['sfreq'], l_freq, h_freq,
-                picks, filter_length, l_trans_bandwidth, h_trans_bandwidth,
-                n_jobs, method, iir_params, copy=False, phase=phase,
-                fir_window=fir_window, fir_design=fir_design, pad=pad,
-                verbose=use_verbose)
-        # update info if filter is applied to all data channels,
-        # and it's not a band-stop filter
-        _filt_update_info(self.info, update_info, l_freq, h_freq)
-        return self
-
-    @verbose
-    def notch_filter(self, freqs, picks=None, filter_length='auto',
-                     notch_widths=None, trans_bandwidth=1.0, n_jobs=1,
-                     method='fir', iir_params=None, mt_bandwidth=None,
-                     p_value=0.05, phase='zero', fir_window='hamming',
-                     fir_design='firwin', pad='reflect_limited', verbose=None):
-        """Notch filter a subset of channels.
-
         Applies a zero-phase notch filter to the channels selected by
         "picks". By default the data of the Raw object is modified inplace.
 
@@ -1345,95 +1183,6 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
                   ``len(picks) * n_times`` additional time points need to
                   be temporaily stored in memory.
 
-        Parameters
-        ----------
-        freqs : float | array of float | None
-            Specific frequencies to filter out from data, e.g.,
-            np.arange(60, 241, 60) in the US or np.arange(50, 251, 50) in
-            Europe. None can only be used with the mode 'spectrum_fit',
-            where an F test is used to find sinusoidal components.
-        %(picks_all_data)s
-        filter_length : str | int
-            Length of the FIR filter to use (if applicable):
-
-                * int: specified length in samples.
-                * 'auto' (default): the filter length is chosen based
-                  on the size of the transition regions (6.6 times the
-                  reciprocal of the shortest transition band for
-                  fir_window='hamming').
-                * str: a human-readable time in
-                  units of "s" or "ms" (e.g., "10s" or "5500ms") will be
-                  converted to that number of samples if ``phase="zero"``, or
-                  the shortest power-of-two length at least that duration for
-                  ``phase="zero-double"``.
-
-        notch_widths : float | array of float | None
-            Width of each stop band (centred at each freq in freqs) in Hz.
-            If None, freqs / 200 is used.
-        trans_bandwidth : float
-            Width of the transition band in Hz.
-            Only used for ``method='fir'``.
-        n_jobs : int | str
-            Number of jobs to run in parallel. Can be 'cuda' if ``cupy``
-            is installed properly and method='fir'.
-        method : str
-            'fir' will use overlap-add FIR filtering, 'iir' will use IIR
-            forward-backward filtering (via filtfilt). 'spectrum_fit' will
-            use multi-taper estimation of sinusoidal components.
-        iir_params : dict | None
-            Dictionary of parameters to use for IIR filtering.
-            See mne.filter.construct_iir_filter for details. If iir_params
-            is None and method="iir", 4th order Butterworth will be used.
-        mt_bandwidth : float | None
-            The bandwidth of the multitaper windowing function in Hz.
-            Only used in 'spectrum_fit' mode.
-        p_value : float
-            p-value to use in F-test thresholding to determine significant
-            sinusoidal components to remove when method='spectrum_fit' and
-            freqs=None. Note that this will be Bonferroni corrected for the
-            number of frequencies, so large p-values may be justified.
-        phase : str
-            Phase of the filter, only used if ``method='fir'``.
-            By default, a symmetric linear-phase FIR filter is constructed.
-            If ``phase='zero'`` (default), the delay of this filter
-            is compensated for. If ``phase=='zero-double'``, then this filter
-            is applied twice, once forward, and once backward. If 'minimum',
-            then a minimum-phase, causal filter will be used.
-
-            .. versionadded:: 0.13
-        fir_window : str
-            The window to use in FIR design, can be "hamming" (default),
-            "hann", or "blackman".
-
-            .. versionadded:: 0.13
-        fir_design : str
-            Can be "firwin" (default) to use :func:`scipy.signal.firwin`,
-            or "firwin2" to use :func:`scipy.signal.firwin2`. "firwin" uses
-            a time-domain design technique that generally gives improved
-            attenuation using fewer samples than "firwin2".
-
-            ..versionadded:: 0.15
-        pad : str
-            The type of padding to use. Supports all :func:`numpy.pad` ``mode``
-            options. Can also be "reflect_limited" (default), which pads with a
-            reflected version of each vector mirrored on the first and last
-            values of the vector, followed by zeros.
-            Only used for ``method='fir'``.
-
-            .. versionadded:: 0.15
-        %(verbose_meth)s
-
-        Returns
-        -------
-        raw : instance of Raw
-            The raw instance with filtered data.
-
-        See Also
-        --------
-        mne.io.Raw.filter
-
-        Notes
-        -----
         For details, see :func:`mne.filter.notch_filter`.
         """
         fs = float(self.info['sfreq'])
@@ -1450,7 +1199,8 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
 
     @verbose
     def resample(self, sfreq, npad='auto', window='boxcar', stim_picks=None,
-                 n_jobs=1, events=None, pad='reflect_limited', verbose=None):
+                 n_jobs=1, events=None, pad='reflect_limited',
+                 verbose=None):  # lgtm
         """Resample all channels.
 
         The Raw object has to have the data loaded e.g. with ``preload=True``
@@ -1464,7 +1214,8 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
                      but instead epoch and then downsample, as epoching
                      downsampled data jitters triggers.
                      For more, see
-                     `this illustrative gist <https://gist.github.com/larsoner/01642cb3789992fbca59>`_.
+                     `this illustrative gist
+                     <https://gist.github.com/larsoner/01642cb3789992fbca59>`_.
 
                      If resampling the continuous data is desired, it is
                      recommended to construct events using the original data.
@@ -1476,31 +1227,21 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
         ----------
         sfreq : float
             New sample rate to use.
-        npad : int | str
-            Amount to pad the start and end of the data.
-            Can also be "auto" to use a padding that will result in
-            a power-of-two size (can be much faster).
-        window : string or tuple
-            Frequency-domain window to use in resampling.
-            See :func:`scipy.signal.resample`.
+        %(npad)s
+        %(window-resample)s
         stim_picks : list of int | None
             Stim channels. These channels are simply subsampled or
             supersampled (without applying any filtering). This reduces
             resampling artifacts in stim channels, but may lead to missing
             triggers. If None, stim channels are automatically chosen using
             :func:`mne.pick_types`.
-        n_jobs : int | str
-            Number of jobs to run in parallel. Can be 'cuda' if ``cupy``
-            is installed properly and method='fir'.
+        %(n_jobs-cuda)s
         events : 2D array, shape (n_events, 3) | None
             An optional event matrix. When specified, the onsets of the events
             are resampled jointly with the data. NB: The input events are not
             modified, but a new array is returned with the raw instead.
-        pad : str
-            The type of padding to use. Supports all :func:`numpy.pad` ``mode``
-            options. Can also be "reflect_limited" (default), which pads with a
-            reflected version of each vector mirrored on the first and last
-            values of the vector, followed by zeros.
+        %(pad-fir)s
+            The default is ``'reflect_limited'``.
 
             .. versionadded:: 0.15
         %(verbose_meth)s
@@ -1521,7 +1262,7 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
         -----
         For some data, it may be more accurate to use ``npad=0`` to reduce
         artifacts. This is dataset dependent -- check your data!
-        """  # noqa: E501
+        """
         _check_preload(self, 'raw.resample')
 
         # When no event object is supplied, some basic detection of dropped
@@ -1571,8 +1312,9 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
 
         self._data = np.concatenate(new_data, axis=1)
         self.info['sfreq'] = sfreq
-        if self.info.get('lowpass') is not None:
-            self.info['lowpass'] = min(self.info['lowpass'], sfreq / 2.)
+        lowpass = self.info.get('lowpass')
+        lowpass = np.inf if lowpass is None else lowpass
+        self.info['lowpass'] = min(lowpass, sfreq / 2.)
         self._update_times()
 
         # See the comment above why we ignore all errors here.
@@ -1595,11 +1337,12 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
 
             events[:, 0] = np.minimum(
                 np.round(events[:, 0] * ratio).astype(int),
-                self._data.shape[1] + self.first_samp
+                self._data.shape[1] + self.first_samp - 1
             )
             return self, events
 
-    def crop(self, tmin=0.0, tmax=None):
+    @fill_doc
+    def crop(self, tmin=0.0, tmax=None, include_tmax=True):
         """Crop raw data file.
 
         Limit the data from the raw file to go between specific times. Note
@@ -1616,6 +1359,7 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
             New start time in seconds (must be >= 0).
         tmax : float | None
             New end time in seconds of the data (cannot exceed data duration).
+        %(include_tmax)s
 
         Returns
         -------
@@ -1627,15 +1371,17 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
             tmax = max_time
 
         if tmin > tmax:
-            raise ValueError('tmin must be less than tmax')
+            raise ValueError('tmin (%s) must be less than tmax (%s)'
+                             % (tmin, tmax))
         if tmin < 0.0:
-            raise ValueError('tmin must be >= 0')
+            raise ValueError('tmin (%s) must be >= 0' % (tmin,))
         elif tmax > max_time:
-            raise ValueError('tmax must be less than or equal to the max raw '
-                             'time (%0.4f sec)' % max_time)
+            raise ValueError('tmax (%s) must be less than or equal to the max '
+                             'time (%0.4f sec)' % (tmax, max_time))
 
-        smin, smax = np.where(_time_mask(self.times, tmin, tmax,
-                                         sfreq=self.info['sfreq']))[0][[0, -1]]
+        smin, smax = np.where(_time_mask(
+            self.times, tmin, tmax, sfreq=self.info['sfreq'],
+            include_tmax=include_tmax))[0][[0, -1]]
         cumul_lens = np.concatenate(([0], np.array(self._raw_lengths,
                                                    dtype='int')))
         cumul_lens = np.cumsum(cumul_lens)
@@ -1675,8 +1421,8 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
         fname : string
             File name of the new dataset. This has to be a new filename
             unless data have been preloaded. Filenames should end with
-            raw.fif, raw.fif.gz, raw_sss.fif, raw_sss.fif.gz, raw_tsss.fif
-            or raw_tsss.fif.gz.
+            raw.fif, raw.fif.gz, raw_sss.fif, raw_sss.fif.gz, raw_tsss.fif,
+            raw_tsss.fif.gz, or _meg.fif.
         %(picks_all)s
         tmin : float | None
             Time in seconds of first sample to save. If None first sample
@@ -1736,13 +1482,12 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
         or all forms of SSS). It is recommended not to concatenate and
         then save raw files for this reason.
         """
+        fname = op.realpath(fname)
         check_fname(fname, 'raw', ('raw.fif', 'raw_sss.fif', 'raw_tsss.fif',
                                    'raw.fif.gz', 'raw_sss.fif.gz',
-                                   'raw_tsss.fif.gz'))
+                                   'raw_tsss.fif.gz', '_meg.fif'))
 
         split_size = _get_split_size(split_size)
-
-        fname = op.realpath(fname)
         if not self.preload and fname in self._filenames:
             raise ValueError('You cannot save data to the same file.'
                              ' Please use a different filename.')
@@ -1812,29 +1557,32 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
              show_options=False, title=None, show=True, block=False,
              highpass=None, lowpass=None, filtorder=4, clipping=None,
              show_first_samp=False, proj=True, group_by='type',
-             butterfly=False, decim='auto', noise_cov=None, event_id=None):
+             butterfly=False, decim='auto', noise_cov=None, event_id=None,
+             show_scrollbars=True, verbose=None):
         return plot_raw(self, events, duration, start, n_channels, bgcolor,
                         color, bad_color, event_color, scalings, remove_dc,
                         order, show_options, title, show, block, highpass,
                         lowpass, filtorder, clipping, show_first_samp, proj,
                         group_by, butterfly, decim, noise_cov=noise_cov,
-                        event_id=event_id)
+                        event_id=event_id, show_scrollbars=show_scrollbars,
+                        verbose=verbose)
 
     @verbose
     @copy_function_doc_to_method_doc(plot_raw_psd)
-    def plot_psd(self, tmin=0.0, tmax=np.inf, fmin=0, fmax=np.inf,
-                 proj=False, n_fft=None, picks=None, ax=None,
-                 color='black', area_mode='std', area_alpha=0.33,
-                 n_overlap=0, dB=True, estimate='auto', average=None,
-                 show=True, n_jobs=1, line_alpha=None, spatial_colors=None,
-                 xscale='linear', reject_by_annotation=True, verbose=None):
-        return plot_raw_psd(
-            self, tmin=tmin, tmax=tmax, fmin=fmin, fmax=fmax, proj=proj,
-            n_fft=n_fft, picks=picks, ax=ax, color=color, area_mode=area_mode,
-            area_alpha=area_alpha, n_overlap=n_overlap, dB=dB,
-            estimate=estimate, average=average, show=show, n_jobs=n_jobs,
-            line_alpha=line_alpha, spatial_colors=spatial_colors,
-            xscale=xscale, reject_by_annotation=reject_by_annotation)
+    def plot_psd(self, fmin=0, fmax=np.inf, tmin=None, tmax=None, proj=False,
+                 n_fft=None, n_overlap=0, reject_by_annotation=True,
+                 picks=None, ax=None, color='black', xscale='linear',
+                 area_mode='std', area_alpha=0.33, dB=True, estimate='auto',
+                 show=True, n_jobs=1, average=False, line_alpha=None,
+                 spatial_colors=True, verbose=None):
+        return plot_raw_psd(self, fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax,
+                            proj=proj, n_fft=n_fft, n_overlap=n_overlap,
+                            reject_by_annotation=reject_by_annotation,
+                            picks=picks, ax=ax, color=color, xscale=xscale,
+                            area_mode=area_mode, area_alpha=area_alpha,
+                            dB=dB, estimate=estimate, show=show, n_jobs=n_jobs,
+                            average=average, line_alpha=line_alpha,
+                            spatial_colors=spatial_colors, verbose=verbose)
 
     @copy_function_doc_to_method_doc(plot_raw_psd_topo)
     def plot_psd_topo(self, tmin=0., tmax=None, fmin=0, fmax=100, proj=False,
@@ -1849,85 +1597,6 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
                                  axis_facecolor=axis_facecolor, dB=dB,
                                  show=show, block=block, n_jobs=n_jobs,
                                  axes=axes, verbose=verbose)
-
-    @deprecated('raw.estimate_rank is deprecated and will be removed in 0.19, '
-                'use mne.compute_rank instead.')
-    @verbose
-    def estimate_rank(self, tstart=0.0, tstop=30.0, tol=1e-4,
-                      return_singular=False, picks=None, scalings='norm',
-                      verbose=None):
-        """Estimate rank of the raw data.
-
-        This function is meant to provide a reasonable estimate of the rank.
-        The true rank of the data depends on many factors, so use at your
-        own risk.
-
-        Parameters
-        ----------
-        tstart : float
-            Start time to use for rank estimation. Default is 0.0.
-        tstop : float | None
-            End time to use for rank estimation. Default is 30.0.
-            If None, the end time of the raw file is used.
-        tol : float
-            Tolerance for singular values to consider non-zero in
-            calculating the rank. The singular values are calculated
-            in this method such that independent data are expected to
-            have singular value around one.
-        return_singular : bool
-            If True, also return the singular values that were used
-            to determine the rank.
-        %(picks_good_data)s
-        scalings : dict | 'norm' | None
-            To achieve reliable rank estimation on multiple sensors,
-            sensors have to be rescaled. This parameter controls the
-            rescaling. If dict, it will update the
-            following dict of defaults:
-
-                dict(mag=1e11, grad=1e9, eeg=1e5)
-
-            If 'norm' data will be scaled by internally computed
-            channel-wise norms. None will perform no scaling.
-            Defaults to 'norm'.
-        %(verbose)s
-
-        Returns
-        -------
-        rank : int
-            Estimated rank of the data.
-        s : array
-            If return_singular is True, the singular values that were
-            thresholded to determine the rank are also returned.
-
-        Notes
-        -----
-        If data are not pre-loaded, the appropriate data will be loaded
-        by this function (can be memory intensive).
-
-        Projectors are not taken into account unless they have been applied
-        to the data using apply_proj(), since it is not always possible
-        to tell whether or not projectors have been applied previously.
-
-        Bad channels will be excluded from calculations.
-        """
-        from ..rank import _estimate_rank_meeg_signals
-
-        start = max(0, self.time_as_index(tstart)[0])
-        if tstop is None:
-            stop = self.n_times - 1
-        else:
-            stop = min(self.n_times - 1, self.time_as_index(tstop)[0])
-        tslice = slice(start, stop + 1)
-        picks = _picks_to_idx(self.info, picks, with_ref_meg=False)
-        # ensure we don't get a view of data
-        if len(picks) == 1:
-            return 1.0, 1.0
-        # this should already be a copy, so we can overwrite it
-        data = self[picks, tslice][0]
-        out = _estimate_rank_meeg_signals(
-            data, pick_info(self.info, picks),
-            scalings=scalings, tol=tol, return_singular=return_singular)
-        return out
 
     @property
     def ch_names(self):
@@ -2053,12 +1722,7 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
                 this_data = self._data
 
             # allocate the buffer
-            if isinstance(preload, str):
-                _data = np.memmap(preload, mode='w+', dtype=this_data.dtype,
-                                  shape=(nchan, nsamp))
-            else:
-                _data = np.empty((nchan, nsamp), dtype=this_data.dtype)
-
+            _data = _allocate_data(preload, (nchan, nsamp), this_data.dtype)
             _data[:, 0:c_ns[0]] = this_data
 
             for ri in range(len(raws)):
@@ -2106,7 +1770,7 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
         Does nothing for objects that close their file descriptors.
         Things like RawFIF will override this method.
         """
-        pass
+        pass  # noqa
 
     def copy(self):
         """Return copy of Raw instance."""
@@ -2172,16 +1836,13 @@ class BaseRaw(ProjMixin, ContainsMixin, UpdateChannelsMixin, SetChannelsMixin,
         return int(np.ceil(buffer_size_sec * self.info['sfreq']))
 
 
-def _allocate_data(data, data_buffer, data_shape, dtype):
+def _allocate_data(preload, shape, dtype):
     """Allocate data in memory or in memmap for preloading."""
-    if data is None:
-        # if not already done, allocate array with right type
-        if isinstance(data_buffer, str):
-            # use a memmap
-            data = np.memmap(data_buffer, mode='w+',
-                             dtype=dtype, shape=data_shape)
-        else:
-            data = np.zeros(data_shape, dtype=dtype)
+    if preload in (None, True):  # None comes from _read_segment
+        data = np.zeros(shape, dtype)
+    else:
+        _validate_type(preload, 'path-like', 'preload')
+        data = np.memmap(str(preload), mode='w+', dtype=dtype, shape=shape)
     return data
 
 
@@ -2371,7 +2032,7 @@ def _write_raw(fname, raw, info, picks, fmt, data_type, reset_range, start,
 
     logger.info('Closing %s [done]' % use_fname)
     if info.get('maxshield', False):
-        end_block(fid, FIFF.FIFFB_SMSH_RAW_DATA)
+        end_block(fid, FIFF.FIFFB_IAS_RAW_DATA)
     else:
         end_block(fid, FIFF.FIFFB_RAW_DATA)
     end_block(fid, FIFF.FIFFB_MEAS)
@@ -2444,7 +2105,7 @@ def _start_writing_raw(name, info, sel, data_type,
     # Start the raw data
     #
     if info.get('maxshield', False):
-        start_block(fid, FIFF.FIFFB_SMSH_RAW_DATA)
+        start_block(fid, FIFF.FIFFB_IAS_RAW_DATA)
     else:
         start_block(fid, FIFF.FIFFB_RAW_DATA)
 
@@ -2492,33 +2153,6 @@ def _write_raw_buffer(fid, buf, cals, fmt):
 
     buf = buf / np.ravel(cals)[:, None]
     write_function(fid, FIFF.FIFF_DATA_BUFFER, buf)
-
-
-def _my_hilbert(x, n_fft=None, envelope=False):
-    """Compute Hilbert transform of signals w/ zero padding.
-
-    Parameters
-    ----------
-    x : array, shape (n_times)
-        The signal to convert
-    n_fft : int
-        Size of the FFT to perform, must be at least ``len(x)``.
-        The signal will be cut back to original length.
-    envelope : bool
-        Whether to compute amplitude of the hilbert transform in order
-        to return the signal envelope.
-
-    Returns
-    -------
-    out : array, shape (n_times)
-        The hilbert transform of the signal, or the envelope.
-    """
-    from scipy.signal import hilbert
-    n_x = x.shape[-1]
-    out = hilbert(x, N=n_fft)[:n_x]
-    if envelope is True:
-        out = np.abs(out)
-    return out
 
 
 def _check_raw_compatibility(raw):
@@ -2588,36 +2222,6 @@ def concatenate_raws(raws, preload=None, events_list=None, verbose=None):
         return raws[0]
     else:
         return raws[0], events
-
-
-def _check_update_montage(info, montage, path=None, update_ch_names=False,
-                          raise_missing=True):
-    """Help eeg readers to add montage."""
-    if montage is not None:
-        if not isinstance(montage, (str, Montage)):
-            err = ("Montage must be str, None, or instance of Montage. "
-                   "%s was provided" % type(montage))
-            raise TypeError(err)
-        if montage is not None:
-            if isinstance(montage, str):
-                montage = read_montage(montage, path=path)
-            _set_montage(info, montage, update_ch_names=update_ch_names)
-
-            missing_positions = []
-            exclude = (FIFF.FIFFV_EOG_CH, FIFF.FIFFV_MISC_CH,
-                       FIFF.FIFFV_STIM_CH)
-            for ch in info['chs']:
-                if not ch['kind'] in exclude:
-                    if not np.isfinite(ch['loc'][:3]).all():
-                        missing_positions.append(ch['ch_name'])
-
-            # raise error if positions are missing
-            if missing_positions and raise_missing:
-                raise KeyError(
-                    "The following positions are missing from the montage "
-                    "definitions: %s. If those channels lack positions "
-                    "because they are EOG channels use the eog parameter."
-                    % str(missing_positions))
 
 
 def _check_maxshield(allow_maxshield):

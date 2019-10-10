@@ -2,22 +2,30 @@
 #
 # License: BSD (3-clause)
 
+import os.path as op
 import numpy as np
 import pytest
 
 from mne import create_info
-from mne.io import RawArray
+from mne.datasets import testing
+from mne.io import RawArray, read_raw_fif
 from mne.preprocessing import mark_flat
 
+data_path = testing.data_path(download=False)
+skip_fname = op.join(data_path, 'misc', 'intervalrecording_raw.fif')
 
-def test_mark_flat():
+
+@pytest.mark.parametrize('first_samp', (0, 10000))
+def test_mark_flat(first_samp):
     """Test marking flat segments."""
     # Test if ECG analysis will work on data that is not preloaded
     n_ch, n_times = 11, 1000
     data = np.random.RandomState(0).randn(n_ch, n_times)
     assert not (np.diff(data, axis=-1) == 0).any()  # nothing flat at first
     info = create_info(n_ch, 1000., 'eeg')
-    raw = RawArray(data, info)
+    info['meas_date'] = (1, 2)
+    # test first_samp != for gh-6295
+    raw = RawArray(data, info, first_samp=first_samp)
     raw.info['bads'] = [raw.ch_names[-1]]
 
     #
@@ -59,3 +67,16 @@ def test_mark_flat():
         mark_flat(0.)
     with pytest.raises(ValueError, match='not convert string to float'):
         mark_flat(raw, 'x')
+
+
+@testing.requires_testing_data
+def test_flat_acq_skip():
+    """Test that acquisition skips are handled properly."""
+    raw = read_raw_fif(skip_fname).load_data()
+    n_annot = len(raw.annotations)
+    mark_flat(raw)
+    assert len(raw.annotations) == n_annot
+    assert raw.info['bads'] == [  # MaxFilter finds the same 21 channels
+        'MEG%04d' % (int(num),) for num in
+        '141 331 421 431 611 641 1011 1021 1031 1241 1421 '
+        '1741 1841 2011 2131 2141 2241 2531 2541 2611 2621'.split()]

@@ -1,10 +1,10 @@
-# Author: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Author: Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #         Daniel Strohmeier <daniel.strohmeier@gmail.com>
 #
 # License: Simplified BSD
 
 import numpy as np
-from scipy import linalg, signal
+from scipy import linalg
 
 from ..source_estimate import (SourceEstimate, VolSourceEstimate,
                                _BaseSourceEstimate)
@@ -13,7 +13,7 @@ from ..minimum_norm.inverse import (combine_xyz, _prepare_forward,
 from ..forward import is_fixed_orient
 from ..io.pick import pick_channels_evoked
 from ..io.proj import deactivate_proj
-from ..utils import logger, verbose, warn, _check_depth
+from ..utils import logger, verbose, _check_depth
 from ..dipole import Dipole
 
 from .mxne_optim import (mixed_norm_solver, iterative_mixed_norm_solver, _Phi,
@@ -228,15 +228,15 @@ def make_stc_from_dipoles(dipoles, src, verbose=None):
     vertices = [np.array(lh_vertno).astype(int),
                 np.array(rh_vertno).astype(int)]
     stc = SourceEstimate(X, vertices=vertices, tmin=tmin, tstep=tstep,
-                         subject=src[0]['subject_his_id'])
+                         subject=src._subject)
     logger.info('[done]')
     return stc
 
 
 @verbose
 def mixed_norm(evoked, forward, noise_cov, alpha, loose='auto', depth=0.8,
-               maxit=3000, tol=1e-4, active_set_size=10, pca=None,
-               debias=True, time_pca=True, weights=None, weights_min=None,
+               maxit=3000, tol=1e-4, active_set_size=10,
+               debias=True, time_pca=True, weights=None, weights_min=0.,
                solver='auto', n_mxne_iter=1, return_residual=False,
                return_as_dipoles=False, dgap_freq=10, rank=None,
                verbose=None):
@@ -270,8 +270,6 @@ def mixed_norm(evoked, forward, noise_cov, alpha, loose='auto', depth=0.8,
         Tolerance parameter.
     active_set_size : int | None
         Size of active set increment. If None, no active set strategy is used.
-    pca : bool
-        If True the rank of the data is reduced to true dimension.
     debias : bool
         Remove coefficient amplitude bias due to L1 penalty.
     time_pca : bool or int
@@ -318,7 +316,7 @@ def mixed_norm(evoked, forward, noise_cov, alpha, loose='auto', depth=0.8,
 
     References
     ----------
-    .. [1] A. Gramfort, M. Kowalski, M. Hamalainen,
+    .. [1] A. Gramfort, M. Kowalski, M. Hämäläinen,
        "Mixed-norm estimates for the M/EEG inverse problem using accelerated
        gradient methods", Physics in Medicine and Biology, 2012.
        https://doi.org/10.1088/0031-9155/57/7/1937
@@ -338,11 +336,7 @@ def mixed_norm(evoked, forward, noise_cov, alpha, loose='auto', depth=0.8,
         raise ValueError('dgap_freq must be a positive integer.'
                          ' Got dgap_freq = %s' % dgap_freq)
 
-    if pca is None:
-        pca = True
-    else:
-        warn('pca argument is deprecated and will be removed in 0.19, do '
-             'not set it. It should not affect results.', DeprecationWarning)
+    pca = True
     if not isinstance(evoked, list):
         evoked = [evoked]
 
@@ -455,11 +449,9 @@ def _window_evoked(evoked, size):
     sfreq = float(evoked.info['sfreq'])
     lsize = int(lsize * sfreq)
     rsize = int(rsize * sfreq)
-    lhann = signal.hann(lsize * 2)
-    rhann = signal.hann(rsize * 2)
-    window = np.r_[lhann[:lsize],
-                   np.ones(len(evoked.times) - lsize - rsize),
-                   rhann[-rsize:]]
+    lhann = np.hanning(lsize * 2)[:lsize]
+    rhann = np.hanning(rsize * 2)[-rsize:]
+    window = np.r_[lhann, np.ones(len(evoked.times) - lsize - rsize), rhann]
     evoked.data *= window[None, :]
     return evoked
 
@@ -467,7 +459,7 @@ def _window_evoked(evoked, size):
 @verbose
 def tf_mixed_norm(evoked, forward, noise_cov,
                   loose='auto', depth=0.8, maxit=3000,
-                  tol=1e-4, weights=None, weights_min=None, pca=True,
+                  tol=1e-4, weights=None, weights_min=0., pca=True,
                   debias=True, wsize=64, tstep=4, window=0.02,
                   return_residual=False, return_as_dipoles=False,
                   alpha=None, l1_ratio=None, dgap_freq=10, rank=None,
@@ -559,13 +551,13 @@ def tf_mixed_norm(evoked, forward, noise_cov,
 
     References
     ----------
-    .. [1] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hamalainen, M. Kowalski
+    .. [1] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hämäläinen, M. Kowalski
        "Time-Frequency Mixed-Norm Estimates: Sparse M/EEG imaging with
        non-stationary source activations",
        Neuroimage, Volume 70, pp. 410-422, 15 April 2013.
        DOI: 10.1016/j.neuroimage.2012.12.051
 
-    .. [2] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hamalainen, M. Kowalski
+    .. [2] A. Gramfort, D. Strohmeier, J. Haueisen, M. Hämäläinen, M. Kowalski
        "Functional Brain Imaging with M/EEG Using Structured Sparsity in
        Time-Frequency Dictionaries",
        Proceedings Information Processing in Medical Imaging

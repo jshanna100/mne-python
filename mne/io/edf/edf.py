@@ -19,60 +19,12 @@ import numpy as np
 
 from ...utils import verbose, logger, warn
 from ..utils import _blk_read_lims
-from ..base import BaseRaw, _check_update_montage
+from ..base import BaseRaw
 from ..meas_info import _empty_info, _unique_channel_names, DATE_NONE
 from ..constants import FIFF
 from ...filter import resample
-from ...utils import copy_function_doc_to_method_doc, deprecated, fill_doc
-from ...annotations import Annotations, events_from_annotations
-from ._utils import _load_gdf_events_lut
-
-
-GDF_EVENTS_LUT = _load_gdf_events_lut()
-
-
-@deprecated('find_edf_events is deprecated in 0.18, and will be removed'
-            ' in 0.19. Please use `mne.events_from_annotations` instead')
-def find_edf_events(raw):
-    """Get original EDF events as read from the header.
-
-    For GDF, the values are returned in form
-    [n_events, pos, typ, chn, dur]
-    where:
-
-    ========  ===================================  =======
-    name      description                          type
-    ========  ===================================  =======
-    n_events  The number of all events             integer
-    pos       Beginning of the events in samples   array
-    typ       The event identifiers                array
-    chn       The associated channels (0 for all)  array
-    dur       The durations of the events          array
-    ========  ===================================  =======
-
-    For EDF+, the values are returned in form
-    n_events * [onset, dur, desc]
-    where:
-
-    ========  ===================================  =======
-    name      description                          type
-    ========  ===================================  =======
-    onset     Onset of the event in seconds        float
-    dur       Duration of the event in seconds     float
-    desc      Description of the event             str
-    ========  ===================================  =======
-
-    Parameters
-    ----------
-    raw : instance of RawEDF
-        The raw object for finding the events.
-
-    Returns
-    -------
-    events : ndarray
-        The events as they are in the file header.
-    """
-    return events_from_annotations(raw)
+from ...utils import fill_doc
+from ...annotations import Annotations
 
 
 @fill_doc
@@ -83,10 +35,6 @@ class RawEDF(BaseRaw):
     ----------
     input_fname : str
         Path to the EDF, EDF+ or BDF file.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions. If None,
-        sensor locations are (0,0,0). See the documentation of
-        :func:`mne.channels.read_montage` for more information.
     eog : list or tuple
         Names of channels or list of indices that should be designated EOG
         channels. Values should correspond to the electrodes in the file.
@@ -111,12 +59,7 @@ class RawEDF(BaseRaw):
     exclude : list of str
         Channel names to exclude. This can help when reading data with
         different sampling rates to avoid unnecessary resampling.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing. If
-        True, data will be preloaded into memory (fast, but requires large
-        amount of memory). If preload is a string, preload is the file name of
-        a memory-mapped file which is used to store the data on the hard drive
-        (slower, but requires less memory).
+    %(preload)s
     %(verbose)s
 
     Notes
@@ -164,7 +107,7 @@ class RawEDF(BaseRaw):
     """
 
     @verbose
-    def __init__(self, input_fname, montage, eog=None, misc=None,
+    def __init__(self, input_fname, eog=None, misc=None,
                  stim_channel='auto', exclude=(), preload=False, verbose=None):
         logger.info('Extracting EDF parameters from {}...'.format(input_fname))
         input_fname = os.path.abspath(input_fname)
@@ -172,7 +115,6 @@ class RawEDF(BaseRaw):
                                                stim_channel, eog, misc,
                                                exclude, preload)
         logger.info('Creating raw.info structure...')
-        _check_update_montage(info, montage)
 
         # Raw attributes
         last_samps = [edf_info['nsamples'] - 1]
@@ -199,12 +141,6 @@ class RawEDF(BaseRaw):
                                   self._raw_extras[fi], self.info['chs'],
                                   self._filenames[fi])
 
-    @copy_function_doc_to_method_doc(find_edf_events)
-    @deprecated('find_edf_events is deprecated in 0.18, and will be removed'
-                ' in 0.19. Please use `mne.events_from_annotations` instead')
-    def find_edf_events(self):
-        return events_from_annotations(self)
-
 
 @fill_doc
 class RawGDF(BaseRaw):
@@ -214,10 +150,6 @@ class RawGDF(BaseRaw):
     ----------
     input_fname : str
         Path to the GDF file.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions. If None,
-        sensor locations are (0,0,0). See the documentation of
-        :func:`mne.channels.read_montage` for more information.
     eog : list or tuple
         Names of channels or list of indices that should be designated EOG
         channels. Values should correspond to the electrodes in the file.
@@ -234,12 +166,7 @@ class RawGDF(BaseRaw):
     exclude : list of str
         Channel names to exclude. This can help when reading data with
         different sampling rates to avoid unnecessary resampling.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing. If
-        True, data will be preloaded into memory (fast, but requires large
-        amount of memory). If preload is a string, preload is the file name of
-        a memory-mapped file which is used to store the data on the hard drive
-        (slower, but requires less memory).
+    %(preload)s
     %(verbose)s
 
     Notes
@@ -255,7 +182,7 @@ class RawGDF(BaseRaw):
     """
 
     @verbose
-    def __init__(self, input_fname, montage, eog=None, misc=None,
+    def __init__(self, input_fname, eog=None, misc=None,
                  stim_channel='auto', exclude=(), preload=False, verbose=None):
         logger.info('Extracting EDF parameters from {}...'.format(input_fname))
         input_fname = os.path.abspath(input_fname)
@@ -263,7 +190,6 @@ class RawGDF(BaseRaw):
                                                stim_channel, eog, misc,
                                                exclude, preload)
         logger.info('Creating raw.info structure...')
-        _check_update_montage(info, montage)
 
         # Raw attributes
         last_samps = [edf_info['nsamples'] - 1]
@@ -285,12 +211,6 @@ class RawGDF(BaseRaw):
         return _read_segment_file(data, idx, fi, start, stop,
                                   self._raw_extras[fi], self.info['chs'],
                                   self._filenames[fi])
-
-    @copy_function_doc_to_method_doc(find_edf_events)
-    @deprecated('find_edf_events is deprecated in 0.18, and will be removed'
-                ' in 0.19. Please use `mne.events_from_annotations` instead')
-    def find_edf_events(self):
-        return events_from_annotations(self)
 
 
 def _read_ch(fid, subtype, samp, dtype_byte, dtype=None):
@@ -325,12 +245,6 @@ def _read_segment_file(data, idx, fi, start, stop, raw_extras, chs, filenames):
     orig_sel = raw_extras['sel']
     tal_idx = raw_extras.get('tal_idx', [])
     subtype = raw_extras['subtype']
-
-    if np.size(dtype_byte) > 1:
-        if len(np.unique(dtype_byte)) > 1:
-            warn("Multiple data type not supported")
-        dtype = dtype[0]
-        dtype_byte = dtype_byte[0]
 
     # gain constructor
     physical_range = np.array([ch['range'] for ch in chs])
@@ -394,8 +308,9 @@ def _read_segment_file(data, idx, fi, start, stop, raw_extras, chs, filenames):
                         # it forces edge artifacts to appear at
                         # each buffer boundary :(
                         # it can also be very slow...
-                        ch_data = resample(ch_data, buf_len, n_samps[ci],
-                                           npad=0, axis=-1)
+                        ch_data = resample(
+                            ch_data.astype(np.float64), buf_len, n_samps[ci],
+                            npad=0, axis=-1)
                 assert ch_data.shape == (len(ch_data), buf_len)
                 data[ii, d_sidx:d_eidx] = ch_data.ravel()[r_sidx:r_eidx]
 
@@ -412,7 +327,7 @@ def _read_segment_file(data, idx, fi, start, stop, raw_extras, chs, filenames):
                 stim_channel_idx.append(stim_ch_idx)
         stim_channel_idx = np.array(stim_channel_idx).ravel()
 
-    if subtype == 'bdf':
+    if subtype == 'bdf' and len(stim_channel_idx) > 0:
         cal[0, stim_channel_idx] = 1
         offsets[stim_channel_idx, 0] = 0
         gains[0, stim_channel_idx] = 1
@@ -425,6 +340,9 @@ def _read_segment_file(data, idx, fi, start, stop, raw_extras, chs, filenames):
                               2**17 - 1)
         data[stim_channel_idx, :] = stim
 
+    if len(tal_data) > 1:
+        tal_data = np.concatenate([tal.ravel() for tal in tal_data])
+        tal_data = tal_data[np.newaxis, :]
     return tal_data
 
 
@@ -650,6 +568,8 @@ def _read_edf_header(fname, exclude):
                 continue
             if unit == 'uV':
                 edf_info['units'].append(1e-6)
+            elif unit == 'mV':
+                edf_info['units'].append(1e-3)
             else:
                 edf_info['units'].append(1)
 
@@ -715,6 +635,23 @@ def _read_edf_header(fname, exclude):
     return edf_info, orig_units
 
 
+GDFTYPE_NP = (None, np.int8, np.uint8, np.int16, np.uint16, np.int32,
+              np.uint32, np.int64, np.uint64, None, None, None, None,
+              None, None, None, np.float32, np.float64)
+GDFTYPE_BYTE = tuple(np.dtype(x).itemsize if x is not None else 0
+                     for x in GDFTYPE_NP)
+
+
+def _check_dtype_byte(types):
+    assert sum(GDFTYPE_BYTE) == 42
+    dtype_byte = [GDFTYPE_BYTE[t] for t in types]
+    dtype_np = [GDFTYPE_NP[t] for t in types]
+    if len(np.unique(dtype_byte)) > 1:
+        # We will not read it properly, so this should be an error
+        raise RuntimeError("Reading multiple data types not supported")
+    return dtype_np[0], dtype_byte[0]
+
+
 def _read_gdf_header(fname, exclude):
     """Read GDF 1.x and GDF 2.x header info."""
     edf_info = dict()
@@ -722,14 +659,6 @@ def _read_gdf_header(fname, exclude):
     with open(fname, 'rb') as fid:
 
         version = fid.read(8).decode()
-
-        gdftype_np = (None, np.int8, np.uint8, np.int16, np.uint16, np.int32,
-                      np.uint32, np.int64, np.uint64, None, None, None, None,
-                      None, None, None, np.float32, np.float64)
-        gdftype_byte = [np.dtype(x).itemsize if x is not None else 0
-                        for x in gdftype_np]
-        assert sum(gdftype_byte) == 42
-
         edf_info['type'] = edf_info['subtype'] = version[:3]
         edf_info['number'] = float(version[4:])
         meas_date = DATE_NONE
@@ -811,16 +740,16 @@ def _read_gdf_header(fname, exclude):
             dtype = np.fromfile(fid, np.int32, len(channels))
 
             # total number of bytes for data
-            bytes_tot = np.sum([gdftype_byte[t] * n_samps[i]
+            bytes_tot = np.sum([GDFTYPE_BYTE[t] * n_samps[i]
                                 for i, t in enumerate(dtype)])
 
             # Populate edf_info
+            dtype_np, dtype_byte = _check_dtype_byte(dtype)
             edf_info.update(
                 bytes_tot=bytes_tot, ch_names=ch_names,
                 data_offset=header_nbytes, digital_min=digital_min,
                 digital_max=digital_max,
-                dtype_byte=[gdftype_byte[t] for t in dtype],
-                dtype_np=[gdftype_np[t] for t in dtype], exclude=exclude,
+                dtype_byte=dtype_byte, dtype_np=dtype_np, exclude=exclude,
                 highpass=highpass, sel=sel, lowpass=lowpass,
                 meas_date=meas_date,
                 meas_id=meas_id, n_records=n_records, n_samps=n_samps,
@@ -852,7 +781,7 @@ def _read_gdf_header(fname, exclude):
                 else:
                     chn = np.zeros(n_events, dtype=np.int32)
                     dur = np.ones(n_events, dtype=np.uint32)
-                np.clip(dur, 1, np.inf, out=dur)
+                np.maximum(dur, 1, out=dur)
                 events = [n_events, pos, typ, chn, dur]
 
         # GDF 2.x
@@ -979,6 +908,8 @@ def _read_gdf_header(fname, exclude):
             for i, unit in enumerate(units):
                 if unit == 4275:  # microvolts
                     units[i] = 1e-6
+                elif unit == 4274:  # millivolts
+                    units[i] = 1e-3
                 elif unit == 512:  # dimensionless
                     units[i] = 1
                 elif unit == 0:
@@ -1032,15 +963,15 @@ def _read_gdf_header(fname, exclude):
             assert fid.tell() == header_nbytes
 
             # total number of bytes for data
-            bytes_tot = np.sum([gdftype_byte[t] * n_samps[i]
+            bytes_tot = np.sum([GDFTYPE_BYTE[t] * n_samps[i]
                                 for i, t in enumerate(dtype)])
 
             # Populate edf_info
+            dtype_np, dtype_byte = _check_dtype_byte(dtype)
             edf_info.update(
                 bytes_tot=bytes_tot, ch_names=ch_names,
                 data_offset=header_nbytes,
-                dtype_byte=[gdftype_byte[t] for t in dtype],
-                dtype_np=[gdftype_np[t] for t in dtype],
+                dtype_byte=dtype_byte, dtype_np=dtype_np,
                 digital_min=digital_min, digital_max=digital_max,
                 exclude=exclude, gnd=gnd, highpass=highpass, sel=sel,
                 impedance=impedance, lowpass=lowpass, meas_date=meas_date,
@@ -1159,7 +1090,7 @@ def _find_tal_idx(ch_names):
 
 
 @fill_doc
-def read_raw_edf(input_fname, montage=None, eog=None, misc=None,
+def read_raw_edf(input_fname, eog=None, misc=None,
                  stim_channel='auto', exclude=(), preload=False, verbose=None):
     """Reader function for EDF or EDF+ files.
 
@@ -1167,10 +1098,6 @@ def read_raw_edf(input_fname, montage=None, eog=None, misc=None,
     ----------
     input_fname : str
         Path to the EDF or EDF+ file.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions. If None,
-        sensor locations are (0,0,0). See the documentation of
-        :func:`mne.channels.read_montage` for more information.
     eog : list or tuple
         Names of channels or list of indices that should be designated EOG
         channels. Values should correspond to the electrodes in the file.
@@ -1195,12 +1122,7 @@ def read_raw_edf(input_fname, montage=None, eog=None, misc=None,
     exclude : list of str
         Channel names to exclude. This can help when reading data with
         different sampling rates to avoid unnecessary resampling.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing. If
-        True, data will be preloaded into memory (fast, but requires large
-        amount of memory). If preload is a string, preload is the file name of
-        a memory-mapped file which is used to store the data on the hard drive
-        (slower, but requires less memory).
+    %(preload)s
     %(verbose)s
 
     Notes
@@ -1230,7 +1152,7 @@ def read_raw_edf(input_fname, montage=None, eog=None, misc=None,
     if ext == 'gdf':
         warn('The use of read_raw_edf for GDF files is deprecated. Please use '
              'read_raw_gdf instead.', DeprecationWarning)
-        return RawGDF(input_fname=input_fname, montage=montage, eog=eog,
+        return RawGDF(input_fname=input_fname, eog=eog,
                       misc=misc, stim_channel=stim_channel, exclude=exclude,
                       preload=preload, verbose=verbose)
     elif ext == 'bdf':
@@ -1239,13 +1161,13 @@ def read_raw_edf(input_fname, montage=None, eog=None, misc=None,
     elif ext not in ('edf', 'bdf'):
         raise NotImplementedError('Only EDF and BDF files are supported, got '
                                   '{}.'.format(ext))
-    return RawEDF(input_fname=input_fname, montage=montage, eog=eog, misc=misc,
+    return RawEDF(input_fname=input_fname, eog=eog, misc=misc,
                   stim_channel=stim_channel, exclude=exclude, preload=preload,
                   verbose=verbose)
 
 
 @fill_doc
-def read_raw_bdf(input_fname, montage=None, eog=None, misc=None,
+def read_raw_bdf(input_fname, eog=None, misc=None,
                  stim_channel='auto', exclude=(), preload=False, verbose=None):
     """Reader function for BDF files.
 
@@ -1253,10 +1175,6 @@ def read_raw_bdf(input_fname, montage=None, eog=None, misc=None,
     ----------
     input_fname : str
         Path to the BDF file.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions. If None,
-        sensor locations are (0,0,0). See the documentation of
-        :func:`mne.channels.read_montage` for more information.
     eog : list or tuple
         Names of channels or list of indices that should be designated EOG
         channels. Values should correspond to the electrodes in the file.
@@ -1281,12 +1199,7 @@ def read_raw_bdf(input_fname, montage=None, eog=None, misc=None,
     exclude : list of str
         Channel names to exclude. This can help when reading data with
         different sampling rates to avoid unnecessary resampling.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing. If
-        True, data will be preloaded into memory (fast, but requires large
-        amount of memory). If preload is a string, preload is the file name of
-        a memory-mapped file which is used to store the data on the hard drive
-        (slower, but requires less memory).
+    %(preload)s
     %(verbose)s
 
     Notes
@@ -1335,13 +1248,13 @@ def read_raw_bdf(input_fname, montage=None, eog=None, misc=None,
     if ext != 'bdf':
         raise NotImplementedError('Only BDF files are supported, got '
                                   '{}.'.format(ext))
-    return RawEDF(input_fname=input_fname, montage=montage, eog=eog, misc=misc,
+    return RawEDF(input_fname=input_fname, eog=eog, misc=misc,
                   stim_channel=stim_channel, exclude=exclude, preload=preload,
                   verbose=verbose)
 
 
 @fill_doc
-def read_raw_gdf(input_fname, montage=None, eog=None, misc=None,
+def read_raw_gdf(input_fname, eog=None, misc=None,
                  stim_channel='auto', exclude=(), preload=False, verbose=None):
     """Reader function for GDF files.
 
@@ -1349,10 +1262,6 @@ def read_raw_gdf(input_fname, montage=None, eog=None, misc=None,
     ----------
     input_fname : str
         Path to the GDF file.
-    montage : str | None | instance of Montage
-        Path or instance of montage containing electrode positions. If None,
-        sensor locations are (0,0,0). See the documentation of
-        :func:`mne.channels.read_montage` for more information.
     eog : list or tuple
         Names of channels or list of indices that should be designated EOG
         channels. Values should correspond to the electrodes in the file.
@@ -1369,12 +1278,7 @@ def read_raw_gdf(input_fname, montage=None, eog=None, misc=None,
     exclude : list of str
         Channel names to exclude. This can help when reading data with
         different sampling rates to avoid unnecessary resampling.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing. If
-        True, data will be preloaded into memory (fast, but requires large
-        amount of memory). If preload is a string, preload is the file name of
-        a memory-mapped file which is used to store the data on the hard drive
-        (slower, but requires less memory).
+    %(preload)s
     %(verbose)s
 
     Notes
@@ -1393,7 +1297,7 @@ def read_raw_gdf(input_fname, montage=None, eog=None, misc=None,
     if ext != 'gdf':
         raise NotImplementedError('Only GDF files are supported, got '
                                   '{}.'.format(ext))
-    return RawGDF(input_fname=input_fname, montage=montage, eog=eog, misc=misc,
+    return RawGDF(input_fname=input_fname, eog=eog, misc=misc,
                   stim_channel=stim_channel, exclude=exclude, preload=preload,
                   verbose=verbose)
 
@@ -1469,8 +1373,6 @@ def _get_annotations_gdf(edf_info, sfreq):
     if events is not None and events[1].shape[0] > 0:
         onset = events[1] / sfreq
         duration = events[4] / sfreq
-        desc = [GDF_EVENTS_LUT[key]
-                if key in GDF_EVENTS_LUT else 'Unknown'
-                for key in events[2]]
+        desc = events[2]
 
     return onset, duration, desc

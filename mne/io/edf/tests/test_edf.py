@@ -26,14 +26,14 @@ from mne.io.tests.test_raw import _test_raw_reader
 from mne.io.edf.edf import _get_edf_default_event_id
 from mne.io.edf.edf import _read_annotations_edf
 from mne.io.edf.edf import _read_ch
-from mne.io.edf.edf import find_edf_events
 from mne.io.pick import channel_indices_by_type
 from mne.annotations import events_from_annotations, read_annotations
 from mne.io.meas_info import _kind_dict as _KIND_DICT
 
+
 FILE = inspect.getfile(inspect.currentframe())
 data_dir = op.join(op.dirname(op.abspath(FILE)), 'data')
-montage_path = op.join(data_dir, 'biosemi.hpts')
+montage_path = op.join(data_dir, 'biosemi.hpts')  # XXX: missing reader
 bdf_path = op.join(data_dir, 'test.bdf')
 edf_path = op.join(data_dir, 'test.edf')
 duplicate_channel_labels_path = op.join(data_dir,
@@ -76,7 +76,7 @@ def test_bdf_data():
                               exclude=['M2', 'IEOG'])
     assert len(raw_py.ch_names) == 71
     raw_py = _test_raw_reader(read_raw_bdf, input_fname=bdf_path,
-                              montage=montage_path, eog=eog, misc=misc,
+                              montage='biosemi64', eog=eog, misc=misc,
                               exclude=['M2', 'IEOG'])
     assert len(raw_py.ch_names) == 71
     assert 'RawEDF' in repr(raw_py)
@@ -94,6 +94,13 @@ def test_bdf_data():
     assert (raw_py.info['chs'][0]['loc']).any()
     assert (raw_py.info['chs'][25]['loc']).any()
     assert (raw_py.info['chs'][63]['loc']).any()
+
+
+@testing.requires_testing_data
+def test_bdf_crop_save_stim_channel(tmpdir):
+    """Test EDF with various sampling rates."""
+    raw = read_raw_bdf(bdf_stim_channel_path)
+    raw.save(tmpdir.join('test-raw.fif'), tmin=1.2, tmax=4.0, overwrite=True)
 
 
 @testing.requires_testing_data
@@ -202,16 +209,6 @@ def test_to_data_frame(fname):
     assert_array_equal(df.values[:, 0], raw._data[0] * 1e13)
 
 
-def test_find_edf_events_deprecation():
-    """Test find_edf_events deprecation."""
-    raw = read_raw_edf(edf_path)
-    with pytest.deprecated_call(match="find_edf_events"):
-        raw.find_edf_events()
-
-    with pytest.deprecated_call(match="find_edf_events"):
-        find_edf_events(raw)
-
-
 def test_read_raw_edf_stim_channel_input_parameters():
     """Test edf raw reader deprecation."""
     _MSG = "`read_raw_edf` is not supposed to trigger a deprecation warning"
@@ -298,8 +295,8 @@ def test_load_generator(fname, recwarn):
                 'sine 50 Hz']
     assert raw.get_data().shape == (11, 120000)
     assert raw.ch_names == ch_names
-    assert event_id == {'RECORD START': 1, 'REC STOP': 2}
-    assert_array_equal(events, [[0, 0, 1], [120000, 0, 2]])
+    assert event_id == {'RECORD START': 2, 'REC STOP': 1}
+    assert_array_equal(events, [[0, 0, 2], [120000, 0, 1]])
 
 
 @pytest.mark.parametrize('EXPECTED, test_input', [

@@ -5,7 +5,7 @@ Examples
 --------
 .. code-block:: console
 
-    $ mne browse_raw --raw sample_audvis_raw.fif \
+    $ mne browse_raw sample_audvis_raw.fif \
                      --proj sample_audvis_ecg-proj.fif \
                      --eve sample_audvis_raw-eve.fif
 """
@@ -19,13 +19,14 @@ import mne
 def run():
     """Run command."""
     import matplotlib.pyplot as plt
+    from mne.commands.utils import get_optparser, _add_verbose_flag
 
-    from mne.commands.utils import get_optparser
-
-    parser = get_optparser(__file__)
+    parser = get_optparser(__file__, usage='usage: %prog raw [options]')
 
     parser.add_option("--raw", dest="raw_in",
-                      help="Input raw FIF file", metavar="FILE")
+                      help="Input raw FIF file (can also be specified "
+                      "directly as an argument without the --raw prefix)",
+                      metavar="FILE")
     parser.add_option("--proj", dest="proj_in",
                       help="Projector file", metavar="FILE",
                       default='')
@@ -63,15 +64,18 @@ def run():
                       help="Display filtering IIR order (or 0 to use FIR)",
                       default=4)
     parser.add_option("--clipping", dest="clipping",
-                      help="Enable trace clipping mode, either 'clip' or "
+                      help="Enable trace clipping mode, either 'clamp' or "
                       "'transparent'", default=None)
     parser.add_option("--filterchpi", dest="filterchpi",
                       help="Enable filtering cHPI signals.", default=None,
                       action="store_true")
-
+    _add_verbose_flag(parser)
     options, args = parser.parse_args()
 
-    raw_in = options.raw_in
+    if len(args):
+        raw_in = args[0]
+    else:
+        raw_in = options.raw_in
     duration = options.duration
     start = options.start
     n_channels = options.n_channels
@@ -86,6 +90,7 @@ def run():
     filtorder = options.filtorder
     clipping = options.clipping
     filterchpi = options.filterchpi
+    verbose = options.verbose
 
     if raw_in is None:
         parser.print_help()
@@ -112,10 +117,8 @@ def run():
     raw.plot(duration=duration, start=start, n_channels=n_channels,
              group_by=group_by, show_options=show_options, events=events,
              highpass=highpass, lowpass=lowpass, filtorder=filtorder,
-             clipping=clipping)
+             clipping=clipping, verbose=verbose)
     plt.show(block=True)
 
 
-is_main = (__name__ == '__main__')
-if is_main:
-    run()
+mne.utils.run_command_if_main()

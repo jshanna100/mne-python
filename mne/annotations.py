@@ -13,7 +13,9 @@ import collections
 import numpy as np
 
 from .utils import (_pl, check_fname, _validate_type, verbose, warn, logger,
-                    _check_pandas_installed, _Counter, _mask_to_onsets_offsets)
+                    _check_pandas_installed, _mask_to_onsets_offsets)
+from .utils import _DefaultEventParser
+
 from .io.write import (start_block, end_block, write_float, write_name_list,
                        write_double, start_file)
 from .io.constants import FIFF
@@ -345,6 +347,9 @@ class Annotations(object):
         self : instance of Annotations
             The cropped Annotations object.
         """
+        if len(self) == 0:
+            return  # no annotations, nothing to do
+
         offset = 0 if self.orig_time is None else self.orig_time
         absolute_onset = self.onset + offset
         absolute_offset = absolute_onset + self.duration
@@ -354,9 +359,6 @@ class Annotations(object):
 
         if tmin > tmax:
             raise ValueError('tmax should be greater than tmin.')
-
-        if tmin < 0:
-            raise ValueError('tmin should be positive.')
 
         out_of_bounds = (absolute_onset > tmax) | (absolute_offset < tmin)
 
@@ -549,8 +551,8 @@ def _write_annotations_txt(fname, annot):
 def read_annotations(fname, sfreq='auto', uint16_codec=None):
     r"""Read annotations from a file.
 
-    This function reads a .fif, .fif.gz, .vrmk, .edf, .txt, .csv or .set file
-    and makes an :class:`mne.Annotations` object.
+    This function reads a .fif, .fif.gz, .vrmk, .edf, .txt, .csv .cnt, .cef,
+    or .set file and makes an :class:`mne.Annotations` object.
 
     Parameters
     ----------
@@ -558,11 +560,13 @@ def read_annotations(fname, sfreq='auto', uint16_codec=None):
         The filename.
     sfreq : float | 'auto'
         The sampling frequency in the file. This parameter is necessary for
-        \*.vmrk files as Annotations are expressed in seconds and \*.vmrk files
-        are in samples. For any other file format, ``sfreq`` is omitted.
-        If set to 'auto' then the ``sfreq`` is taken from the \*.vhdr
-        file that has the same name (without file extension). So data.vrmk
-        looks for sfreq in data.vhdr.
+        \*.vmrk and \*.cef files as Annotations are expressed in seconds and
+        \*.vmrk/\*.cef files are in samples. For any other file format,
+        ``sfreq`` is omitted. If set to 'auto' then the ``sfreq`` is taken
+        from the respective info file of the same name with according file
+        extension (\*.vhdr for brainvision; \*.dap for Curry 7; \*.cdt.dpa for
+        Curry 8). So data.vrmk looks for sfreq in data.vhdr, data.cef looks in
+        data.dap and data.cdt.cef looks in data.cdt.dpa.
     uint16_codec : str | None
         This parameter is only used in EEGLAB (\*.set) and omitted otherwise.
         If your \*.set file contains non-ascii characters, sometimes reading
@@ -586,6 +590,8 @@ def read_annotations(fname, sfreq='auto', uint16_codec=None):
     from .io.eeglab.eeglab import _read_annotations_eeglab
     from .io.edf.edf import _read_annotations_edf
     from .io.cnt.cnt import _read_annotations_cnt
+    from .io.curry.curry import _read_annotations_curry
+    from .io.ctf.markers import _read_annotations_ctf
 
     name = op.basename(fname)
     if name.endswith(('fif', 'fif.gz')):
@@ -608,6 +614,12 @@ def read_annotations(fname, sfreq='auto', uint16_codec=None):
 
     elif name.endswith('cnt'):
         annotations = _read_annotations_cnt(fname)
+
+    elif name.endswith('ds'):
+        annotations = _read_annotations_ctf(fname)
+
+    elif name.endswith('cef'):
+        annotations = _read_annotations_curry(fname, sfreq=sfreq)
 
     elif name.endswith('set'):
         annotations = _read_annotations_eeglab(fname,
@@ -647,20 +659,21 @@ def _read_annotations_csv(fname):
     pd = _check_pandas_installed(strict=True)
     df = pd.read_csv(fname)
     orig_time = df['onset'].values[0]
+    try:
+        float(orig_time)
+        warn('It looks like you have provided annotation onsets as floats. '
+             'These will be interpreted as MILLISECONDS. If that is not what '
+             'you want, save your CSV as a TXT file; the TXT reader accepts '
+             'onsets in seconds.')
+    except ValueError:
+        pass
     orig_time = _handle_meas_date(orig_time)
     onset_dt = pd.to_datetime(df['onset'])
-    onset = (onset_dt - onset_dt[0]).dt.seconds.astype(float)
+    onset = (onset_dt - onset_dt[0]).dt.total_seconds()
     duration = df['duration'].values.astype(float)
     description = df['description'].values
     if orig_time == 0:
         orig_time = None
-
-    if onset_dt.unique().size != onset.unique().size:
-        warn("The number of onsets in the '.csv' file (%d) does not match "
-             "the number of onsets in the Annotations created (%d). If "
-             "this happens because you did not encode your onsets as "
-             "timestamps you should save your files as '.txt'." %
-             (onset_dt.unique().size, onset.unique().size))
 
     return Annotations(onset, duration, description, orig_time)
 
@@ -778,12 +791,11 @@ def _select_annotations_based_on_description(descriptions, event_id, regexp):
     """Get a collection of descriptions and returns index of selected."""
     regexp_comp = re.compile('.*' if regexp is None else regexp)
 
-    if event_id is None:
-        event_id = _Counter()
-
     event_id_ = dict()
     dropped = []
-    for desc in descriptions:
+    # Iterate over the sorted descriptions so that the Counter mapping
+    # is slightly less arbitrary
+    for desc in sorted(descriptions):
         if desc in event_id_:
             continue
 
@@ -811,35 +823,75 @@ def _select_annotations_based_on_description(descriptions, event_id, regexp):
     return event_sel, event_id_
 
 
+def _check_event_id(event_id, raw):
+    from .io.brainvision.brainvision import _BVEventParser
+    from .io.brainvision.brainvision import _check_bv_annot
+    from .io.brainvision.brainvision import RawBrainVision
+    from .io import RawFIF, RawArray
+
+    if event_id is None:
+        return _DefaultEventParser()
+    elif event_id == 'auto':
+        if isinstance(raw, RawBrainVision):
+            return _BVEventParser()
+        elif (isinstance(raw, (RawFIF, RawArray)) and
+              _check_bv_annot(raw.annotations.description)):
+            logger.info('Non-RawBrainVision raw using branvision markers')
+            return _BVEventParser()
+        else:
+            return _DefaultEventParser()
+    elif callable(event_id) or isinstance(event_id, dict):
+        return event_id
+    else:
+        raise ValueError('Invalid input event_id')
+
+
 @verbose
-def events_from_annotations(raw, event_id=None, regexp=None, use_rounding=True,
-                            chunk_duration=None, verbose=None):
+def events_from_annotations(raw, event_id="auto",
+                            regexp=r'^(?![Bb][Aa][Dd]|[Ee][Dd][Gg][Ee]).*$',
+                            use_rounding=True, chunk_duration=None,
+                            verbose=None):
     """Get events and event_id from an Annotations object.
 
     Parameters
     ----------
     raw : instance of Raw
         The raw data for which Annotations are defined.
-    event_id : dict | callable | None
-        Dictionary of string keys and integer values as used in mne.Epochs
-        to map annotation descriptions to integer event codes. Only the
-        keys present will be mapped and the annotations with other descriptions
-        will be ignored. Otherwise, a callable that provides an integer given
-        a string or that returns None for an event to ignore.
-        If None, all descriptions of annotations are mapped
-        and assigned arbitrary unique integer values.
+    event_id : dict | callable | None | 'auto'
+        Can be:
+
+        - **dict**: map descriptions (keys) to integer event codes (values).
+          Only the descriptions present will be mapped, others will be ignored.
+        - **callable**: must take a string input and returns an integer event
+          code or None to ignore it.
+        - **None**: Map descriptions to unique integer values based on their
+          ``sorted`` order.
+        - **'auto' (default)**: prefer a raw-format-specific parser:
+
+          - Brainvision: map stimulus events to their integer part; response
+            events to integer part + 1000; optic events to integer part + 2000;
+            'SyncStatus/Sync On' to 99998; 'New Segment/' to 99999;
+            all others like ``None`` with an offset of 10000.
+          - Other raw formats: Behaves like None.
+
+          .. versionadded:: 0.18
     regexp : str | None
         Regular expression used to filter the annotations whose
-        descriptions is a match.
+        descriptions is a match. The default ignores descriptions beginning
+        ``'bad'`` or ``'edge'`` (case-insensitive).
+
+        .. versionchanged:: 0.18
+           Default ignores bad and edge descriptions.
     use_rounding : boolean
         If True, use rounding (instead of truncation) when converting
         times to indices. This can help avoid non-unique indices.
     chunk_duration: float | None
-        If chunk_duration parameter in events_from_annotations is None, events
-        correspond to the annotation onsets.
+        Chunk duration in seconds. If ``chunk_duration`` is set to None
+        (default), generated events correspond to the annotation onsets.
         If not, :func:`mne.events_from_annotations` returns as many events as
         they fit within the annotation duration spaced according to
-        `chunk_duration`, which is given in seconds.
+        ``chunk_duration``. As a consequence annotations with duration shorter
+        than ``chunk_duration`` will not contribute events.
     %(verbose)s
 
     Returns
@@ -850,9 +902,12 @@ def events_from_annotations(raw, event_id=None, regexp=None, use_rounding=True,
         The event_id variable that can be passed to Epochs.
     """
     if len(raw.annotations) == 0:
+        event_id = dict() if not isinstance(event_id, dict) else event_id
         return np.empty((0, 3), dtype=int), event_id
 
     annotations = raw.annotations
+
+    event_id = _check_event_id(event_id, raw)
 
     event_sel, event_id_ = _select_annotations_based_on_description(
         annotations.description, event_id=event_id, regexp=regexp)
@@ -866,18 +921,21 @@ def events_from_annotations(raw, event_id=None, regexp=None, use_rounding=True,
     else:
         inds = values = np.array([]).astype(int)
         for annot in annotations[event_sel]:
-            _onsets = np.arange(start=annot['onset'],
-                                stop=(annot['onset'] + annot['duration']),
+            annot_offset = annot['onset'] + annot['duration']
+            _onsets = np.arange(start=annot['onset'], stop=annot_offset,
                                 step=chunk_duration)
-            _inds = raw.time_as_index(_onsets,
-                                      use_rounding=use_rounding,
-                                      origin=annotations.orig_time)
-            _inds += raw.first_samp
-            inds = np.append(inds, _inds)
-            _values = np.full(shape=len(_inds),
-                              fill_value=event_id_[annot['description']],
-                              dtype=int)
-            values = np.append(values, _values)
+            good_events = annot_offset - _onsets >= chunk_duration
+            if good_events.any():
+                _onsets = _onsets[good_events]
+                _inds = raw.time_as_index(_onsets,
+                                          use_rounding=use_rounding,
+                                          origin=annotations.orig_time)
+                _inds += raw.first_samp
+                inds = np.append(inds, _inds)
+                _values = np.full(shape=len(_inds),
+                                  fill_value=event_id_[annot['description']],
+                                  dtype=int)
+                values = np.append(values, _values)
 
     events = np.c_[inds, np.zeros(len(inds)), values].astype(int)
 

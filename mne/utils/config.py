@@ -84,6 +84,7 @@ known_config_types = (
     'MNE_COREG_WINDOW_HEIGHT',
     'MNE_COREG_WINDOW_WIDTH',
     'MNE_COREG_SUBJECTS_DIR',
+    'MNE_CUDA_DEVICE',
     'MNE_CUDA_IGNORE_PRECISION',
     'MNE_DATA',
     'MNE_DATASETS_BRAINSTORM_PATH',
@@ -258,12 +259,6 @@ def set_config(key, value, home_dir=None, set_env=True):
     --------
     get_config
     """
-    if key is None:
-        warn('set_config(key=None, value=None) to get a list of valid keys '
-             'has been deprecated and will be removed in version 0.19. Use '
-             'get_config(key='') instead.', DeprecationWarning)
-        return known_config_types
-
     _validate_type(key, 'str', "key")
     # While JSON allow non-string types, we allow users to override config
     # settings using env, which are strings, so we enforce that here
@@ -501,7 +496,8 @@ def sys_info(fid=None, show_paths=False):
                 libs += ['%s=%s' % (key, lib)]
     libs = ', '.join(libs)
     for mod_name in ('mne', 'numpy', 'scipy', 'matplotlib', '', 'sklearn',
-                     'nibabel', 'mayavi', 'cupy', 'pandas', 'dipy'):
+                     'numba', 'nibabel', 'cupy', 'pandas', 'dipy',
+                     'mayavi', 'pyvista', 'vtk'):
         if mod_name == '':
             out += '\n'
             continue
@@ -531,7 +527,11 @@ def sys_info(fid=None, show_paths=False):
                     except Exception:
                         pass
                 extra = ' {qt_api=%s}%s' % (qt_api, extra)
-            out += '%s%s\n' % (mod.__version__, extra)
+            if mod_name == 'vtk':
+                version = mod.VTK_VERSION
+            else:
+                version = mod.__version__
+            out += '%s%s\n' % (version, extra)
     print(out, end='', file=fid)
 
 

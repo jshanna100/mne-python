@@ -1,5 +1,5 @@
 # Author: Denis Engemann <denis.engemann@gmail.com>
-#         Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+#         Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #         Jean-Remi King <jeanremi.king@gmail.com>
 #
 # License: BSD (3-clause)
@@ -123,8 +123,7 @@ def compute_ems(epochs, conditions=None, picks=None, n_jobs=1, cv=None,
         well as the number of conditions supported by the objective_function.
         If None keys in epochs.event_id are used.
     %(picks_good_data)s
-    n_jobs : int, default 1
-        Number of jobs to run in parallel.
+    %(n_jobs)s
     cv : cross-validation object | str | None, default LeaveOneOut
         The cross-validation scheme.
     %(verbose)s
@@ -174,7 +173,7 @@ def compute_ems(epochs, conditions=None, picks=None, n_jobs=1, cv=None,
     cond_idx = [np.where(ev == epochs.event_id[k])[0] for k in conditions]
 
     info = pick_info(epochs.info, picks)
-    data = epochs.get_data()[:, picks]
+    data = epochs.get_data(picks=picks)
 
     # Scale (z-score) the data by channel type
     # XXX the z-scoring is applied outside the CV, which is not standard.

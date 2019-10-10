@@ -24,7 +24,6 @@ public_modules = [
     'mne.datasets',
     'mne.datasets.brainstorm',
     'mne.datasets.hf_sef',
-    'mne.datasets.megsim',
     'mne.datasets.sample',
     'mne.decoding',
     'mne.dipole',
@@ -35,7 +34,6 @@ public_modules = [
     'mne.io.kit',
     'mne.minimum_norm',
     'mne.preprocessing',
-    'mne.realtime',
     'mne.report',
     'mne.simulation',
     'mne.source_estimate',
@@ -68,10 +66,10 @@ docstring_ignores = [
 ]
 char_limit = 800  # XX eventually we should probably get this lower
 docstring_length_ignores = [
-    'mne.viz.evoked.plot_compare_evokeds::cmap',
     'mne.filter.construct_iir_filter::iir_params',
 ]
 tab_ignores = [
+    'mne.channels.tests.test_montage',
 ]
 
 
@@ -141,6 +139,10 @@ def test_docstring_parameters():
 
     incorrect = []
     for name in public_modules_:
+        # Assert that by default we import all public names with `import mne`
+        if name not in ('mne', 'mne.gui'):
+            extra = name.split('.')[1]
+            assert hasattr(mne, extra)
         with pytest.warns(None):  # traits warnings
             module = __import__(name, globals())
         for submod in name.split('.')[1:]:

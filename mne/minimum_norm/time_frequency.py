@@ -1,4 +1,4 @@
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #          Martin Luessi <mluessi@nmr.mgh.harvard.edu>
 #
 # License: BSD (3-clause)
@@ -116,8 +116,7 @@ def source_band_induced_power(epochs, inverse_operator, bands, label=None,
         If True, the true dimension of data is estimated before running
         the time-frequency transforms. It reduces the computation times
         e.g. with a dataset that was maxfiltered (true dim is 64).
-    n_jobs : int
-        Number of jobs to run in parallel.
+    %(n_jobs)s
     prepared : bool
         If True, do not call :func:`prepare_inverse_operator`.
     method_params : dict | None
@@ -366,8 +365,7 @@ def source_induced_power(epochs, inverse_operator, freqs, label=None,
         If True, the true dimension of data is estimated before running
         the time-frequency transforms. It reduces the computation times
         e.g. with a dataset that was maxfiltered (true dim is 64).
-    n_jobs : int
-        Number of jobs to run in parallel.
+    %(n_jobs)s
     zero_mean : bool
         Make sure the wavelets are zero mean.
     prepared : bool
@@ -377,13 +375,15 @@ def source_induced_power(epochs, inverse_operator, freqs, label=None,
     %(verbose)s
     """  # noqa: E501
     _check_option('method', method, INVERSE_METHODS)
-    _check_ori(pick_ori, inverse_operator['source_ori'])
+    _check_ori(pick_ori, inverse_operator['source_ori'],
+               inverse_operator['src'])
 
     power, plv, vertno = _source_induced_power(
         epochs, inverse_operator, freqs, label=label, lambda2=lambda2,
         method=method, nave=nave, n_cycles=n_cycles, decim=decim,
         use_fft=use_fft, pick_ori=pick_ori, pca=pca, n_jobs=n_jobs,
-        prepared=False, method_params=method_params)
+        method_params=method_params, zero_mean=zero_mean,
+        prepared=prepared)
 
     # Run baseline correction
     power = rescale(power, epochs.times[::decim], baseline, baseline_mode,
@@ -399,7 +399,7 @@ def compute_source_psd(raw, inverse_operator, lambda2=1. / 9., method="dSPM",
                        inv_split=None, bandwidth='hann', adaptive=False,
                        low_bias=False, n_jobs=1, return_sensor=False, dB=False,
                        verbose=None):
-    """Compute source power spectrum density (PSD).
+    """Compute source power spectral density (PSD).
 
     Parameters
     ----------
@@ -465,8 +465,8 @@ def compute_source_psd(raw, inverse_operator, lambda2=1. / 9., method="dSPM",
         bandwidth.
 
         .. versionadded:: 0.17
-    n_jobs : int
-        Number of parallel jobs to use (only used if adaptive=True).
+    %(n_jobs)s
+        It is only used if adaptive=True.
 
         .. versionadded:: 0.17
     return_sensor : bool
@@ -511,7 +511,8 @@ def compute_source_psd(raw, inverse_operator, lambda2=1. / 9., method="dSPM",
     n_fft = int(n_fft)
     duration = ((1. - overlap) * n_fft) / raw.info['sfreq']
     events = make_fixed_length_events(raw, 1, tmin, tmax, duration)
-    epochs = Epochs(raw, events, 1, 0, (n_fft - 1) / raw.info['sfreq'])
+    epochs = Epochs(raw, events, 1, 0, (n_fft - 1) / raw.info['sfreq'],
+                    baseline=None)
     out = compute_source_psd_epochs(
         epochs, inverse_operator, lambda2, method, fmin, fmax,
         pick_ori, label, nave, pca, inv_split, bandwidth, adaptive, low_bias,
@@ -683,7 +684,7 @@ def compute_source_psd_epochs(epochs, inverse_operator, lambda2=1. / 9.,
                               return_generator=False, n_jobs=1,
                               prepared=False, method_params=None,
                               return_sensor=False, verbose=None):
-    """Compute source power spectrum density (PSD) from Epochs.
+    """Compute source power spectral density (PSD) from Epochs.
 
     This uses the multi-taper method to compute the PSD for each epoch.
 
@@ -727,8 +728,8 @@ def compute_source_psd_epochs(epochs, inverse_operator, lambda2=1. / 9.,
     return_generator : bool
         Return a generator object instead of a list. This allows iterating
         over the stcs without having to keep them all in memory.
-    n_jobs : int
-        Number of parallel jobs to use (only used if adaptive=True).
+    %(n_jobs)s
+        It is only used if adaptive=True.
     prepared : bool
         If True, do not call :func:`prepare_inverse_operator`.
     method_params : dict | None

@@ -26,8 +26,8 @@ def _stc_gen(data, sfreq, tmin, combo=False):
             yield (arr, stc)
 
 
-@pytest.mark.parametrize('method', ['coh', 'cohy', 'imcoh',
-                                    ['plv', 'ppc', 'pli', 'pli2_unbiased',
+@pytest.mark.parametrize('method', ['coh', 'cohy', 'imcoh', 'plv',
+                                    ['ciplv', 'ppc', 'pli', 'pli2_unbiased',
                                      'wpli', 'wpli2_debiased', 'coh']])
 @pytest.mark.parametrize('mode', ['multitaper', 'fourier', 'cwt_morlet'])
 def test_spectral_connectivity(method, mode):
@@ -150,8 +150,7 @@ def test_spectral_connectivity(method, mode):
             stc_data, method=test_methods, mode=mode, indices=indices,
             sfreq=sfreq, mt_adaptive=adaptive, mt_low_bias=True,
             mt_bandwidth=mt_bandwidth, tmin=tmin, tmax=tmax,
-            cwt_freqs=cwt_freqs,
-            cwt_n_cycles=cwt_n_cycles, n_jobs=2)
+            cwt_freqs=cwt_freqs, cwt_n_cycles=cwt_n_cycles)
 
         assert isinstance(con2, list)
         assert len(con2) == len(test_methods)

@@ -1,10 +1,11 @@
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
-#          Matti Hamalainen <msh@nmr.mgh.harvard.edu>
+# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
+#          Matti Hämäläinen <msh@nmr.mgh.harvard.edu>
 #          Denis A. Engemann <denis.engemann@gmail.com>
 #
 # License: BSD (3-clause)
 
 from copy import deepcopy
+from distutils.version import LooseVersion
 import itertools as itt
 from math import log
 import os
@@ -35,7 +36,7 @@ from .rank import compute_rank
 from .utils import (check_fname, logger, verbose, check_version, _time_mask,
                     warn, copy_function_doc_to_method_doc, _pl,
                     _undo_scaling_cov, _scaled_array, _validate_type,
-                    _check_option)
+                    _check_option, eigh)
 from . import viz
 
 from .fixes import BaseEstimator, EmpiricalCovariance, _logdet
@@ -377,8 +378,7 @@ def compute_raw_covariance(raw, tmin=0, tmax=None, tstep=0.2, reject=None,
         at the same unit.
 
         .. versionadded:: 0.12
-    n_jobs : int (default 1)
-        Number of jobs to run in parallel.
+    %(n_jobs)s
 
         .. versionadded:: 0.12
     return_estimators : bool (default False)
@@ -626,8 +626,7 @@ def compute_covariance(epochs, keep_sample_mean=True, tmin=None, tmax=None,
         Defaults to ``dict(mag=1e15, grad=1e13, eeg=1e6)``.
         These defaults will scale data to roughly the same order of
         magnitude.
-    n_jobs : int (default 1)
-        Number of jobs to run in parallel.
+    %(n_jobs)s
     return_estimators : bool (default False)
         Whether to return all estimators or the best. Only considered if
         method equals 'auto' or is a list of str. Defaults to False
@@ -822,7 +821,7 @@ def compute_covariance(epochs, keep_sample_mean=True, tmin=None, tmax=None,
 
     info = pick_info(info, picks_meeg)
     tslice = _get_tslice(epochs[0], tmin, tmax)
-    epochs = [ee.get_data()[:, picks_meeg, tslice] for ee in epochs]
+    epochs = [ee.get_data(picks=picks_meeg)[..., tslice] for ee in epochs]
     picks_meeg = np.arange(len(picks_meeg))
     picks_list = _picks_by_type(info)
 
@@ -893,9 +892,17 @@ def _eigvec_subspace(eig, eigvec, mask):
     """Compute the subspace from a subset of eigenvectors."""
     # We do the same thing we do with projectors:
     P = np.eye(len(eigvec)) - np.dot(eigvec[~mask].T, eigvec[~mask])
-    eig, eigvec = linalg.eigh(P)
+    eig, eigvec = eigh(P)
     eigvec = eigvec.T
     return eig, eigvec
+
+
+def _get_iid_kwargs():
+    import sklearn
+    kwargs = dict()
+    if LooseVersion(sklearn.__version__) < LooseVersion('0.22'):
+        kwargs['iid'] = False
+    return kwargs
 
 
 def _compute_covariance_auto(data, method, info, method_params, cv,
@@ -986,7 +993,7 @@ def _compute_covariance_auto(data, method, info, method_params, cv,
                 tuned_parameters = [{'shrinkage': shrinkage}]
                 shrinkages = []
                 gs = GridSearchCV(ShrunkCovariance(**mp),
-                                  tuned_parameters, cv=cv, iid=True)
+                                  tuned_parameters, cv=cv, **_get_iid_kwargs())
                 for ch_type, picks in sub_picks_list:
                     gs.fit(data_[:, picks])
                     shrinkages.append((ch_type, gs.best_estimator_.shrinkage,
@@ -1129,8 +1136,8 @@ class _RegCovariance(BaseEstimator):
     """Aux class."""
 
     def __init__(self, info, grad=0.1, mag=0.1, eeg=0.1, seeg=0.1, ecog=0.1,
-                 hbo=0.1, hbr=0.1, store_precision=False,
-                 assume_centered=False):
+                 hbo=0.1, hbr=0.1, fnirs_raw=0.1, fnirs_od=0.1,
+                 store_precision=False, assume_centered=False):
         self.info = info
         # For sklearn compat, these cannot (easily?) be combined into
         # a single dictionary
@@ -1141,6 +1148,8 @@ class _RegCovariance(BaseEstimator):
         self.ecog = ecog
         self.hbo = hbo
         self.hbr = hbr
+        self.fnirs_raw = fnirs_raw
+        self.fnirs_od = fnirs_od
         self.store_precision = store_precision
         self.assume_centered = assume_centered
 
@@ -1282,17 +1291,15 @@ def _unpack_epochs(epochs):
 def _get_ch_whitener(A, pca, ch_type, rank):
     """Get whitener params for a set of channels."""
     # whitening operator
-    eig, eigvec = linalg.eigh(A, overwrite_a=True)
+    eig, eigvec = eigh(A, overwrite_a=True)
     eigvec = eigvec.T
     mask = np.ones(len(eig), bool)
     eig[:-rank] = 0.0
     mask[:-rank] = False
 
-    logger.info('Setting small %s eigenvalues to zero.' % ch_type)
-    if not pca:  # No PCA case.
-        logger.info('Not doing PCA for %s.' % ch_type)
-    else:
-        logger.info('Doing PCA for %s.' % ch_type)
+    logger.info('    Setting small %s eigenvalues to zero (%s)'
+                % (ch_type, 'using PCA' if pca else 'without PCA'))
+    if pca:  # No PCA case.
         # This line will reduce the actual number of variables in data
         # and leadfield to the true rank.
         eigvec = eigvec[:-rank].copy()
@@ -1425,6 +1432,7 @@ def _smart_eigh(C, info, rank, scalings=None, projs=None,
 @verbose
 def regularize(cov, info, mag=0.1, grad=0.1, eeg=0.1, exclude='bads',
                proj=True, seeg=0.1, ecog=0.1, hbo=0.1, hbr=0.1,
+               fnirs_raw=0.1, fnirs_od=0.1,
                rank=None, scalings=None, verbose=None):
     """Regularize noise covariance matrix.
 
@@ -1435,8 +1443,8 @@ def regularize(cov, info, mag=0.1, grad=0.1, eeg=0.1, exclude='bads',
     .. note:: This function is kept for reasons of backward-compatibility.
               Please consider explicitly using the ``method`` parameter in
               :func:`mne.compute_covariance` to directly combine estimation
-              with regularization in a data-driven fashion.
-              See the `faq <http://martinos.org/mne/dev/faq.html#how-should-i-regularize-the-covariance-matrix>`_
+              with regularization in a data-driven fashion. See the `faq
+              <http://mne.tools/dev/overview/faq.html#how-should-i-regularize-the-covariance-matrix>`_
               for more information.
 
     Parameters
@@ -1465,6 +1473,10 @@ def regularize(cov, info, mag=0.1, grad=0.1, eeg=0.1, exclude='bads',
         Regularization factor for HBO signals.
     hbr : float (default 0.1)
         Regularization factor for HBR signals.
+    fnirs_raw : float (default 0.1)
+        Regularization factor for fNIRS raw signals.
+    fnirs_od : float (default 0.1)
+        Regularization factor for fNIRS optical density signals.
     %(rank_None)s
 
         .. versionadded:: 0.17

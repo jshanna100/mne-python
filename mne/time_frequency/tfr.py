@@ -2,7 +2,7 @@
 
 Morlet code inspired by Matlab code from Sheraz Khan & Brainstorm & SPM
 """
-# Authors : Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Authors : Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #           Hari Bharadwaj <hari@nmr.mgh.harvard.edu>
 #           Clement Moutard <clement.moutard@polytechnique.org>
 #           Jean-Remi King <jeanremi.king@gmail.com>
@@ -15,16 +15,17 @@ from math import sqrt
 
 import numpy as np
 from scipy import linalg
-from scipy.fftpack import fft, ifft
 
 from .multitaper import dpss_windows
 
 from ..baseline import rescale
+from ..fixes import fft, ifft
 from ..parallel import parallel_func
 from ..utils import (logger, verbose, _time_mask, _freq_mask, check_fname,
                      sizeof_fmt, GetEpochsMixin, _prepare_read_metadata,
                      fill_doc, _prepare_write_metadata, _check_event_id,
-                     _gen_events, SizeMixin, _is_numeric, _check_option)
+                     _gen_events, SizeMixin, _is_numeric, _check_option,
+                     _validate_type)
 from ..channels.channels import ContainsMixin, UpdateChannelsMixin
 from ..channels.layout import _pair_grad_sensors
 from ..io.pick import (pick_info, _picks_to_idx, channel_type, _pick_inst,
@@ -117,7 +118,6 @@ def _make_dpss(sfreq, freqs, n_cycles=7., time_bandwidth=4.0, zero_mean=False):
         Default is 4.0, giving 3 good tapers.
     zero_mean : bool | None, , default False
         Make sure the wavelet has a mean of zero.
-
 
     Returns
     -------
@@ -318,7 +318,7 @@ def _compute_tfr(epoch_data, freqs, sfreq=1.0, method='morlet',
         * 'avg_power_itc' : average of single trial power and inter-trial
           coherence across trials.
 
-    n_jobs : int, default 1
+    %(n_jobs)s
         The number of epochs to process at the same time. The parallelization
         is implemented across channels.
     %(verbose)s
@@ -335,15 +335,22 @@ def _compute_tfr(epoch_data, freqs, sfreq=1.0, method='morlet',
     # Check data
     epoch_data = np.asarray(epoch_data)
     if epoch_data.ndim != 3:
-        raise ValueError('epoch_data must be of shape '
-                         '(n_epochs, n_chans, n_times)')
+        raise ValueError('epoch_data must be of shape (n_epochs, n_chans, '
+                         'n_times), got %s' % (epoch_data.shape,))
 
     # Check params
     freqs, sfreq, zero_mean, n_cycles, time_bandwidth, decim = \
         _check_tfr_param(freqs, sfreq, method, zero_mean, n_cycles,
                          time_bandwidth, use_fft, decim, output)
 
-    # Setup wavelet
+    decim = _check_decim(decim)
+    if (freqs > sfreq / 2.).any():
+        raise ValueError('Cannot compute freq above Nyquist freq of the data '
+                         '(%0.1f Hz), got %0.1f Hz'
+                         % (sfreq / 2., freqs.max()))
+
+    # We decimate *after* decomposition, so we need to create our kernels
+    # for the original sfreq
     if method == 'morlet':
         W = morlet(sfreq, freqs, n_cycles=n_cycles, zero_mean=zero_mean)
         Ws = [W]  # to have same dimensionality as the 'multitaper' case
@@ -358,7 +365,6 @@ def _compute_tfr(epoch_data, freqs, sfreq=1.0, method='morlet',
                          'signal. Use a longer signal or shorter wavelets.')
 
     # Initialize output
-    decim = _check_decim(decim)
     n_freqs = len(freqs)
     n_epochs, n_chans, n_times = epoch_data[:, :, decim].shape
     if output in ('power', 'phase', 'avg_power', 'itc'):
@@ -598,7 +604,7 @@ def _tfr_aux(method, inst, freqs, decim, return_itc, picks, average,
     """Help reduce redundancy between tfr_morlet and tfr_multitaper."""
     decim = _check_decim(decim)
     data = _get_data(inst, return_itc)
-    info = inst.info
+    info = inst.info.copy()  # make a copy as sfreq can be altered
 
     info, data = _prepare_picks(info, data, picks, axis=1)
     del picks
@@ -619,6 +625,7 @@ def _tfr_aux(method, inst, freqs, decim, return_itc, picks, average,
     out = _compute_tfr(data, freqs, info['sfreq'], method=method,
                        output=output, decim=decim, **tfr_params)
     times = inst.times[decim].copy()
+    info['sfreq'] /= decim.step
 
     if average:
         if return_itc:
@@ -674,8 +681,7 @@ def tfr_morlet(inst, freqs, n_cycles, use_fft=False, return_itc=True, decim=1,
 
         .. note:: Decimation may create aliasing artifacts.
 
-    n_jobs : int, default 1
-        The number of jobs to run in parallel.
+    %(n_jobs)s
     picks : array-like of int | None, default None
         The indices of the channels to decompose. If None, all available
         good data channels are decomposed.
@@ -759,7 +765,7 @@ def tfr_array_morlet(epoch_data, sfreq, freqs, n_cycles=7.0,
         * 'avg_power_itc' : average of single trial power and inter-trial
           coherence across trials.
 
-    n_jobs : int
+    %(n_jobs)s
         The number of epochs to process at the same time. The parallelization
         is implemented across channels. default 1
     %(verbose)s
@@ -827,8 +833,7 @@ def tfr_multitaper(inst, freqs, n_cycles, time_bandwidth=4.0,
 
         .. note:: Decimation may create aliasing artifacts.
 
-    n_jobs : int,  default 1
-        The number of jobs to run in parallel.
+    %(n_jobs)s
     %(picks_good_data)s
     average : bool, default True
         If True average across Epochs.
@@ -880,7 +885,9 @@ class _BaseTFR(ContainsMixin, UpdateChannelsMixin, SizeMixin):
         """Channel names."""
         return self.info['ch_names']
 
-    def crop(self, tmin=None, tmax=None, fmin=None, fmax=None):
+    @fill_doc
+    def crop(self, tmin=None, tmax=None, fmin=None, fmax=None,
+             include_tmax=True):
         """Crop data to a given time interval in place.
 
         Parameters
@@ -897,6 +904,7 @@ class _BaseTFR(ContainsMixin, UpdateChannelsMixin, SizeMixin):
             Highest frequency of selection in Hz.
 
             .. versionadded:: 0.18.0
+        %(include_tmax)s
 
         Returns
         -------
@@ -904,8 +912,9 @@ class _BaseTFR(ContainsMixin, UpdateChannelsMixin, SizeMixin):
             The modified instance.
         """
         if tmin is not None or tmax is not None:
-            time_mask = _time_mask(self.times, tmin, tmax,
-                                   sfreq=self.info['sfreq'])
+            time_mask = _time_mask(
+                self.times, tmin, tmax, sfreq=self.info['sfreq'],
+                include_tmax=include_tmax)
 
         else:
             time_mask = slice(None)
@@ -1252,7 +1261,7 @@ class AverageTFR(_BaseTFR):
                 tfr._onselect, cmap=cmap, source_plot_joint=source_plot_joint,
                 topomap_args={k: v for k, v in topomap_args.items()
                               if k not in {"vmin", "vmax", "cmap", "axes"}})
-            t_end = _imshow_tfr(
+            _imshow_tfr(
                 ax, 0, tmin, tmax, vmin, vmax, onselect_callback, ylim=None,
                 tfr=data[idx: idx + 1], freq=tfr.freqs, x_label='Time (s)',
                 y_label='Frequency (Hz)', colorbar=colorbar, cmap=cmap,
@@ -1261,11 +1270,11 @@ class AverageTFR(_BaseTFR):
 
             if title is None:
                 if combine is None or len(tfr.info['ch_names']) == 1:
-                    title = tfr.info['ch_names'][0] + t_end
+                    title = tfr.info['ch_names'][0]
                 else:
                     title = _set_title_multiple_electrodes(
                         title, combine, tfr.info["ch_names"], all=True,
-                        ch_type=ch_type) + t_end
+                        ch_type=ch_type)
 
             if title:
                 fig.suptitle(title)
@@ -2218,11 +2227,12 @@ def _preproc_tfr(data, times, freqs, tmin, tmax, fmin, fmax, mode,
 
 def _check_decim(decim):
     """Aux function checking the decim parameter."""
-    if isinstance(decim, int):
-        decim = slice(None, None, decim)
-    elif not isinstance(decim, slice):
-        raise TypeError('`decim` must be int or slice, got %s instead'
-                        % type(decim))
+    _validate_type(decim, ('int-like', slice), 'decim')
+    if not isinstance(decim, slice):
+        decim = slice(None, None, int(decim))
+    # ensure that we can actually use `decim.step`
+    if decim.step is None:
+        decim = slice(decim.start, decim.stop, 1)
     return decim
 
 
@@ -2257,7 +2267,8 @@ def write_tfrs(fname, tfr, overwrite=False):
     for ii, tfr_ in enumerate(tfr):
         comment = ii if tfr_.comment is None else tfr_.comment
         out.append(_prepare_write_tfr(tfr_, condition=comment))
-    write_hdf5(fname, out, overwrite=overwrite, title='mnepython')
+    write_hdf5(fname, out, overwrite=overwrite, title='mnepython',
+               slash='replace')
 
 
 def _prepare_write_tfr(tfr, condition):
@@ -2301,7 +2312,7 @@ def read_tfrs(fname, condition=None):
     check_fname(fname, 'tfr', ('-tfr.h5', '_tfr.h5'))
 
     logger.info('Reading %s ...' % fname)
-    tfr_data = read_hdf5(fname, title='mnepython')
+    tfr_data = read_hdf5(fname, title='mnepython', slash='replace')
     for k, tfr in tfr_data:
         tfr['info'] = Info(tfr['info'])
         if 'metadata' in tfr:

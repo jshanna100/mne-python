@@ -1,8 +1,9 @@
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
-#          Matti Hamalainen <msh@nmr.mgh.harvard.edu>
+# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
+#          Matti Hämäläinen <msh@nmr.mgh.harvard.edu>
 #          Denis Engemann <denis.engemann@gmail.com>
 #          Andrew Dykstra <andrew.r.dykstra@gmail.com>
 #          Teon Brooks <teon.brooks@gmail.com>
+#          Daniel McCloy <dan.mccloy@gmail.com>
 #
 # License: BSD (3-clause)
 
@@ -21,6 +22,9 @@ from ..io.meas_info import anonymize_info, Info
 from ..io.pick import (channel_type, pick_info, pick_types, _picks_by_type,
                        _check_excludes_includes, _contains_ch_type,
                        channel_indices_by_type, pick_channels, _picks_to_idx)
+
+
+DEPRECATED_PARAM = object()
 
 
 def _get_meg_system(info):
@@ -164,6 +168,10 @@ class ContainsMixin(object):
         """The current gradient compensation grade."""
         return get_current_comp(self.info)
 
+    def get_channel_types(self):
+        """Get a list of channel type for each channel."""
+        return [channel_type(self.info, n)
+                for n in range(len(self.info['ch_names']))]
 
 # XXX Eventually de-duplicate with _kind_dict of mne/io/meas_info.py
 _human2fiff = {'ecg': FIFF.FIFFV_ECG_CH,
@@ -179,6 +187,8 @@ _human2fiff = {'ecg': FIFF.FIFFV_ECG_CH,
                'syst': FIFF.FIFFV_SYST_CH,
                'bio': FIFF.FIFFV_BIO_CH,
                'ecog': FIFF.FIFFV_ECOG_CH,
+               'fnirs_raw': FIFF.FIFFV_FNIRS_CH,
+               'fnirs_od': FIFF.FIFFV_FNIRS_CH,
                'hbo': FIFF.FIFFV_FNIRS_CH,
                'hbr': FIFF.FIFFV_FNIRS_CH}
 _human2unit = {'ecg': FIFF.FIFF_UNIT_V,
@@ -194,13 +204,16 @@ _human2unit = {'ecg': FIFF.FIFF_UNIT_V,
                'syst': FIFF.FIFF_UNIT_NONE,
                'bio': FIFF.FIFF_UNIT_V,
                'ecog': FIFF.FIFF_UNIT_V,
+               'fnirs_raw': FIFF.FIFF_UNIT_V,
+               'fnirs_od': FIFF.FIFF_UNIT_NONE,
                'hbo': FIFF.FIFF_UNIT_MOL,
                'hbr': FIFF.FIFF_UNIT_MOL}
 _unit2human = {FIFF.FIFF_UNIT_V: 'V',
                FIFF.FIFF_UNIT_T: 'T',
                FIFF.FIFF_UNIT_T_M: 'T/m',
                FIFF.FIFF_UNIT_MOL: 'M',
-               FIFF.FIFF_UNIT_NONE: 'NA'}
+               FIFF.FIFF_UNIT_NONE: 'NA',
+               FIFF.FIFF_UNIT_CEL: 'C'}
 
 
 def _check_set(ch, projs, ch_type):
@@ -220,7 +233,7 @@ class SetChannelsMixin(object):
 
     @verbose
     def set_eeg_reference(self, ref_channels='average', projection=False,
-                          verbose=None):
+                          ch_type='auto', verbose=None):
         """Specify which reference to use for EEG data.
 
         By default, MNE-Python will automatically re-reference the EEG signal
@@ -274,6 +287,12 @@ class SetChannelsMixin(object):
             ``projection=False``, the average reference is directly applied to
             the data. If ``ref_channels`` is not ``'average'``, ``projection``
             must be set to ``False`` (the default in this case).
+        ch_type : 'auto' | 'eeg' | 'ecog' | 'seeg'
+            The name of the channel type to apply the reference to. If 'auto',
+            the first channel type of eeg, ecog or seeg that is found (in that
+            order) will be selected.
+
+            .. versionadded:: 0.19
         %(verbose_meth)s
 
         Returns
@@ -306,7 +325,7 @@ class SetChannelsMixin(object):
         """
         from ..io.reference import set_eeg_reference
         return set_eeg_reference(self, ref_channels=ref_channels, copy=False,
-                                 projection=projection)[0]
+                                 projection=projection, ch_type=ch_type)[0]
 
     def _get_channel_positions(self, picks=None):
         """Get channel locations from info.
@@ -413,6 +432,10 @@ class SetChannelsMixin(object):
                 coil_type = FIFF.FIFFV_COIL_FNIRS_HBO
             elif ch_type == 'hbr':
                 coil_type = FIFF.FIFFV_COIL_FNIRS_HBR
+            elif ch_type == 'fnirs_raw':
+                coil_type = FIFF.FIFFV_COIL_FNIRS_RAW
+            elif ch_type == 'fnirs_od':
+                coil_type = FIFF.FIFFV_COIL_FNIRS_OD
             else:
                 coil_type = FIFF.FIFFV_COIL_NONE
             self.info['chs'][c_ind]['coil_type'] = coil_type
@@ -437,18 +460,23 @@ class SetChannelsMixin(object):
         rename_channels(self.info, mapping)
 
     @verbose
-    def set_montage(self, montage, set_dig=True, verbose=None):
+    def set_montage(
+        self, montage, raise_if_subset=DEPRECATED_PARAM, verbose=None
+    ):
         """Set EEG sensor configuration and head digitization.
 
         Parameters
         ----------
-        montage : instance of Montage | instance of DigMontage | str | None
-            The montage to use (None removes any location information).
-        set_dig : bool
-            If True, update the digitization information (``info['dig']``)
-            in addition to the channel positions (``info['chs'][idx]['loc']``).
+        %(montage)s
+        raise_if_subset: bool
+            If True, ValueError will be raised when montage.ch_names is a
+            subset of info['ch_names']. This parameter was introduced for
+            backward compatibility when set to False.
 
-            .. versionadded: 0.15
+            Defaults to False in 0.19, it will change to default to True in
+            0.20, and will be removed in 0.21.
+
+            .. versionadded: 0.19
         %(verbose_meth)s
 
         Notes
@@ -457,8 +485,11 @@ class SetChannelsMixin(object):
 
         .. versionadded:: 0.9.0
         """
+        # How to set up a montage to old named fif file (walk through example)
+        # https://gist.github.com/massich/f6a9f4799f1fbeb8f5e8f8bc7b07d3df
+
         from .montage import _set_montage
-        _set_montage(self.info, montage, set_dig=set_dig)
+        _set_montage(self.info, montage, raise_if_subset=raise_if_subset)
         return self
 
     def plot_sensors(self, kind='topomap', ch_type=None, title=None,
@@ -542,17 +573,14 @@ class SetChannelsMixin(object):
                             show=show)
 
     @copy_function_doc_to_method_doc(anonymize_info)
-    def anonymize(self):
+    def anonymize(self, daysback=None, keep_his=False):
         """
         .. versionadded:: 0.13.0
         """
-        anonymize_info(self.info)
+        anonymize_info(self.info, daysback=daysback, keep_his=keep_his)
         if hasattr(self, 'annotations'):
-            # XXX : anonymize should rather subtract a random date
-            # rather than setting it to None
-            self.annotations.orig_time = None
+            self.annotations.orig_time = self.info['meas_date']
             self.annotations.onset -= self._first_time
-
         return self
 
 
@@ -737,8 +765,8 @@ class UpdateChannelsMixin(object):
 
         Parameters
         ----------
-        ch_names : list or str
-            List of channel name(s) or channel name to remove.
+        ch_names : iterable or str
+            Iterable (e.g. list) of channel name(s) or channel name to remove.
 
         Returns
         -------
@@ -755,15 +783,18 @@ class UpdateChannelsMixin(object):
         -----
         .. versionadded:: 0.9.0
         """
-        if isinstance(ch_names, list):
-            if not all([isinstance(ch, str) for ch in ch_names]):
-                raise ValueError("'ch_names' must be a list of strings, got "
-                                 "{}.".format([type(ch) for ch in ch_names]))
-        elif isinstance(ch_names, str):
+        if isinstance(ch_names, str):
             ch_names = [ch_names]
-        else:
-            raise ValueError("'ch_names' must be a list or a string, got "
-                             "{}.".format(type(ch_names)))
+
+        try:
+            all_str = all([isinstance(ch, str) for ch in ch_names])
+        except TypeError:
+            raise ValueError("'ch_names' must be iterable, got "
+                             "type {} ({}).".format(type(ch_names), ch_names))
+
+        if not all_str:
+            raise ValueError("Each element in 'ch_names' must be str, got "
+                             "{}.".format([type(ch) for ch in ch_names]))
 
         missing = [ch for ch in ch_names if ch not in self.ch_names]
         if len(missing) > 0:
@@ -1189,6 +1220,9 @@ def find_ch_connectivity(info, ch_type):
             conn_name = 'ctf275'
         else:
             conn_name = 'ctf151'
+    elif n_kit_grads > 0:
+        from ..io.kit.constants import KIT_NEIGHBORS
+        conn_name = KIT_NEIGHBORS.get(info['kit_system_id'])
 
     if conn_name is not None:
         logger.info('Reading connectivity matrix for %s.' % conn_name)
@@ -1278,7 +1312,7 @@ def fix_mag_coil_types(info):
 
     .. note:: The effect of the difference between the coil sizes on the
               current estimates computed by the MNE software is very small.
-              Therefore the use of mne_fix_mag_coil_types is not mandatory.
+              Therefore the use of ``fix_mag_coil_types`` is not mandatory.
     """
     old_mag_inds = _get_T1T2_mag_inds(info)
 

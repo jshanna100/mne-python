@@ -4,6 +4,7 @@ RawKIT class is adapted from Denis Engemann et al.'s mne_bti2fiff.py.
 """
 
 # Authors: Teon Brooks <teon.brooks@gmail.com>
+#          Joan Massich <mailsik@gmail.com>
 #          Christian Brodbeck <christianbrodbeck@nyu.edu>
 #
 # License: BSD (3-clause)
@@ -17,18 +18,37 @@ import numpy as np
 from scipy import linalg
 
 from ..pick import pick_types
-from ...coreg import fit_matched_points, _decimate_points
 from ...utils import verbose, logger, warn, fill_doc, _check_option
-from ...transforms import (apply_trans, als_ras_trans,
-                           get_ras_to_neuromag_trans, Transform)
+from ...transforms import apply_trans, als_ras_trans
 from ..base import BaseRaw
 from ..utils import _mult_cal_one
 from ...epochs import BaseEpochs
 from ..constants import FIFF
-from ..meas_info import _empty_info, _read_dig_points, _make_dig_points
+from ..meas_info import _empty_info
 from .constants import KIT, LEGACY_AMP_PARAMS
 from .coreg import read_mrk
 from ...event import read_events
+
+from .._digitization import _set_dig_kit
+
+
+def _call_digitization(info, mrk, elp, hsp):
+    # prepare mrk
+    if isinstance(mrk, list):
+        mrk = [read_mrk(marker) if isinstance(marker, str)
+               else marker for marker in mrk]
+        mrk = np.mean(mrk, axis=0)
+
+    # setup digitization
+    if mrk is not None and elp is not None and hsp is not None:
+        dig_points, dev_head_t = _set_dig_kit(mrk, elp, hsp)
+        info['dig'] = dig_points
+        info['dev_head_t'] = dev_head_t
+    elif mrk is not None or elp is not None or hsp is not None:
+        raise ValueError("mrk, elp and hsp need to be provided as a group "
+                         "(all or none)")
+
+    return info
 
 
 class UnsupportedKITFormat(ValueError):
@@ -72,12 +92,7 @@ class RawKIT(BaseRaw):
     stimthresh : float
         The threshold level for accepting voltage changes in KIT trigger
         channels as a trigger event. If None, stim must also be set to None.
-    preload : bool or str (default False)
-        Preload data into memory for data manipulation and faster indexing.
-        If True, the data will be preloaded into memory (fast, requires
-        large amount of memory). If preload is a string, preload is the
-        file name of a memory-mapped file which is used to store the data
-        on the hard drive (slower, requires less memory).
+    %(preload)s
     stim_code : 'binary' | 'channel'
         How to decode trigger values from stim channels. 'binary' read stim
         channel events as binary code, 'channel' encodes channel number.
@@ -121,17 +136,11 @@ class RawKIT(BaseRaw):
             info, preload, last_samps=last_samps, filenames=[input_fname],
             raw_extras=self._raw_extras, verbose=verbose)
 
-        if isinstance(mrk, list):
-            mrk = [read_mrk(marker) if isinstance(marker, str)
-                   else marker for marker in mrk]
-            mrk = np.mean(mrk, axis=0)
-        if mrk is not None and elp is not None and hsp is not None:
-            dig_points, dev_head_t = _set_dig_kit(mrk, elp, hsp)
-            self.info['dig'] = dig_points
-            self.info['dev_head_t'] = dev_head_t
-        elif mrk is not None or elp is not None or hsp is not None:
-            raise ValueError('mrk, elp and hsp need to be provided as a group '
-                             '(all or none)')
+        self.info = _call_digitization(info=self.info,
+                                       mrk=mrk,
+                                       elp=elp,
+                                       hsp=hsp,
+                                       )
 
         logger.info('Ready.')
 
@@ -372,19 +381,6 @@ class EpochsKIT(BaseEpochs):
 
         if isinstance(events, str):
             events = read_events(events)
-        if isinstance(mrk, list):
-            mrk = [read_mrk(marker) if isinstance(marker, str)
-                   else marker for marker in mrk]
-            mrk = np.mean(mrk, axis=0)
-
-        if (mrk is not None and elp is not None and hsp is not None):
-            dig_points, dev_head_t = _set_dig_kit(mrk, elp, hsp)
-            self.info['dig'] = dig_points
-            self.info['dev_head_t'] = dev_head_t
-        elif (mrk is not None or elp is not None or hsp is not None):
-            err = ("mrk, elp and hsp need to be provided as a group (all or "
-                   "none)")
-            raise ValueError(err)
 
         logger.info('Extracting KIT Parameters from %s...' % input_fname)
         input_fname = op.abspath(input_fname)
@@ -419,6 +415,14 @@ class EpochsKIT(BaseEpochs):
             self.info, data, events, event_id, tmin, tmax, baseline,
             reject=reject, flat=flat, reject_tmin=reject_tmin,
             reject_tmax=reject_tmax, filename=input_fname, verbose=verbose)
+
+        # XXX: This should be unified with kitraw
+        self.info = _call_digitization(info=self.info,
+                                       mrk=mrk,
+                                       elp=elp,
+                                       hsp=hsp,
+                                       )
+
         logger.info('Ready.')
 
     def _read_kit_data(self):
@@ -452,78 +456,6 @@ class EpochsKIT(BaseEpochs):
         data = data.transpose((1, 0, 2))
 
         return data
-
-
-def _set_dig_kit(mrk, elp, hsp):
-    """Add landmark points and head shape data to the KIT instance.
-
-    Digitizer data (elp and hsp) are represented in [mm] in the Polhemus
-    ALS coordinate system. This is converted to [m].
-
-    Parameters
-    ----------
-    mrk : None | str | array_like, shape = (5, 3)
-        Marker points representing the location of the marker coils with
-        respect to the MEG Sensors, or path to a marker file.
-    elp : None | str | array_like, shape = (8, 3)
-        Digitizer points representing the location of the fiducials and the
-        marker coils with respect to the digitized head shape, or path to a
-        file containing these points.
-    hsp : None | str | array, shape = (n_points, 3)
-        Digitizer head shape points, or path to head shape file. If more
-        than 10`000 points are in the head shape, they are automatically
-        decimated.
-
-    Returns
-    -------
-    dig_points : list
-        List of digitizer points for info['dig'].
-    dev_head_t : dict
-        A dictionary describe the device-head transformation.
-    """
-    if isinstance(hsp, str):
-        hsp = _read_dig_points(hsp)
-    n_pts = len(hsp)
-    if n_pts > KIT.DIG_POINTS:
-        hsp = _decimate_points(hsp, res=0.005)
-        n_new = len(hsp)
-        warn("The selected head shape contained {n_in} points, which is "
-             "more than recommended ({n_rec}), and was automatically "
-             "downsampled to {n_new} points. The preferred way to "
-             "downsample is using FastScan.".format(
-                 n_in=n_pts, n_rec=KIT.DIG_POINTS, n_new=n_new))
-
-    if isinstance(elp, str):
-        elp_points = _read_dig_points(elp)
-        if len(elp_points) != 8:
-            raise ValueError("File %r should contain 8 points; got shape "
-                             "%s." % (elp, elp_points.shape))
-        elp = elp_points
-    elif len(elp) != 8:
-        raise ValueError("ELP should contain 8 points; got shape "
-                         "%s." % (elp.shape,))
-    if isinstance(mrk, str):
-        mrk = read_mrk(mrk)
-
-    hsp = apply_trans(als_ras_trans, hsp)
-    elp = apply_trans(als_ras_trans, elp)
-    mrk = apply_trans(als_ras_trans, mrk)
-
-    nasion, lpa, rpa = elp[:3]
-    nmtrans = get_ras_to_neuromag_trans(nasion, lpa, rpa)
-    elp = apply_trans(nmtrans, elp)
-    hsp = apply_trans(nmtrans, hsp)
-
-    # device head transform
-    trans = fit_matched_points(tgt_pts=elp[3:], src_pts=mrk, out='trans')
-
-    nasion, lpa, rpa = elp[:3]
-    elp = elp[3:]
-
-    dig_points = _make_dig_points(nasion, lpa, rpa, elp, hsp)
-    dev_head_t = Transform('meg', 'head', trans)
-
-    return dig_points, dev_head_t
 
 
 def get_kit_info(rawfile, allow_unknown_format):
@@ -824,9 +756,7 @@ def read_raw_kit(input_fname, mrk=None, elp=None, hsp=None, stim='>',
     stimthresh : float
         The threshold level for accepting voltage changes in KIT trigger
         channels as a trigger event.
-    preload : bool
-        If True, all data are loaded at initialization.
-        If False, data are not read until save.
+    %(preload)s
     stim_code : 'binary' | 'channel'
         How to decode trigger values from stim channels. 'binary' read stim
         channel events as binary code, 'channel' encodes channel number.

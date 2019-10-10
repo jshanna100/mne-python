@@ -289,7 +289,7 @@ class GetEpochsMixin(object):
             >>>     print(epoch)  # doctest: +SKIP
 
         Where ``epoch`` is given by successive outputs of
-        :func:`mne.Epochs.next`.
+        :meth:`mne.Epochs.next`.
         """
         self._current = 0
         return self
@@ -438,7 +438,8 @@ def _hid_match(event_id, keys):
         use_keys.extend(k for k in event_id.keys()
                         if set(key.split('/')).issubset(k.split('/')))
     if len(use_keys) == 0:
-        raise KeyError('Event "%s" is not in Epochs.' % key)
+        raise KeyError('Event "{}" is not in Epochs. Event_ids must be one of '
+                       '"{}"'.format(key, ', '.join(event_id.keys())))
     use_keys = list(set(use_keys))  # deduplicate if necessary
     return use_keys
 

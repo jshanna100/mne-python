@@ -47,7 +47,7 @@ def maxwell_filter(raw, origin='auto', int_order=8, ext_order=3,
                    regularize='in', ignore_ref=False, bad_condition='error',
                    head_pos=None, st_fixed=True, st_only=False, mag_scale=100.,
                    skip_by_annotation=('edge', 'bad_acq_skip'), verbose=None):
-    u"""Maxwell filter data using multipole moments.
+    """Maxwell filter data using multipole moments.
 
     Parameters
     ----------
@@ -81,9 +81,9 @@ def maxwell_filter(raw, origin='auto', int_order=8, ext_order=3,
         If not None, apply spatiotemporal SSS with specified buffer duration
         (in seconds). MaxFilter™'s default is 10.0 seconds in v2.2.
         Spatiotemporal SSS acts as implicitly as a high-pass filter where the
-        cut-off frequency is 1/st_dur Hz. For this (and other) reasons, longer
-        buffers are generally better as long as your system can handle the
-        higher memory usage. To ensure that each window is processed
+        cut-off frequency is 1/st_duration Hz. For this (and other) reasons,
+        longer buffers are generally better as long as your system can handle
+        the higher memory usage. To ensure that each window is processed
         identically, choose a buffer length that divides evenly into your data.
         Any data at the trailing edge that doesn't fit evenly into a whole
         buffer window will be lumped into the previous buffer.
@@ -188,41 +188,44 @@ def maxwell_filter(raw, origin='auto', int_order=8, ext_order=3,
     Compared to the MEGIN MaxFilter™ software, the MNE Maxwell filtering
     routines currently provide the following features:
 
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Feature                                                                     | MNE | MaxFilter |
-    +=============================================================================+=====+===========+
-    | Maxwell filtering software shielding                                        | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Bad channel reconstruction                                                  | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Cross-talk cancellation                                                     | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Fine calibration correction (1D)                                            | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Fine calibration correction (3D)                                            | X   |           |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Spatio-temporal SSS (tSSS)                                                  | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Coordinate frame translation                                                | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Regularization using information theory                                     | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Movement compensation (raw)                                                 | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Movement compensation (:func:`epochs <mne.epochs.average_movements>`)       | X   |           |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | :func:`cHPI subtraction <mne.chpi.filter_chpi>`                             | X   | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Double floating point precision                                             | X   |           |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Seamless processing of split (``-1.fif``) and concatenated files            | X   |           |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Certified for clinical use                                                  |     | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Automatic bad channel detection                                             |     | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
-    | Head position estimation                                                    |     | X         |
-    +-----------------------------------------------------------------------------+-----+-----------+
+    .. table::
+       :widths: auto
+
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Feature                                                                     | MNE | MaxFilter |
+       +=============================================================================+=====+===========+
+       | Maxwell filtering software shielding                                        | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Bad channel reconstruction                                                  | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Cross-talk cancellation                                                     | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Fine calibration correction (1D)                                            | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Fine calibration correction (3D)                                            | ✓   |           |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Spatio-temporal SSS (tSSS)                                                  | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Coordinate frame translation                                                | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Regularization using information theory                                     | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Movement compensation (raw)                                                 | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Movement compensation (:func:`epochs <mne.epochs.average_movements>`)       | ✓   |           |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | :func:`cHPI subtraction <mne.chpi.filter_chpi>`                             | ✓   | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Double floating point precision                                             | ✓   |           |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Seamless processing of split (``-1.fif``) and concatenated files            | ✓   |           |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Certified for clinical use                                                  |     | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Automatic bad channel detection                                             |     | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
+       | Head position estimation                                                    |     | ✓         |
+       +-----------------------------------------------------------------------------+-----+-----------+
 
     Epoch-based movement compensation is described in [1]_.
 

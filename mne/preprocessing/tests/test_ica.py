@@ -1,5 +1,5 @@
 # Author: Denis Engemann <denis.engemann@gmail.com>
-#         Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+#         Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #
 # License: BSD (3-clause)
 
@@ -247,6 +247,10 @@ def test_ica_core(method):
         pytest.raises(RuntimeError, ica.get_sources, raw)
         pytest.raises(RuntimeError, ica.get_sources, epochs)
 
+        # Test error upon empty epochs fitting
+        with pytest.raises(RuntimeError, match='none were found'):
+            ica.fit(epochs[0:0])
+
         # test decomposition
         with pytest.warns(UserWarning, match='did not converge'):
             ica.fit(raw, picks=pcks, start=start, stop=stop)
@@ -263,6 +267,15 @@ def test_ica_core(method):
         # test for #3804
         assert_equal(raw_sources._filenames, [None])
         print(raw_sources)
+
+        # test for gh-6271 (scaling of ICA traces)
+        fig = raw_sources.plot()
+        assert len(fig.axes[0].lines) in (4, 5, 6)
+        for line in fig.axes[0].lines:
+            y = line.get_ydata()
+            if len(y) > 2:  # actual data, not markers
+                assert np.ptp(y) < 15
+        plt.close('all')
 
         sources = raw_sources[:, :][0]
         assert (sources.shape[0] == ica.n_components_)
@@ -386,6 +399,10 @@ def test_ica_additional(method):
     assert (ica2.labels_["blinks"] == ica3.labels_["blinks"])
 
     plt.close('all')
+
+    # make sure a single threshold in a list works
+    corrmap([ica, ica3], template, threshold=[0.5], label='blinks', plot=True,
+            ch_type="mag")
 
     ica_different_channels = ICA(n_components=2, random_state=0).fit(
         raw, picks=[2, 3, 4, 5])
@@ -521,7 +538,7 @@ def test_ica_additional(method):
         assert (ica.n_components_ == len(scores))
 
     # check univariate stats
-    scores = ica.score_sources(raw, score_func=stats.skew)
+    scores = ica.score_sources(raw, start=0, stop=50, score_func=stats.skew)
     # check exception handling
     pytest.raises(ValueError, ica.score_sources, raw,
                   target=np.arange(1))
@@ -533,6 +550,16 @@ def test_ica_additional(method):
         ica.detect_artifacts(raw, start_find=0, stop_find=50, ecg_ch=ch_name,
                              eog_ch=ch_name, skew_criterion=idx,
                              var_criterion=idx, kurt_criterion=idx)
+
+    # Make sure detect_artifacts marks the right components.
+    # For int criterion, the doc says "E.g. range(2) would return the two
+    # sources with the highest score". Assert that's what it does.
+    # Only test for skew, since it's always the same code.
+    ica.exclude = []
+    ica.detect_artifacts(raw, start_find=0, stop_find=50, ecg_ch=None,
+                         eog_ch=None, skew_criterion=0,
+                         var_criterion=None, kurt_criterion=None)
+    assert np.abs(scores[ica.exclude]) == np.max(np.abs(scores))
 
     evoked = epochs.average()
     evoked_data = evoked.data.copy()
@@ -988,7 +1015,7 @@ def test_ica_eeg():
     method = 'fastica'
     raw_fif = read_raw_fif(fif_fname, preload=True)
     raw_eeglab = read_raw_eeglab(input_fname=eeglab_fname,
-                                 montage=eeglab_montage, preload=True)
+                                 preload=True)
     for raw in [raw_fif, raw_eeglab]:
         events = make_fixed_length_events(raw, 99999, start=0, stop=0.3,
                                           duration=0.1)

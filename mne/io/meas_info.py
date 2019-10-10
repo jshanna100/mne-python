@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
-#          Matti Hamalainen <msh@nmr.mgh.harvard.edu>
+# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
+#          Matti Hämäläinen <msh@nmr.mgh.harvard.edu>
 #          Teon Brooks <teon.brooks@gmail.com>
 #          Stefan Appelhoff <stefan.appelhoff@mailbox.org>
 #
@@ -11,8 +11,6 @@ from copy import deepcopy
 import datetime
 from io import BytesIO
 import operator
-import os.path as op
-import re
 
 import numpy as np
 from scipy import linalg
@@ -21,7 +19,7 @@ from .pick import channel_type
 from .constants import FIFF
 from .open import fiff_open
 from .tree import dir_tree_find
-from .tag import read_tag, find_tag
+from .tag import read_tag, find_tag, _coord_dict
 from .proj import _read_proj, _write_proj, _uniquify_projs, _normalize_proj
 from .ctf_comp import read_ctf_comp, write_ctf_comp
 from .write import (start_file, end_file, start_block, end_block,
@@ -29,10 +27,11 @@ from .write import (start_file, end_file, start_block, end_block,
                     write_coord_trans, write_ch_info, write_name_list,
                     write_julian, write_float_matrix, write_id, DATE_NONE)
 from .proc_history import _read_proc_history, _write_proc_history
-from ..transforms import _to_const, invert_transform, _coord_frame_name
-from ..utils import (logger, verbose, warn, object_diff, _validate_type,
-                     _check_option)
-from .. import __version__
+from ..transforms import invert_transform, Transform
+from ..utils import logger, verbose, warn, object_diff, _validate_type
+from ._digitization import (_format_dig_points, _dig_kind_proper,
+                            _dig_kind_rev, _dig_kind_ints, _read_dig_fif)
+from ._digitization import write_dig as _dig_write_dig
 from .compensator import get_current_comp
 
 b = bytes  # alias
@@ -51,6 +50,10 @@ _kind_dict = dict(
     seeg=(FIFF.FIFFV_SEEG_CH, FIFF.FIFFV_COIL_EEG, FIFF.FIFF_UNIT_V),
     bio=(FIFF.FIFFV_BIO_CH, FIFF.FIFFV_COIL_NONE, FIFF.FIFF_UNIT_V),
     ecog=(FIFF.FIFFV_ECOG_CH, FIFF.FIFFV_COIL_EEG, FIFF.FIFF_UNIT_V),
+    fnirs_raw=(FIFF.FIFFV_FNIRS_CH, FIFF.FIFFV_COIL_FNIRS_RAW,
+               FIFF.FIFF_UNIT_V),
+    fnirs_od=(FIFF.FIFFV_FNIRS_CH, FIFF.FIFFV_COIL_FNIRS_OD,
+              FIFF.FIFF_UNIT_NONE),
     hbo=(FIFF.FIFFV_FNIRS_CH, FIFF.FIFFV_COIL_FNIRS_HBO, FIFF.FIFF_UNIT_MOL),
     hbr=(FIFF.FIFFV_FNIRS_CH, FIFF.FIFFV_COIL_FNIRS_HBR, FIFF.FIFF_UNIT_MOL)
 )
@@ -59,15 +62,16 @@ _kind_dict = dict(
 def _get_valid_units():
     """Get valid units according to the International System of Units (SI).
 
-    The International System of Units (SI, [1]) is the default system for
+    The International System of Units (SI, [1]_) is the default system for
     describing units in the Brain Imaging Data Structure (BIDS). For more
-    information, see the BIDS specification [2] and the appendix "Units"
+    information, see the BIDS specification [2]_ and the appendix "Units"
     therein.
 
     References
     ----------
     [1] .. https://en.wikipedia.org/wiki/International_System_of_Units
-    [2] .. http://bids.neuroimaging.io/bids_spec.pdf
+    [2] .. https://bids-specification.readthedocs.io/en/stable/
+
     """
     valid_prefix_names = ['yocto', 'zepto', 'atto', 'femto', 'pico', 'nano',
                           'micro', 'milli', 'centi', 'deci', 'deca', 'hecto',
@@ -115,13 +119,19 @@ def _summarize_str(st):
     return st[:56][::-1].split(',', 1)[-1][::-1] + ', ...'
 
 
-def _stamp_to_dt(stamp):
+def _dt_to_stamp(inp_date):
+    """Convert a datetime object to a meas_date."""
+    return int(inp_date.timestamp() // 1), inp_date.microsecond
+
+
+def _stamp_to_dt(utc_stamp):
     """Convert timestamp to datetime object in Windows-friendly way."""
     # The min on windows is 86400
-    stamp = [int(s) for s in stamp]
+    stamp = [int(s) for s in utc_stamp]
     if len(stamp) == 1:  # In case there is no microseconds information
         stamp.append(0)
-    return (datetime.datetime.utcfromtimestamp(stamp[0]) +
+    return (datetime.datetime.fromtimestamp(stamp[0],
+                                            tz=datetime.timezone.utc) +
             datetime.timedelta(0, 0, stamp[1]))  # day, sec, μs
 
 
@@ -237,6 +247,10 @@ class Info(dict):
         1970-01-01 00:00:00) denoting the date and time at which the
         measurement was taken. The second element is the additional number of
         microseconds.
+    utc_offset : str
+        "UTC offset of related meas_date (sHH:MM).
+
+        .. versionadded:: 0.19
     meas_id : dict | None
         The ID assigned to this measurement by the acquisition system or
         during file conversion. Follows the same format as ``file_id``.
@@ -257,6 +271,14 @@ class Info(dict):
     subject_info : dict | None
         Information about the subject.
         See Notes for details.
+    device_info : dict | None
+        Information about the acquisition device. See Notes for details.
+
+        .. versionadded:: 0.19
+    helium_info : dict | None
+        Information about the device helium. See Notes for details.
+
+        .. versionadded:: 0.19
 
     See Also
     --------
@@ -314,9 +336,19 @@ class Info(dict):
         save_calibrated : bool
             Were the compensation data saved in calibrated form.
 
-    * ``dig`` list:
+    * ``dig`` list of dict:
 
-        See :class:`~mne.io.DigPoint`.
+        kind : int
+            The kind of channel,
+            e.g. ``FIFFV_POINT_EEG``, ``FIFFV_POINT_CARDINAL``.
+        r : array, shape (3,)
+            3D position in m. and coord_frame.
+        ident : int
+            Number specifying the identity of the point.
+            e.g. ``FIFFV_POINT_NASION`` if kind is ``FIFFV_POINT_CARDINAL``, or
+            42 if kind is ``FIFFV_POINT_EEG``.
+        coord_frame : int
+            The coordinate frame used, e.g. ``FIFFV_COORD_HEAD``.
 
     * ``events`` list of dict:
 
@@ -443,6 +475,28 @@ class Info(dict):
             Subject sex (0=unknown, 1=male, 2=female).
         hand : int
             Handedness (1=right, 2=left).
+
+    * ``device_info`` dict:
+
+        type : str
+            Device type.
+        model : str
+            Device model.
+        serial : str
+            Device serial.
+        site : str
+            Device site.
+
+    * ``helium_info`` dict:
+
+        he_level_raw : float
+            Helium level (%) before position correction.
+        helium_level : float
+            Helium level (%) after position correction.
+        orig_file_guid : str
+            Original file GUID.
+        meas_date : tuple of int
+            The helium level meas date.
 
     """
 
@@ -655,7 +709,7 @@ def write_fiducials(fname, pts, coord_frame=FIFF.FIFFV_COORD_UNKNOWN,
         mne.io.constants.FIFF.FIFFV_COORD_...).
     %(verbose)s
     """
-    write_dig(fname, pts, coord_frame)
+    _dig_write_dig(fname, pts, coord_frame)
 
 
 def write_dig(fname, pts, coord_frame=None):
@@ -673,265 +727,7 @@ def write_dig(fname, pts, coord_frame=None):
         here. Can be None (default) if the points could have varying
         coordinate frames.
     """
-    if coord_frame is not None:
-        coord_frame = _to_const(coord_frame)
-        pts_frames = {pt.get('coord_frame', coord_frame) for pt in pts}
-        bad_frames = pts_frames - {coord_frame}
-        if len(bad_frames) > 0:
-            raise ValueError(
-                'Points have coord_frame entries that are incompatible with '
-                'coord_frame=%i: %s.' % (coord_frame, str(tuple(bad_frames))))
-
-    with start_file(fname) as fid:
-        write_dig_points(fid, pts, block=True, coord_frame=coord_frame)
-        end_file(fid)
-
-
-def _format_dig_points(dig):
-    """Format the dig points nicely."""
-    return [DigPoint(d) for d in dig] if dig is not None else dig
-
-
-_dig_kind_dict = {
-    'cardinal': FIFF.FIFFV_POINT_CARDINAL,
-    'hpi': FIFF.FIFFV_POINT_HPI,
-    'eeg': FIFF.FIFFV_POINT_EEG,
-    'extra': FIFF.FIFFV_POINT_EXTRA,
-}
-_dig_kind_ints = tuple(sorted(_dig_kind_dict.values()))
-_dig_kind_proper = {'cardinal': 'Cardinal',
-                    'hpi': 'HPI',
-                    'eeg': 'EEG',
-                    'extra': 'Extra',
-                    'unknown': 'Unknown'}
-_dig_kind_rev = {val: key for key, val in _dig_kind_dict.items()}
-_cardinal_kind_rev = {1: 'LPA', 2: 'Nasion', 3: 'RPA', 4: 'Inion'}
-
-
-class DigPoint(dict):
-    """Container for a digitization point.
-
-    This is a simple subclass of the standard dict type designed to provide
-    a readable string representation.
-
-    Parameters
-    ----------
-    kind : int
-        Digitization kind, e.g. ``FIFFV_POINT_EXTRA``.
-    ident : int
-        Identifier.
-    r : ndarray, shape (3,)
-        Position.
-    coord_frame : int
-        Coordinate frame, e.g. ``FIFFV_COORD_HEAD``.
-    """
-
-    def __repr__(self):  # noqa: D105
-        if self['kind'] == FIFF.FIFFV_POINT_CARDINAL:
-            id_ = _cardinal_kind_rev.get(
-                self.get('ident', -1), 'Unknown cardinal')
-        else:
-            id_ = _dig_kind_proper[
-                _dig_kind_rev.get(self.get('kind', -1), 'unknown')]
-            id_ = ('%s #%s' % (id_, self.get('ident', -1)))
-        id_ = id_.rjust(10)
-        cf = _coord_frame_name(self['coord_frame'])
-        pos = ('(%0.1f, %0.1f, %0.1f) mm' % tuple(1000 * self['r'])).ljust(25)
-        return ('<DigPoint | %s : %s : %s frame>' % (id_, pos, cf))
-
-
-def _read_dig_fif(fid, meas_info):
-    """Read digitizer data from a FIFF file."""
-    isotrak = dir_tree_find(meas_info, FIFF.FIFFB_ISOTRAK)
-    dig = None
-    if len(isotrak) == 0:
-        logger.info('Isotrak not found')
-    elif len(isotrak) > 1:
-        warn('Multiple Isotrak found')
-    else:
-        isotrak = isotrak[0]
-        dig = []
-        for k in range(isotrak['nent']):
-            kind = isotrak['directory'][k].kind
-            pos = isotrak['directory'][k].pos
-            if kind == FIFF.FIFF_DIG_POINT:
-                tag = read_tag(fid, pos)
-                dig.append(tag.data)
-                dig[-1]['coord_frame'] = FIFF.FIFFV_COORD_HEAD
-    return _format_dig_points(dig)
-
-
-def _read_dig_points(fname, comments='%', unit='auto'):
-    """Read digitizer data from a text file.
-
-    If fname ends in .hsp or .esp, the function assumes digitizer files in [m],
-    otherwise it assumes space-delimited text files in [mm].
-
-    Parameters
-    ----------
-    fname : str
-        The filepath of space delimited file with points, or a .mat file
-        (Polhemus FastTrak format).
-    comments : str
-        The character used to indicate the start of a comment;
-        Default: '%'.
-    unit : 'auto' | 'm' | 'cm' | 'mm'
-        Unit of the digitizer files (hsp and elp). If not 'm', coordinates will
-        be rescaled to 'm'. Default is 'auto', which assumes 'm' for *.hsp and
-        *.elp files and 'mm' for *.txt files, corresponding to the known
-        Polhemus export formats.
-
-    Returns
-    -------
-    dig_points : np.ndarray, shape (n_points, 3)
-        Array of dig points in [m].
-    """
-    _check_option('unit', unit, ['auto', 'm', 'mm', 'cm'])
-
-    _, ext = op.splitext(fname)
-    if ext == '.elp' or ext == '.hsp':
-        with open(fname) as fid:
-            file_str = fid.read()
-        value_pattern = r"\-?\d+\.?\d*e?\-?\d*"
-        coord_pattern = r"({0})\s+({0})\s+({0})\s*$".format(value_pattern)
-        if ext == '.hsp':
-            coord_pattern = '^' + coord_pattern
-        points_str = [m.groups() for m in re.finditer(coord_pattern, file_str,
-                                                      re.MULTILINE)]
-        dig_points = np.array(points_str, dtype=float)
-    elif ext == '.mat':  # like FastScan II
-        from scipy.io import loadmat
-        dig_points = loadmat(fname)['Points'].T
-    else:
-        dig_points = np.loadtxt(fname, comments=comments, ndmin=2)
-        if unit == 'auto':
-            unit = 'mm'
-        if dig_points.shape[1] > 3:
-            warn('Found %d columns instead of 3, using first 3 for XYZ '
-                 'coordinates' % (dig_points.shape[1],))
-            dig_points = dig_points[:, :3]
-
-    if dig_points.shape[-1] != 3:
-        err = 'Data must be (n, 3) instead of %s' % (dig_points.shape,)
-        raise ValueError(err)
-
-    if unit == 'mm':
-        dig_points /= 1000.
-    elif unit == 'cm':
-        dig_points /= 100.
-
-    return dig_points
-
-
-def _write_dig_points(fname, dig_points):
-    """Write points to text file.
-
-    Parameters
-    ----------
-    fname : str
-        Path to the file to write. The kind of file to write is determined
-        based on the extension: '.txt' for tab separated text file.
-    dig_points : numpy.ndarray, shape (n_points, 3)
-        Points.
-    """
-    _, ext = op.splitext(fname)
-    dig_points = np.asarray(dig_points)
-    if (dig_points.ndim != 2) or (dig_points.shape[1] != 3):
-        err = ("Points must be of shape (n_points, 3), "
-               "not %s" % (dig_points.shape,))
-        raise ValueError(err)
-
-    if ext == '.txt':
-        with open(fname, 'wb') as fid:
-            version = __version__
-            now = datetime.datetime.now().strftime("%I:%M%p on %B %d, %Y")
-            fid.write(b'%% Ascii 3D points file created by mne-python version'
-                      b' %s at %s\n' % (version.encode(), now.encode()))
-            fid.write(b'%% %d 3D points, x y z per line\n' % len(dig_points))
-            np.savetxt(fid, dig_points, delimiter='\t', newline='\n')
-    else:
-        msg = "Unrecognized extension: %r. Need '.txt'." % ext
-        raise ValueError(msg)
-
-
-def _make_dig_points(nasion=None, lpa=None, rpa=None, hpi=None,
-                     extra_points=None, dig_ch_pos=None):
-    """Construct digitizer info for the info.
-
-    Parameters
-    ----------
-    nasion : array-like | numpy.ndarray, shape (3,) | None
-        Point designated as the nasion point.
-    lpa : array-like |  numpy.ndarray, shape (3,) | None
-        Point designated as the left auricular point.
-    rpa : array-like |  numpy.ndarray, shape (3,) | None
-        Point designated as the right auricular point.
-    hpi : array-like | numpy.ndarray, shape (n_points, 3) | None
-        Points designated as head position indicator points.
-    extra_points : array-like | numpy.ndarray, shape (n_points, 3)
-        Points designed as the headshape points.
-    dig_ch_pos : dict
-        Dict of EEG channel positions.
-
-    Returns
-    -------
-    dig : list
-        List of digitizer points to be added to the info['dig'].
-    """
-    dig = []
-    if lpa is not None:
-        lpa = np.asarray(lpa)
-        if lpa.shape != (3,):
-            raise ValueError('LPA should have the shape (3,) instead of %s'
-                             % (lpa.shape,))
-        dig.append({'r': lpa, 'ident': FIFF.FIFFV_POINT_LPA,
-                    'kind': FIFF.FIFFV_POINT_CARDINAL,
-                    'coord_frame': FIFF.FIFFV_COORD_HEAD})
-    if nasion is not None:
-        nasion = np.asarray(nasion)
-        if nasion.shape != (3,):
-            raise ValueError('Nasion should have the shape (3,) instead of %s'
-                             % (nasion.shape,))
-        dig.append({'r': nasion, 'ident': FIFF.FIFFV_POINT_NASION,
-                    'kind': FIFF.FIFFV_POINT_CARDINAL,
-                    'coord_frame': FIFF.FIFFV_COORD_HEAD})
-    if rpa is not None:
-        rpa = np.asarray(rpa)
-        if rpa.shape != (3,):
-            raise ValueError('RPA should have the shape (3,) instead of %s'
-                             % (rpa.shape,))
-        dig.append({'r': rpa, 'ident': FIFF.FIFFV_POINT_RPA,
-                    'kind': FIFF.FIFFV_POINT_CARDINAL,
-                    'coord_frame': FIFF.FIFFV_COORD_HEAD})
-    if hpi is not None:
-        hpi = np.asarray(hpi)
-        if hpi.ndim != 2 or hpi.shape[1] != 3:
-            raise ValueError('HPI should have the shape (n_points, 3) instead '
-                             'of %s' % (hpi.shape,))
-        for idx, point in enumerate(hpi):
-            dig.append({'r': point, 'ident': idx + 1,
-                        'kind': FIFF.FIFFV_POINT_HPI,
-                        'coord_frame': FIFF.FIFFV_COORD_HEAD})
-    if extra_points is not None:
-        extra_points = np.asarray(extra_points)
-        if extra_points.shape[1] != 3:
-            raise ValueError('Points should have the shape (n_points, 3) '
-                             'instead of %s' % (extra_points.shape,))
-        for idx, point in enumerate(extra_points):
-            dig.append({'r': point, 'ident': idx + 1,
-                        'kind': FIFF.FIFFV_POINT_EXTRA,
-                        'coord_frame': FIFF.FIFFV_COORD_HEAD})
-    if dig_ch_pos is not None:
-        keys = sorted(dig_ch_pos.keys())
-        try:  # use the last 3 as int if possible (e.g., EEG001->1)
-            idents = [int(key[-3:]) for key in keys]
-        except ValueError:  # and if any conversion fails, simply use arange
-            idents = np.arange(1, len(keys) + 1)
-        for key, ident in zip(keys, idents):
-            dig.append({'r': dig_ch_pos[key], 'ident': ident,
-                        'kind': FIFF.FIFFV_POINT_EEG,
-                        'coord_frame': FIFF.FIFFV_COORD_HEAD})
-    return _format_dig_points(dig)
+    return _dig_write_dig(fname, pts, coord_frame=None)
 
 
 @verbose
@@ -1025,6 +821,7 @@ def read_meas_info(fid, tree, clean_bads=False, verbose=None):
     ctf_head_t = None
     dev_ctf_t = None
     meas_date = None
+    utc_offset = None
     highpass = None
     lowpass = None
     nchan = None
@@ -1064,6 +861,9 @@ def read_meas_info(fid, tree, clean_bads=False, verbose=None):
             meas_date = tuple(tag.data)
             if len(meas_date) == 1:  # can happen from old C conversions
                 meas_date = (meas_date[0], 0)
+        elif kind == FIFF.FIFF_UTC_OFFSET:
+            tag = read_tag(fid, pos)
+            utc_offset = str(tag.data)
         elif kind == FIFF.FIFF_COORD_TRANS:
             tag = read_tag(fid, pos)
             cand = tag.data
@@ -1265,6 +1065,7 @@ def read_meas_info(fid, tree, clean_bads=False, verbose=None):
         hm['hpi_coils'] = hcs
         hms.append(hm)
     info['hpi_meas'] = hms
+    del hms
 
     subject_info = dir_tree_find(meas_info, FIFF.FIFFB_SUBJECT)
     si = None
@@ -1305,6 +1106,53 @@ def read_meas_info(fid, tree, clean_bads=False, verbose=None):
                 tag = read_tag(fid, pos)
                 si['height'] = tag.data
     info['subject_info'] = si
+    del si
+
+    device_info = dir_tree_find(meas_info, FIFF.FIFFB_DEVICE)
+    di = None
+    if len(device_info) == 1:
+        device_info = device_info[0]
+        di = dict()
+        for k in range(device_info['nent']):
+            kind = device_info['directory'][k].kind
+            pos = device_info['directory'][k].pos
+            if kind == FIFF.FIFF_DEVICE_TYPE:
+                tag = read_tag(fid, pos)
+                di['type'] = str(tag.data)
+            elif kind == FIFF.FIFF_DEVICE_MODEL:
+                tag = read_tag(fid, pos)
+                di['model'] = str(tag.data)
+            elif kind == FIFF.FIFF_DEVICE_SERIAL:
+                tag = read_tag(fid, pos)
+                di['serial'] = str(tag.data)
+            elif kind == FIFF.FIFF_DEVICE_SITE:
+                tag = read_tag(fid, pos)
+                di['site'] = str(tag.data)
+    info['device_info'] = di
+    del di
+
+    helium_info = dir_tree_find(meas_info, FIFF.FIFFB_HELIUM)
+    hi = None
+    if len(helium_info) == 1:
+        helium_info = helium_info[0]
+        hi = dict()
+        for k in range(helium_info['nent']):
+            kind = helium_info['directory'][k].kind
+            pos = helium_info['directory'][k].pos
+            if kind == FIFF.FIFF_HE_LEVEL_RAW:
+                tag = read_tag(fid, pos)
+                hi['he_level_raw'] = float(tag.data)
+            elif kind == FIFF.FIFF_HELIUM_LEVEL:
+                tag = read_tag(fid, pos)
+                hi['helium_level'] = float(tag.data)
+            elif kind == FIFF.FIFF_ORIG_FILE_GUID:
+                tag = read_tag(fid, pos)
+                hi['orig_file_guid'] = str(tag.data)
+            elif kind == FIFF.FIFF_MEAS_DATE:
+                tag = read_tag(fid, pos)
+                hi['meas_date'] = tuple(int(t) for t in tag.data)
+    info['helium_info'] = hi
+    del hi
 
     hpi_subsystem = dir_tree_find(meas_info, FIFF.FIFFB_HPI_SUBSYSTEM)
     hs = None
@@ -1360,6 +1208,7 @@ def read_meas_info(fid, tree, clean_bads=False, verbose=None):
     if np.array_equal(meas_date, DATE_NONE):
         meas_date = None
     info['meas_date'] = meas_date
+    info['utc_offset'] = utc_offset
 
     info['sfreq'] = sfreq
     info['highpass'] = highpass if highpass is not None else 0.
@@ -1384,7 +1233,7 @@ def read_meas_info(fid, tree, clean_bads=False, verbose=None):
         info['dev_ctf_t'] = Transform('meg', 'ctf_head', dev_ctf_trans)
 
     #   All kinds of auxliary stuff
-    info['dig'] = dig
+    info['dig'] = _format_dig_points(dig)
     info['bads'] = bads
     info._update_redundant()
     if clean_bads:
@@ -1542,6 +1391,8 @@ def write_meas_info(fid, info, data_type=None, reset_range=True):
         write_string(fid, FIFF.FIFF_PROJ_NAME, info['proj_name'])
     if info.get('meas_date') is not None:
         write_int(fid, FIFF.FIFF_MEAS_DATE, info['meas_date'])
+    if info.get('utc_offset') is not None:
+        write_string(fid, FIFF.FIFF_UTC_OFFSET, info['utc_offset'])
     write_int(fid, FIFF.FIFF_NCHAN, info['nchan'])
     write_float(fid, FIFF.FIFF_SFREQ, info['sfreq'])
     if info['lowpass'] is not None:
@@ -1594,6 +1445,31 @@ def write_meas_info(fid, info, data_type=None, reset_range=True):
         if si.get('height') is not None:
             write_float(fid, FIFF.FIFF_SUBJ_HEIGHT, si['height'])
         end_block(fid, FIFF.FIFFB_SUBJECT)
+        del si
+
+    if info.get('device_info') is not None:
+        start_block(fid, FIFF.FIFFB_DEVICE)
+        di = info['device_info']
+        write_string(fid, FIFF.FIFF_DEVICE_TYPE, di['type'])
+        for key in ('model', 'serial', 'site'):
+            if di.get(key) is not None:
+                write_string(fid, getattr(FIFF, 'FIFF_DEVICE_' + key.upper()),
+                             di[key])
+        end_block(fid, FIFF.FIFFB_DEVICE)
+        del di
+
+    if info.get('helium_info') is not None:
+        start_block(fid, FIFF.FIFFB_HELIUM)
+        hi = info['helium_info']
+        if hi.get('he_level_raw') is not None:
+            write_float(fid, FIFF.FIFF_HE_LEVEL_RAW, hi['he_level_raw'])
+        if hi.get('helium_level') is not None:
+            write_float(fid, FIFF.FIFF_HELIUM_LEVEL, hi['helium_level'])
+        if hi.get('orig_file_guid') is not None:
+            write_string(fid, FIFF.FIFF_ORIG_FILE_GUID, hi['orig_file_guid'])
+        write_int(fid, FIFF.FIFF_MEAS_DATE, hi['meas_date'])
+        end_block(fid, FIFF.FIFFB_HELIUM)
+        del hi
 
     if info.get('hpi_subsystem') is not None:
         hs = info['hpi_subsystem']
@@ -1610,6 +1486,7 @@ def write_meas_info(fid, info, data_type=None, reset_range=True):
                               coil['event_bits'])
                 end_block(fid, FIFF.FIFFB_HPI_COIL)
         end_block(fid, FIFF.FIFFB_HPI_SUBSYSTEM)
+        del hs
 
     #   CTF compensation info
     write_ctf_comp(fid, info['comps'])
@@ -1823,8 +1700,8 @@ def _merge_info(infos, force_update_to_first=False, verbose=None):
     # other fields
     other_fields = ['acq_pars', 'acq_stim', 'bads',
                     'comps', 'custom_ref_applied', 'description',
-                    'experimenter', 'file_id', 'highpass',
-                    'hpi_subsystem', 'events',
+                    'experimenter', 'file_id', 'highpass', 'utc_offset',
+                    'hpi_subsystem', 'events', 'device_info', 'helium_info',
                     'line_freq', 'lowpass', 'meas_id',
                     'proj_id', 'proj_name', 'projs', 'sfreq', 'gantry_angle',
                     'subject_info', 'sfreq', 'xplotter_layout', 'proc_history']
@@ -1852,13 +1729,7 @@ def create_info(ch_names, sfreq, ch_types=None, montage=None, verbose=None):
         Currently supported fields are 'ecg', 'bio', 'stim', 'eog', 'misc',
         'seeg', 'ecog', 'mag', 'eeg', 'ref_meg', 'grad', 'emg', 'hbr' or 'hbo'.
         If str, then all channels are assumed to be of the same type.
-    montage : None | str | Montage | DigMontage | list
-        A montage containing channel positions. If str or Montage is
-        specified, the channel info will be updated with the channel
-        positions. Default is None. If DigMontage is specified, the
-        digitizer information will be updated. A list of unique montages,
-        can be specified and applied to the info. See also the documentation of
-        :func:`mne.channels.read_montage` for more information.
+    %(montage)s
     %(verbose)s
 
     Returns
@@ -1884,6 +1755,7 @@ def create_info(ch_names, sfreq, ch_types=None, montage=None, verbose=None):
     * Am: dipole
     * AU: misc
     """
+    from ..channels.montage import (DigMontage, _set_montage)
     try:
         ch_names = operator.index(ch_names)  # int-like
     except TypeError:
@@ -1892,6 +1764,8 @@ def create_info(ch_names, sfreq, ch_types=None, montage=None, verbose=None):
         ch_names = list(np.arange(ch_names).astype(str))
     _validate_type(ch_names, (list, tuple), "ch_names",
                    ("list, tuple, or int"))
+    _validate_type(montage, types=(type(None), str, DigMontage),
+                   item_name='montage')
     sfreq = float(sfreq)
     if sfreq <= 0:
         raise ValueError('sfreq must be positive')
@@ -1913,27 +1787,16 @@ def create_info(ch_names, sfreq, ch_types=None, montage=None, verbose=None):
             raise KeyError('kind must be one of %s, not %s'
                            % (list(_kind_dict.keys()), kind))
         kind = _kind_dict[kind]
+        # mirror what tag.py does here
+        coord_frame = _coord_dict.get(kind[0], FIFF.FIFFV_COORD_UNKNOWN)
         chan_info = dict(loc=np.full(12, np.nan), unit_mul=0, range=1., cal=1.,
                          kind=kind[0], coil_type=kind[1],
-                         unit=kind[2], coord_frame=FIFF.FIFFV_COORD_UNKNOWN,
-                         ch_name=name, scanno=ci + 1, logno=ci + 1)
+                         unit=kind[2], coord_frame=coord_frame,
+                         ch_name=str(name), scanno=ci + 1, logno=ci + 1)
         info['chs'].append(chan_info)
+
     info._update_redundant()
-    if montage is not None:
-        from ..channels.montage import (Montage, DigMontage, _set_montage,
-                                        read_montage)
-        if not isinstance(montage, list):
-            montage = [montage]
-        for montage_ in montage:
-            if isinstance(montage_, (Montage, DigMontage)):
-                _set_montage(info, montage_)
-            elif isinstance(montage_, str):
-                montage_ = read_montage(montage_)
-                _set_montage(info, montage_)
-            else:
-                raise TypeError('Montage must be an instance of Montage, '
-                                'DigMontage, a list of montages, or filepath, '
-                                'not %s.' % type(montage))
+    _set_montage(info, montage)
     info._check_consistency()
     return info
 
@@ -1941,8 +1804,8 @@ def create_info(ch_names, sfreq, ch_types=None, montage=None, verbose=None):
 RAW_INFO_FIELDS = (
     'acq_pars', 'acq_stim', 'bads', 'ch_names', 'chs',
     'comps', 'ctf_head_t', 'custom_ref_applied', 'description', 'dev_ctf_t',
-    'dev_head_t', 'dig', 'experimenter', 'events',
-    'file_id', 'highpass', 'hpi_meas', 'hpi_results',
+    'dev_head_t', 'dig', 'experimenter', 'events', 'utc_offset', 'device_info',
+    'file_id', 'highpass', 'hpi_meas', 'hpi_results', 'helium_info',
     'hpi_subsystem', 'kit_system_id', 'line_freq', 'lowpass', 'meas_date',
     'meas_id', 'nchan', 'proj_id', 'proj_name', 'projs', 'sfreq',
     'subject_info', 'xplotter_layout', 'proc_history', 'gantry_angle',
@@ -1951,11 +1814,10 @@ RAW_INFO_FIELDS = (
 
 def _empty_info(sfreq):
     """Create an empty info dictionary."""
-    from ..transforms import Transform
     _none_keys = (
         'acq_pars', 'acq_stim', 'ctf_head_t', 'description',
-        'dev_ctf_t', 'dig', 'experimenter',
-        'file_id', 'highpass', 'hpi_subsystem', 'kit_system_id',
+        'dev_ctf_t', 'dig', 'experimenter', 'utc_offset', 'device_info',
+        'file_id', 'highpass', 'hpi_subsystem', 'kit_system_id', 'helium_info',
         'line_freq', 'lowpass', 'meas_date', 'meas_id', 'proj_id', 'proj_name',
         'subject_info', 'xplotter_layout', 'gantry_angle',
     )
@@ -1967,10 +1829,10 @@ def _empty_info(sfreq):
     for k in _list_keys:
         info[k] = list()
     info['custom_ref_applied'] = False
-    info['dev_head_t'] = Transform('meg', 'head')
     info['highpass'] = 0.
     info['sfreq'] = float(sfreq)
     info['lowpass'] = info['sfreq'] / 2.
+    info['dev_head_t'] = Transform('meg', 'head')
     info._update_redundant()
     info._check_consistency()
     return info
@@ -2005,16 +1867,19 @@ def _force_update_info(info_base, info_target):
             i_targ[key] = val
 
 
-def anonymize_info(info):
+def anonymize_info(info, daysback=None, keep_his=False):
     """Anonymize measurement information in place.
-
-    Reset 'subject_info', 'meas_date', 'file_id', and 'meas_id' keys if they
-    exist in ``info``.
 
     Parameters
     ----------
     info : dict, instance of Info
         Measurement information for the dataset.
+    daysback : int | None
+        Number of days to subtract from all dates.
+        If None (default) the date of service will be set to Jan 1ˢᵗ 2000.
+    keep_his : bool
+        If True his_id of subject_info will NOT be overwritten.
+        Defaults to False.
 
     Returns
     -------
@@ -2023,18 +1888,114 @@ def anonymize_info(info):
 
     Notes
     -----
+    Removes potentially identifying information if it exist in ``info``.
+    Specifically for each of the following we use:
+
+    - meas_date, file_id, meas_id
+          A default value, or as specified by ``daysback``.
+    - subject_info
+          Default values, except for 'birthday' which is adjusted
+          to maintain the subject age.
+    - experimenter, proj_name, description
+          Default strings.
+    - utc_offset
+          ``None``.
+    - proj_id
+          Zeros.
+    - proc_history
+          Dates use the meas_date logic, and experimenter a default string.
+    - helium_info, device_info
+          Dates use the meas_date logic, meta info uses defaults.
+
     Operates in place.
     """
     _validate_type(info, 'info', "self")
-    if info.get('subject_info') is not None:
-        del info['subject_info']
-    info['meas_date'] = None
+
+    default_anon_dos = datetime.datetime(2000, 1, 1, 0, 0, 0,
+                                         tzinfo=datetime.timezone.utc)
+    default_str = "mne_anonymize"
+    default_subject_id = 0
+    default_desc = ("Anonymized using a time shift"
+                    " to preserve age at acquisition")
+
+    # datetime object representing meas_date
+    meas_date_datetime = _stamp_to_dt(info['meas_date'])
+
+    if daysback is None:
+        delta_t = meas_date_datetime - default_anon_dos
+    else:
+        delta_t = datetime.timedelta(days=daysback)
+
+    # adjust meas_date
+    info['meas_date'] = _dt_to_stamp(meas_date_datetime - delta_t)
+
+    # file_id and meas_id
     for key in ('file_id', 'meas_id'):
         value = info.get(key)
         if value is not None:
             assert 'msecs' not in value
-            value['secs'] = DATE_NONE[0]
-            value['usecs'] = DATE_NONE[1]
+            value['secs'] = info['meas_date'][0]
+            value['usecs'] = info['meas_date'][1]
+            value['machid'][:] = 0
+
+    # subject info
+    subject_info = info.get('subject_info')
+    if subject_info is not None:
+        if subject_info.get('id') is not None:
+            subject_info['id'] = default_subject_id
+        if keep_his:
+            logger.warning('Not fully anonymizing info - keeping \'his_id\'')
+        elif subject_info.get('his_id') is not None:
+            subject_info['his_id'] = str(default_subject_id)
+
+        for key in ('last_name', 'first_name', 'middle_name'):
+            if subject_info.get(key) is not None:
+                subject_info[key] = default_str
+
+        if subject_info.get('birthday') is not None:
+            dob = datetime.datetime(subject_info['birthday'][0],
+                                    subject_info['birthday'][1],
+                                    subject_info['birthday'][2])
+            dob -= delta_t
+            subject_info['birthday'] = dob.year, dob.month, dob.day
+
+        for key in ('weight', 'height'):
+            if subject_info.get(key) is not None:
+                subject_info[key] = 0
+
+    info['experimenter'] = default_str
+    info['description'] = default_desc
+
+    if info['proj_id'] is not None:
+        info['proj_id'][:] = 0
+    if info['proj_name'] is not None:
+        info['proj_name'] = default_str
+    if info['utc_offset'] is not None:
+        info['utc_offset'] = None
+
+    proc_hist = info.get('proc_history')
+    if proc_hist is not None:
+        for record in proc_hist:
+            record['block_id']['secs'] = info['meas_date'][0]
+            record['block_id']['usecs'] = info['meas_date'][1]
+            record['block_id']['machid'][:] = 0
+            record['date'] = info['meas_date']
+            record['experimenter'] = default_str
+
+    hi = info.get('helium_info')
+    if hi is not None:
+        if hi.get('orig_file_guid') is not None:
+            hi['orig_file_guid'] = default_str
+        if hi.get('meas_date') is not None:
+            hi['meas_date'] = [info['meas_date'][0],
+                               info['meas_date'][1]]
+
+    di = info.get('device_info')
+    if di is not None:
+        for k in ('serial', 'site'):
+            if di.get(k) is not None:
+                di[k] = default_str
+
     return info
 
 

@@ -144,13 +144,12 @@ def test_copy_function_doc_to_method_doc():
         method_f3 own docstring"""
 
     assert A.method_f3.__doc__ == 'Docstring for f3.\n\n        '
-    pytest.raises(ValueError, copy_function_doc_to_method_doc(f4), A.method_f1)
     pytest.raises(ValueError, copy_function_doc_to_method_doc(f5), A.method_f1)
 
 
 def myfun(x):
     """Check url."""
-    assert 'martinos' in x
+    assert 'mne.tools' in x
 
 
 def test_open_docs():

@@ -52,13 +52,9 @@ def test_datasets_basic(tmpdir):
         assert sd.endswith('MNE-fsaverage-data')
 
 
-@requires_good_network
-def test_megsim(tmpdir):
-    """Test MEGSIM URL handling."""
-    paths = datasets.megsim.load_data(
-        'index', 'text', 'text', path=str(tmpdir), update_path=False)
-    assert len(paths) == 1
-    assert paths[0].endswith('index.html')
+def _fake_fetch_file(url, destination, print_destination=False):
+    with open(destination, 'w') as fid:
+        fid.write(url)
 
 
 @requires_good_network
@@ -100,9 +96,12 @@ _zip_fnames = ['foo/foo.txt', 'foo/bar.txt', 'foo/baz.txt']
 
 def _fake_zip_fetch(url, fname, hash_):
     with zipfile.ZipFile(fname, 'w') as zipf:
+        with zipf.open('foo/', 'w'):
+            pass
         for fname in _zip_fnames:
             with zipf.open(fname, 'w'):
                 pass
+
 
 @pytest.mark.skipif(sys.version_info < (3, 6),
                     reason="writing zip files requires python3.6 or higher")

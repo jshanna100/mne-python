@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-# Author: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Author: Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #         Denis Engemann <denis.engemann@gmail.com>
 #
 # License: BSD (3-clause)
 
 from copy import deepcopy
 from functools import partial
+from io import BytesIO
 import os.path as op
+import pathlib
 import pickle
 import sys
 
@@ -76,7 +78,7 @@ def test_acq_skip(tmpdir):
     assert_allclose(data, np.concatenate(expected_data, axis=-1), atol=1e-22)
 
     # Check that acquisition skips are handled properly during I/O
-    fname = op.join(str(tmpdir), 'test_raw.fif')
+    fname = tmpdir.join('test_raw.fif')
     raw.save(fname, fmt=raw.orig_format)
     # first: file size should not increase much (orig data is missing
     # 7 of 17 buffers, so if we write them out it should increase the file
@@ -127,7 +129,7 @@ def test_concat(tmpdir):
     # we trim the file to save lots of memory and some time
     raw = read_raw_fif(test_fif_fname)
     raw.crop(0, 2.)
-    test_name = op.join(str(tmpdir), 'test_raw.fif')
+    test_name = tmpdir.join('test_raw.fif')
     raw.save(test_name)
     # now run the standard test
     _test_concat(partial(read_raw_fif), test_name)
@@ -174,7 +176,7 @@ def test_subject_info(tmpdir):
     for key, val in zip(keys, vals):
         subject_info[key] = val
     raw.info['subject_info'] = subject_info
-    out_fname = op.join(str(tmpdir), 'test_subj_info_raw.fif')
+    out_fname = tmpdir.join('test_subj_info_raw.fif')
     raw.save(out_fname, overwrite=True)
     raw_read = read_raw_fif(out_fname)
     for key in keys:
@@ -206,7 +208,7 @@ def test_output_formats(tmpdir):
     # let's fake a raw file with different formats
     raw = read_raw_fif(test_fif_fname).crop(0, 1)
 
-    temp_file = op.join(str(tmpdir), 'raw.fif')
+    temp_file = tmpdir.join('raw.fif')
     for ii, (fmt, tol) in enumerate(zip(formats, tols)):
         # Let's test the overwriting error throwing while we're at it
         if ii > 0:
@@ -231,7 +233,6 @@ def _compare_combo(raw, new, times, n_times):
 def test_multiple_files(tmpdir):
     """Test loading multiple files simultaneously."""
     # split file
-    tempdir = str(tmpdir)
     raw = read_raw_fif(fif_fname).crop(0, 10)
     raw.load_data()
     raw.load_data()  # test no operation
@@ -247,7 +248,7 @@ def test_multiple_files(tmpdir):
     # going in reverse order so the last fname is the first file (need later)
     raws = [None] * len(tmins)
     for ri in range(len(tmins) - 1, -1, -1):
-        fname = op.join(tempdir, 'test_raw_split-%d_raw.fif' % ri)
+        fname = tmpdir.join('test_raw_split-%d_raw.fif' % ri)
         raw.save(fname, tmin=tmins[ri], tmax=tmaxs[ri])
         raws[ri] = read_raw_fif(fname)
         assert (len(raws[ri].times) ==
@@ -357,45 +358,45 @@ def test_multiple_files(tmpdir):
 @testing.requires_testing_data
 def test_split_files(tmpdir):
     """Test writing and reading of split raw files."""
-    tempdir = str(tmpdir)
     raw_1 = read_raw_fif(fif_fname, preload=True)
     # Test a very close corner case
     raw_crop = raw_1.copy().crop(0, 1.)
 
     assert_allclose(raw_1.buffer_size_sec, 10., atol=1e-2)  # samp rate
-    split_fname = op.join(tempdir, 'split_raw_meg.fif')
+    split_fname = tmpdir.join('split_raw_meg.fif')
     # intended filenames
-    split_fname_elekta_part2 = op.join(tempdir, 'split_raw_meg-1.fif')
-    split_fname_bids_part1 = op.join(tempdir, 'split_raw_part-01_meg.fif')
-    split_fname_bids_part2 = op.join(tempdir, 'split_raw_part-02_meg.fif')
+    split_fname_elekta_part2 = tmpdir.join('split_raw_meg-1.fif')
+    split_fname_bids_part1 = tmpdir.join('split_raw_part-01_meg.fif')
+    split_fname_bids_part2 = tmpdir.join('split_raw_part-02_meg.fif')
     raw_1.set_annotations(Annotations([2.], [5.5], 'test'))
-    with pytest.warns(RuntimeWarning, match='does not conform to MNE'):
-        raw_1.save(split_fname, buffer_size_sec=1.0, split_size='10MB')
+    raw_1.save(split_fname, buffer_size_sec=1.0, split_size='10MB')
 
     # check that the filenames match the intended pattern
     assert op.exists(split_fname_elekta_part2)
     # check that filenames are being formatted correctly for BIDS
-    with pytest.warns(RuntimeWarning, match='does not conform to MNE'):
-        raw_1.save(split_fname, buffer_size_sec=1.0, split_size='10MB',
-                   split_naming='bids', overwrite=True)
+    raw_1.save(split_fname, buffer_size_sec=1.0, split_size='10MB',
+               split_naming='bids', overwrite=True)
     assert op.exists(split_fname_bids_part1)
     assert op.exists(split_fname_bids_part2)
 
-    split_fname = op.join(tempdir, 'split_raw.fif')
+    annot = Annotations(np.arange(20), np.ones((20,)), 'test')
+    raw_1.set_annotations(annot)
+    split_fname = op.join(tmpdir, 'split_raw.fif')
     raw_1.save(split_fname, buffer_size_sec=1.0, split_size='10MB')
     raw_2 = read_raw_fif(split_fname)
     assert_allclose(raw_2.buffer_size_sec, 1., atol=1e-2)  # samp rate
-    assert_array_almost_equal(raw_1.annotations.onset, raw_2.annotations.onset)
-    assert_array_equal(raw_1.annotations.duration, raw_2.annotations.duration)
+    assert_allclose(raw_1.annotations.onset, raw_2.annotations.onset)
+    assert_allclose(raw_1.annotations.duration, raw_2.annotations.duration,
+                    rtol=0.001 / raw_2.info['sfreq'])
     assert_array_equal(raw_1.annotations.description,
                        raw_2.annotations.description)
+
     data_1, times_1 = raw_1[:, :]
     data_2, times_2 = raw_2[:, :]
     assert_array_equal(data_1, data_2)
     assert_array_equal(times_1, times_2)
 
-    with pytest.warns(RuntimeWarning, match='does not conform to MNE'):
-        raw_bids = read_raw_fif(split_fname_bids_part1)
+    raw_bids = read_raw_fif(split_fname_bids_part1)
     data_bids, times_bids = raw_bids[:, :]
     assert_array_equal(data_1, data_bids)
     assert_array_equal(times_1, times_bids)
@@ -406,6 +407,8 @@ def test_split_files(tmpdir):
     # somehow, the numbers below for e.g. split_size might need to be
     # adjusted.
     raw_crop = raw_1.copy().crop(0, 5)
+    raw_crop.set_annotations(Annotations([2.], [5.5], 'test'),
+                             emit_warning=False)
     with pytest.raises(ValueError,
                        match='after writing measurement information'):
         raw_crop.save(split_fname, split_size='1MB',  # too small a size
@@ -459,7 +462,6 @@ def test_split_files(tmpdir):
 
 def test_load_bad_channels(tmpdir):
     """Test reading/writing of bad channels."""
-    tempdir = str(tmpdir)
     # Load correctly marked file (manually done in mne_process_raw)
     raw_marked = read_raw_fif(fif_bad_marked_fname)
     correct_bads = raw_marked.info['bads']
@@ -470,8 +472,8 @@ def test_load_bad_channels(tmpdir):
     # Test normal case
     raw.load_bad_channels(bad_file_works)
     # Write it out, read it in, and check
-    raw.save(op.join(tempdir, 'foo_raw.fif'))
-    raw_new = read_raw_fif(op.join(tempdir, 'foo_raw.fif'))
+    raw.save(tmpdir.join('foo_raw.fif'))
+    raw_new = read_raw_fif(tmpdir.join('foo_raw.fif'))
     assert correct_bads == raw_new.info['bads']
     # Reset it
     raw.info['bads'] = []
@@ -483,14 +485,14 @@ def test_load_bad_channels(tmpdir):
     with pytest.warns(RuntimeWarning, match='1 bad channel'):
         raw.load_bad_channels(bad_file_wrong, force=True)
         # write it out, read it in, and check
-    raw.save(op.join(tempdir, 'foo_raw.fif'), overwrite=True)
-    raw_new = read_raw_fif(op.join(tempdir, 'foo_raw.fif'))
+    raw.save(tmpdir.join('foo_raw.fif'), overwrite=True)
+    raw_new = read_raw_fif(tmpdir.join('foo_raw.fif'))
     assert correct_bads == raw_new.info['bads']
 
     # Check that bad channels are cleared
     raw.load_bad_channels(None)
-    raw.save(op.join(tempdir, 'foo_raw.fif'), overwrite=True)
-    raw_new = read_raw_fif(op.join(tempdir, 'foo_raw.fif'))
+    raw.save(tmpdir.join('foo_raw.fif'), overwrite=True)
+    raw_new = read_raw_fif(tmpdir.join('foo_raw.fif'))
     assert raw_new.info['bads'] == []
 
 
@@ -499,14 +501,13 @@ def test_load_bad_channels(tmpdir):
 def test_io_raw(tmpdir):
     """Test IO for raw data (Neuromag)."""
     rng = np.random.RandomState(0)
-    tempdir = str(tmpdir)
     # test unicode io
     for chars in [u'äöé', 'a']:
         with read_raw_fif(fif_fname) as r:
             assert ('Raw' in repr(r))
             assert (op.basename(fif_fname) in repr(r))
             r.info['description'] = chars
-            temp_file = op.join(tempdir, 'raw.fif')
+            temp_file = tmpdir.join('raw.fif')
             r.save(temp_file, overwrite=True)
             with read_raw_fif(temp_file) as r2:
                 desc2 = r2.info['description']
@@ -519,7 +520,7 @@ def test_io_raw(tmpdir):
     data = rng.randn(raw._data.shape[0], raw._data.shape[1])
     raw._data[:, :] = data
     # save it somewhere
-    fname = op.join(tempdir, 'test_copy_raw.fif')
+    fname = tmpdir.join('test_copy_raw.fif')
     raw.save(fname, buffer_size_sec=1.0)
     # read it in, make sure the whole thing matches
     raw = read_raw_fif(fname)
@@ -536,8 +537,7 @@ def test_io_raw(tmpdir):
     (ctf_fname, 'raw.fif')])
 def test_io_raw_additional(fname_in, fname_out, tmpdir):
     """Test IO for raw data (Neuromag + CTF + gz)."""
-    tempdir = str(tmpdir)
-    fname_out = op.join(tempdir, fname_out)
+    fname_out = tmpdir.join(fname_out)
     raw = read_raw_fif(fname_in)
 
     nchan = raw.info['nchan']
@@ -606,7 +606,7 @@ def test_io_raw_additional(fname_in, fname_out, tmpdir):
         assert_allclose(raw.info['dig'][0]['r'], raw2.info['dig'][0]['r'])
 
     # test warnings on bad filenames
-    raw_badname = op.join(tempdir, 'test-bad-name.fif.gz')
+    raw_badname = tmpdir.join('test-bad-name.fif.gz')
     with pytest.warns(RuntimeWarning, match='raw.fif'):
         raw.save(raw_badname)
     with pytest.warns(RuntimeWarning, match='raw.fif'):
@@ -617,7 +617,6 @@ def test_io_raw_additional(fname_in, fname_out, tmpdir):
 def test_io_complex(tmpdir):
     """Test IO with complex data types."""
     rng = np.random.RandomState(0)
-    tempdir = str(tmpdir)
     dtypes = [np.complex64, np.complex128]
 
     raw = _test_raw_reader(partial(read_raw_fif),
@@ -635,15 +634,15 @@ def test_io_complex(tmpdir):
         raw_cp._data = np.array(raw_cp._data, dtype)
         raw_cp._data[picks, start:stop] += imag_rand
         with pytest.warns(RuntimeWarning, match='Saving .* complex data.'):
-            raw_cp.save(op.join(tempdir, 'raw.fif'), picks, tmin=0, tmax=5,
+            raw_cp.save(tmpdir.join('raw.fif'), picks, tmin=0, tmax=5,
                         overwrite=True)
 
-        raw2 = read_raw_fif(op.join(tempdir, 'raw.fif'))
+        raw2 = read_raw_fif(tmpdir.join('raw.fif'))
         raw2_data, _ = raw2[picks, :]
         n_samp = raw2_data.shape[1]
         assert_allclose(raw2_data[:, :n_samp], raw_cp._data[picks, :n_samp])
         # with preloading
-        raw2 = read_raw_fif(op.join(tempdir, 'raw.fif'), preload=True)
+        raw2 = read_raw_fif(tmpdir.join('raw.fif'), preload=True)
         raw2_data, _ = raw2[picks, :]
         n_samp = raw2_data.shape[1]
         assert_allclose(raw2_data[:, :n_samp], raw_cp._data[picks, :n_samp])
@@ -678,7 +677,6 @@ def test_getitem():
 @testing.requires_testing_data
 def test_proj(tmpdir):
     """Test SSP proj operations."""
-    tempdir = str(tmpdir)
     for proj in [True, False]:
         raw = read_raw_fif(fif_fname, preload=False)
         if proj:
@@ -717,8 +715,8 @@ def test_proj(tmpdir):
         raw = read_raw_fif(fif_fname, preload=preload)
 
         # write the file with proj. activated, make sure proj has been applied
-        raw.save(op.join(tempdir, 'raw.fif'), proj=True, overwrite=True)
-        raw2 = read_raw_fif(op.join(tempdir, 'raw.fif'))
+        raw.save(tmpdir.join('raw.fif'), proj=True, overwrite=True)
+        raw2 = read_raw_fif(tmpdir.join('raw.fif'))
         data_proj_2, _ = raw2[:, 0:2]
         assert_allclose(data_proj_1, data_proj_2)
         assert (all(p['active'] for p in raw2.info['projs']))
@@ -736,7 +734,7 @@ def test_proj(tmpdir):
         assert_allclose(data_proj_1, data_proj_2)
         assert_allclose(data_proj_2, np.dot(raw._projector, data_proj_2))
 
-    out_fname = op.join(tempdir, 'test_raw.fif')
+    out_fname = tmpdir.join('test_raw.fif')
     raw = read_raw_fif(test_fif_fname, preload=True).crop(0, 0.002)
     raw.pick_types(meg=False, eeg=True)
     raw.info['projs'] = [raw.info['projs'][-1]]
@@ -752,7 +750,6 @@ def test_proj(tmpdir):
 @pytest.mark.parametrize('preload', [False, True, 'memmap.dat'])
 def test_preload_modify(preload, tmpdir):
     """Test preloading and modifying data."""
-    tempdir = str(tmpdir)
     rng = np.random.RandomState(0)
     raw = read_raw_fif(fif_fname, preload=preload)
 
@@ -769,7 +766,7 @@ def test_preload_modify(preload, tmpdir):
         else:
             raise
 
-    tmp_fname = op.join(tempdir, 'raw.fif')
+    tmp_fname = tmpdir.join('raw.fif')
     raw.save(tmp_fname, overwrite=True)
 
     raw_new = read_raw_fif(tmp_fname)
@@ -933,6 +930,11 @@ def test_crop():
     raws = [None] * len(tmins)
     for ri, (tmin, tmax) in enumerate(zip(tmins, tmaxs)):
         raws[ri] = raw.copy().crop(tmin, tmax)
+        if ri < len(tmins) - 1:
+            assert_allclose(
+                raws[ri].times,
+                raw.copy().crop(tmin, tmins[ri + 1], include_tmax=False).times)
+        assert raws[ri]
     all_raw_2 = concatenate_raws(raws, preload=False)
     assert raw.first_samp == all_raw_2.first_samp
     assert raw.last_samp == all_raw_2.last_samp
@@ -964,11 +966,14 @@ def test_crop():
         raw1 = raw.copy().crop(tmin=tmin, tmax=tmin + 2)
         assert raw1[:][0].shape == (1, 2001)
 
+    # degenerate
+    with pytest.raises(ValueError, match='No samples.*when include_tmax=Fals'):
+        raw.crop(0, 0, include_tmax=False)
+
 
 @testing.requires_testing_data
 def test_resample(tmpdir):
     """Test resample (with I/O and multiple files)."""
-    tempdir = str(tmpdir)
     raw = read_raw_fif(fif_fname).crop(0, 3)
     raw.load_data()
     raw_resamp = raw.copy()
@@ -976,8 +981,8 @@ def test_resample(tmpdir):
     # test parallel on upsample
     raw_resamp.resample(sfreq * 2, n_jobs=2, npad='auto')
     assert raw_resamp.n_times == len(raw_resamp.times)
-    raw_resamp.save(op.join(tempdir, 'raw_resamp-raw.fif'))
-    raw_resamp = read_raw_fif(op.join(tempdir, 'raw_resamp-raw.fif'),
+    raw_resamp.save(tmpdir.join('raw_resamp-raw.fif'))
+    raw_resamp = read_raw_fif(tmpdir.join('raw_resamp-raw.fif'),
                               preload=True)
     assert sfreq == raw_resamp.info['sfreq'] / 2
     assert raw.n_times == raw_resamp.n_times // 2
@@ -1054,7 +1059,7 @@ def test_resample(tmpdir):
 
     # test resampling events: this should no longer give a warning
     # we often have first_samp != 0, include it here too
-    stim = [0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
+    stim = [0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1]  # an event at end
     # test is on half the sfreq, but should work with trickier ones too
     o_sfreq, sfreq_ratio = len(stim), 0.5
     n_sfreq = o_sfreq * sfreq_ratio
@@ -1063,13 +1068,17 @@ def test_resample(tmpdir):
                    first_samp=first_samp)
     events = find_events(raw)
     raw, events = raw.resample(n_sfreq, events=events, npad='auto')
+    # Try index into raw.times with resampled events:
+    raw.times[events[:, 0] - raw.first_samp]
     n_fsamp = int(first_samp * sfreq_ratio)  # how it's calc'd in base.py
     # NB np.round used for rounding event times, which has 0.5 as corner case:
     # https://docs.scipy.org/doc/numpy/reference/generated/numpy.around.html
     assert_array_equal(
         events,
         np.array([[np.round(1 * sfreq_ratio) + n_fsamp, 0, 1],
-                  [np.round(10 * sfreq_ratio) + n_fsamp, 0, 1]]))
+                  [np.round(10 * sfreq_ratio) + n_fsamp, 0, 1],
+                  [np.minimum(np.round(15 * sfreq_ratio),
+                              raw._data.shape[1] - 1) + n_fsamp, 0, 1]]))
 
     # test copy flag
     stim = [1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0]
@@ -1112,7 +1121,7 @@ def test_hilbert():
     assert raw_filt._data.shape == raw_filt_2._data.shape
     assert_allclose(raw_filt._data[:, 50:-50], raw_filt_2._data[:, 50:-50],
                     atol=1e-13, rtol=1e-2)
-    with pytest.raises(ValueError, match='n_fft must be greater than n_times'):
+    with pytest.raises(ValueError, match='n_fft.*must be at least the number'):
         raw3.apply_hilbert(picks, n_fft=raw3.n_times - 100)
 
     env = np.abs(raw._data[picks, :])
@@ -1150,6 +1159,13 @@ def test_to_data_frame():
     assert_array_equal(df.values[:, 0], raw._data[0] * 1e13)
     assert_array_equal(df.values[:, 2], raw._data[2] * 1e15)
 
+    df = raw.to_data_frame(long_format=True)
+    assert(len(df) == raw.get_data().size)
+    assert("time" in df.columns)
+    assert("channel" in df.columns)
+    assert("ch_type" in df.columns)
+    assert("observation" in df.columns)
+
 
 def test_add_channels():
     """Test raw splitting / re-appending channel types."""
@@ -1178,7 +1194,9 @@ def test_add_channels():
     raw_arr = rng.randn(2, raw_eeg.n_times)
     raw_arr = RawArray(raw_arr, raw_arr_info)
     # This should error because of conflicts in Info
-    pytest.raises(ValueError, raw_meg.copy().add_channels, [raw_arr])
+    raw_arr.info['dev_head_t'] = orig_head_t
+    with pytest.raises(ValueError, match='mutually inconsistent dev_head_t'):
+        raw_meg.copy().add_channels([raw_arr])
     raw_meg.copy().add_channels([raw_arr], force_update_info=True)
     # Make sure that values didn't get overwritten
     assert_object_equal(raw_arr.info['dev_head_t'], orig_head_t)
@@ -1198,7 +1216,6 @@ def test_add_channels():
 @testing.requires_testing_data
 def test_save(tmpdir):
     """Test saving raw."""
-    tempdir = str(tmpdir)
     raw = read_raw_fif(fif_fname, preload=False)
     # can't write over file being read
     pytest.raises(ValueError, raw.save, fif_fname)
@@ -1211,9 +1228,9 @@ def test_save(tmpdir):
                         orig_time=raw.info['meas_date'][0] + raw._first_time)
     raw.set_annotations(annot)
     annot = raw.annotations
-    new_fname = op.join(op.abspath(op.curdir), 'break_raw.fif')
-    raw.save(op.join(tempdir, new_fname), overwrite=True)
-    new_raw = read_raw_fif(op.join(tempdir, new_fname), preload=False)
+    new_fname = tmpdir.join('break_raw.fif')
+    raw.save(new_fname, overwrite=True)
+    new_raw = read_raw_fif(new_fname, preload=False)
     pytest.raises(ValueError, new_raw.save, new_fname)
     assert_array_almost_equal(annot.onset, new_raw.annotations.onset)
     assert_array_equal(annot.duration, new_raw.annotations.duration)
@@ -1224,8 +1241,6 @@ def test_save(tmpdir):
 @testing.requires_testing_data
 def test_annotation_crop(tmpdir):
     """Test annotation sync after cropping and concatenating."""
-    tempdir = str(tmpdir)
-    new_fname = op.join(op.abspath(op.curdir), 'break_raw.fif')
     annot = Annotations([5., 11., 15.], [2., 1., 3.], ['test', 'test', 'test'])
     raw = read_raw_fif(fif_fname, preload=False)
     raw.set_annotations(annot)
@@ -1249,8 +1264,10 @@ def test_annotation_crop(tmpdir):
                     [1., 1. + 1. / raw.info['sfreq']], atol=1e-3)
 
     # make sure we can overwrite the file we loaded when preload=True
-    new_raw = read_raw_fif(op.join(tempdir, new_fname), preload=True)
-    new_raw.save(op.join(tempdir, new_fname), overwrite=True)
+    new_fname = tmpdir.join('break_raw.fif')
+    raw.save(new_fname)
+    new_raw = read_raw_fif(new_fname, preload=True)
+    new_raw.save(new_fname, overwrite=True)
 
 
 @testing.requires_testing_data
@@ -1263,7 +1280,6 @@ def test_with_statement():
 
 def test_compensation_raw(tmpdir):
     """Test Raw compensation."""
-    tempdir = str(tmpdir)
     raw_3 = read_raw_fif(ctf_comp_fname)
     assert raw_3.compensation_grade == 3
     data_3, times = raw_3[:, :]
@@ -1325,7 +1341,7 @@ def test_compensation_raw(tmpdir):
             assert_allclose(data_3, data_3_new, **tols)
 
     # Try IO with compensation
-    temp_file = op.join(tempdir, 'raw.fif')
+    temp_file = tmpdir.join('raw.fif')
     raw_3.save(temp_file, overwrite=True)
     for preload in (True, False):
         raw_read = read_raw_fif(temp_file, preload=preload)
@@ -1363,10 +1379,8 @@ def test_compensation_raw(tmpdir):
 @requires_mne
 def test_compensation_raw_mne(tmpdir):
     """Test Raw compensation by comparing with MNE-C."""
-    tempdir = str(tmpdir)
-
     def compensate_mne(fname, grad):
-        tmp_fname = op.join(tempdir, 'mne_ctf_test_raw.fif')
+        tmp_fname = tmpdir.join('mne_ctf_test_raw.fif')
         cmd = ['mne_process_raw', '--raw', fname, '--save', tmp_fname,
                '--grad', str(grad), '--projoff', '--filteroff']
         run_subprocess(cmd)
@@ -1448,7 +1462,7 @@ def test_equalize_channels():
 def test_memmap(tmpdir):
     """Test some interesting memmapping cases."""
     # concatenate_raw
-    memmaps = [op.join(str(tmpdir), str(ii)) for ii in range(3)]
+    memmaps = [tmpdir.join(str(ii)) for ii in range(3)]
     raw_0 = read_raw_fif(test_fif_fname, preload=memmaps[0])
     assert raw_0._data.filename == memmaps[0]
     raw_1 = read_raw_fif(test_fif_fname, preload=memmaps[1])
@@ -1485,6 +1499,50 @@ def test_memmap(tmpdir):
     # other things like drop_channels and crop work but do not use memmapping,
     # eventually we might want to add support for some of these as users
     # require them.
+
+
+@pytest.mark.parametrize('split', (False, True))
+@pytest.mark.parametrize('kind', ('file', 'bytes'))
+@pytest.mark.parametrize('preload', (True, str))
+def test_file_like(kind, preload, split, tmpdir):
+    """Test handling with file-like objects."""
+    if split:
+        fname = tmpdir.join('test_raw.fif')
+        read_raw_fif(test_fif_fname).save(fname, split_size='5MB')
+        assert op.isfile(fname)
+        assert op.isfile(str(fname)[:-4] + '-1.fif')
+    else:
+        fname = test_fif_fname
+    if preload is str:
+        preload = tmpdir.join('memmap')
+    with open(str(fname), 'rb') as file_fid:
+        fid = BytesIO(file_fid.read()) if kind == 'bytes' else file_fid
+        assert not fid.closed
+        assert not file_fid.closed
+        with pytest.raises(ValueError, match='preload must be used with file'):
+            read_raw_fif(fid)
+        assert not fid.closed
+        assert not file_fid.closed
+        # Use test_preloading=False but explicitly pass the preload type
+        # so that we don't bother testing preload=False
+        kwargs = dict(fname=fid, preload=preload,
+                      test_preloading=False, test_kwargs=False)
+        if split:
+            with pytest.warns(RuntimeWarning, match='Split raw file detected'):
+                _test_raw_reader(read_raw_fif, **kwargs)
+        else:
+            _test_raw_reader(read_raw_fif, **kwargs)
+        assert not fid.closed
+        assert not file_fid.closed
+    assert file_fid.closed
+
+
+def test_str_like():
+    """Test handling with str-like objects."""
+    fname = pathlib.Path(test_fif_fname)
+    raw_path = read_raw_fif(fname, preload=True)
+    raw_str = read_raw_fif(test_fif_fname, preload=True)
+    assert_allclose(raw_path._data, raw_str._data)
 
 
 run_tests_if_main()

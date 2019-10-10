@@ -1,6 +1,6 @@
 """Generate self-contained HTML reports from MNE objects."""
 
-# Authors: Alex Gramfort <alexandre.gramfort@telecom-paristech.fr>
+# Authors: Alex Gramfort <alexandre.gramfort@inria.fr>
 #          Mainak Jas <mainak@neuro.hut.fi>
 #          Teon Brooks <teon.brooks@gmail.com>
 #
@@ -13,9 +13,11 @@ import os.path as op
 import fnmatch
 import re
 import codecs
+from shutil import copyfile
 import time
 from glob import glob
 import warnings
+import webbrowser
 import numpy as np
 
 from . import read_evokeds, read_events, pick_types, read_cov
@@ -145,14 +147,17 @@ def _iterate_trans_views(function, **kwargs):
     """Auxiliary function to iterate over views in trans fig."""
     import matplotlib.pyplot as plt
     from mayavi import mlab, core
+    from pyface.api import GUI
     fig = function(**kwargs)
-
+    gui = GUI()
+    gui.process_events()
     assert isinstance(fig, core.scene.Scene)
 
     views = [(90, 90), (0, 90), (0, -90)]
     fig2, axes = plt.subplots(1, len(views))
     for view, ax in zip(views, axes):
         mlab.view(view[0], view[1])
+        gui.process_events()
         if fig.scene is not None:
             im = mlab.screenshot(figure=fig)
         else:  # Testing mode
@@ -660,7 +665,7 @@ footer_template = HTMLTemplate(u"""
 <div class="footer">
         &copy; Copyright 2012-{{current_year}}, MNE Developers.
       Created on {{date}}.
-      Powered by <a href="http://martinos.org/mne">MNE.
+      Powered by <a href="http://mne.tools/">MNE.
 </div>
 </html>
 """)
@@ -828,7 +833,7 @@ def _check_image_format(rep, image_format):
 
 @fill_doc
 class Report(object):
-    """Object for rendering HTML.
+    r"""Object for rendering HTML.
 
     Parameters
     ----------
@@ -870,7 +875,9 @@ class Report(object):
 
     Notes
     -----
-    To toggle the show/hide state of all sections in the html report, press 't'
+    See :ref:`tut-report` for an introduction to using ``mne.Report``, and
+    :ref:`this example <ex-report>` for an example of customizing the report
+    with a slider.
 
     .. versionadded:: 0.8.0
     """
@@ -940,10 +947,12 @@ class Report(object):
                 comments = [comments]
         if len(comments) != len(items):
             raise ValueError('Comments and report items must have the same '
-                             'length or comments should be None.')
+                             'length or comments should be None, got %d and %d'
+                             % (len(comments), len(items)))
         elif len(captions) != len(items):
             raise ValueError('Captions and report items must have the same '
-                             'length.')
+                             'length, got %d and %d'
+                             % (len(captions), len(items)))
 
         # Book-keeping of section names
         if section not in self.sections:
@@ -1185,6 +1194,7 @@ class Report(object):
                 html_template.substitute(div_klass=div_klass, id=global_id,
                                          caption=caption, html=html), replace)
 
+    @fill_doc
     def add_bem_to_section(self, subject, caption='BEM', section='bem',
                            decim=2, n_jobs=1, subjects_dir=None,
                            replace=False):
@@ -1202,8 +1212,7 @@ class Report(object):
         decim : int
             Use this decimation factor for generating MRI/BEM images
             (since it can be time consuming).
-        n_jobs : int
-          Number of jobs to run in parallel.
+        %(n_jobs)s
         subjects_dir : str | None
             Path to the SUBJECTS_DIR. If None, the path is obtained by using
             the environment variable SUBJECTS_DIR.
@@ -1359,7 +1368,7 @@ class Report(object):
     @verbose
     def _init_render(self, verbose=None):
         """Initialize the renderer."""
-        inc_fnames = ['jquery-1.10.2.min.js', 'jquery-ui.min.js',
+        inc_fnames = ['jquery.js', 'jquery-ui.min.js',
                       'bootstrap.min.js', 'jquery-ui.min.css',
                       'bootstrap.min.css']
 
@@ -1375,7 +1384,6 @@ class Report(object):
             elif inc_fname.endswith('.css'):
                 include.append(u'<style type="text/css">' +
                                file_content + u'</style>')
-
         self.include = ''.join(include)
 
     @verbose
@@ -1393,8 +1401,7 @@ class Report(object):
             Filename pattern(s) to include in the report.
             Example: [\*raw.fif, \*ave.fif] will include Raw as well as Evoked
             files.
-        n_jobs : int
-          Number of jobs to run in parallel.
+        %(n_jobs)s
         mri_decim : int
             Use this decimation factor for generating MRI/BEM images
             (since it can be time consuming).
@@ -1552,7 +1559,7 @@ class Report(object):
         """
         if fname is None:
             if not hasattr(self, 'data_path'):
-                self.data_path = op.dirname(__file__)
+                self.data_path = os.getcwd()
                 warn('`data_path` not provided. Using %s instead'
                      % self.data_path)
             fname = op.realpath(op.join(self.data_path, 'report.html'))
@@ -1599,8 +1606,8 @@ class Report(object):
                     self.html.pop(0)
                     self.html.pop()
 
-        if open_browser and not is_hdf5:
-            import webbrowser
+        building_doc = os.getenv('_MNE_BUILDING_DOC', '').lower() == 'true'
+        if open_browser and not is_hdf5 and not building_doc:
             webbrowser.open_new_tab('file://' + fname)
 
         self.fname = fname
@@ -1614,7 +1621,6 @@ class Report(object):
         """Save the report when leaving the context block."""
         if self._fname is not None:
             self.save(self._fname, open_browser=False, overwrite=True)
-        return self
 
     @verbose
     def _render_toc(self, verbose=None):
@@ -1917,19 +1923,25 @@ class Report(object):
             caption=caption, show=show, image_format=image_format)
         return html
 
-    def _render_cov(self, cov_fname, info_fname, image_format):
+    def _render_cov(self, cov_fname, info_fname, image_format, show_svd=True):
         """Render cov."""
         global_id = self._get_id()
         cov = read_cov(cov_fname)
-        fig, _ = plot_cov(cov, info_fname, show=False)
-        img = _fig_to_img(fig, image_format)
-        caption = 'Covariance : %s (n_samples: %s)' % (cov_fname, cov.nfree)
-        show = True
-        html = image_template.substitute(
-            img=img, id=global_id, div_klass='covariance',
-            img_klass='covariance', caption=caption, show=show,
-            image_format=image_format)
-        return html
+        fig, svd = plot_cov(cov, info_fname, show=False, show_svd=show_svd)
+        html = []
+        figs = [fig]
+        captions = ['Covariance : %s (n_samples: %s)' % (cov_fname, cov.nfree)]
+        if svd is not None:
+            figs.append(svd)
+            captions.append('Singular values of the noise covariance')
+        for fig, caption in zip(figs, captions):
+            img = _fig_to_img(fig, image_format)
+            show = True
+            html.append(image_template.substitute(
+                img=img, id=global_id, div_klass='covariance',
+                img_klass='covariance', caption=caption, show=show,
+                image_format=image_format))
+        return '\n'.join(html)
 
     def _render_whitened_evoked(self, evoked_fname, noise_cov, baseline,
                                 image_format):
@@ -2059,3 +2071,64 @@ def _fix_global_ids(html):
         html = re.sub('id="###"', 'id="%s"' % global_id, html, count=1)
         global_id += 1
     return html
+
+
+###############################################################################
+# Scraper for sphinx-gallery
+
+_SCRAPER_TEXT = '''
+.. only:: builder_html
+
+    .. container:: row
+
+        .. rubric:: The `HTML document <{0}>`__ written by :meth:`mne.Report.save`:
+
+        .. raw:: html
+
+            <iframe class="sg_report" sandbox="allow-scripts" src="{0}"></iframe>
+
+'''  # noqa: E501
+# Adapted from fa-file-code
+_FA_FILE_CODE = '<svg class="sg_report" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><path fill="#dec" d="M149.9 349.1l-.2-.2-32.8-28.9 32.8-28.9c3.6-3.2 4-8.8.8-12.4l-.2-.2-17.4-18.6c-3.4-3.6-9-3.7-12.4-.4l-57.7 54.1c-3.7 3.5-3.7 9.4 0 12.8l57.7 54.1c1.6 1.5 3.8 2.4 6 2.4 2.4 0 4.8-1 6.4-2.8l17.4-18.6c3.3-3.5 3.1-9.1-.4-12.4zm220-251.2L286 14C277 5 264.8-.1 252.1-.1H48C21.5 0 0 21.5 0 48v416c0 26.5 21.5 48 48 48h288c26.5 0 48-21.5 48-48V131.9c0-12.7-5.1-25-14.1-34zM256 51.9l76.1 76.1H256zM336 464H48V48h160v104c0 13.3 10.7 24 24 24h104zM209.6 214c-4.7-1.4-9.5 1.3-10.9 6L144 408.1c-1.4 4.7 1.3 9.6 6 10.9l24.4 7.1c4.7 1.4 9.6-1.4 10.9-6L240 231.9c1.4-4.7-1.3-9.6-6-10.9zm24.5 76.9l.2.2 32.8 28.9-32.8 28.9c-3.6 3.2-4 8.8-.8 12.4l.2.2 17.4 18.6c3.3 3.5 8.9 3.7 12.4.4l57.7-54.1c3.7-3.5 3.7-9.4 0-12.8l-57.7-54.1c-3.5-3.3-9.1-3.2-12.4.4l-17.4 18.6c-3.3 3.5-3.1 9.1.4 12.4z" class=""></path></svg>'  # noqa: E501
+
+
+class _ReportScraper(object):
+    """Scrape Report outputs.
+
+    Only works properly if conf.py is configured properly and the file
+    is written to the same directory as the example script.
+    """
+
+    def __init__(self):
+        self.app = None
+        self.files = dict()
+
+    def __repr__(self):
+        return '<ReportScraper>'
+
+    def __call__(self, block, block_vars, gallery_conf):
+        for report in block_vars['example_globals'].values():
+            if (isinstance(report, Report) and hasattr(report, 'fname') and
+                    report.fname.endswith('.html') and
+                    gallery_conf['builder_name'] == 'html'):
+                # Thumbnail
+                image_path_iterator = block_vars['image_path_iterator']
+                img_fname = next(image_path_iterator)
+                img_fname = img_fname.replace('.png', '.svg')
+                with open(img_fname, 'w') as fid:
+                    fid.write(_FA_FILE_CODE)
+                # copy HTML file
+                html_fname = op.basename(report.fname)
+                out_fname = op.join(
+                    self.app.builder.outdir,
+                    op.relpath(op.dirname(block_vars['target_file']),
+                               self.app.builder.srcdir), html_fname)
+                self.files[report.fname] = out_fname
+                # embed links/iframe
+                data = _SCRAPER_TEXT.format(html_fname)
+                return data
+        return ''
+
+    def copyfiles(self, *args, **kwargs):
+        for key, value in self.files.items():
+            copyfile(key, value)

@@ -15,14 +15,16 @@ import os.path as op
 from math import ceil
 import shutil
 import sys
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
-from scipy import linalg, sparse
+from scipy import sparse
 
 from ._logging import logger, warn, verbose
 from .check import check_random_state, _ensure_int, _validate_type
-from ..fixes import _infer_dimension_, svd_flip, stable_cumsum
-from .docs import deprecated
+from .linalg import _svd_lwork, _repeated_svd, dgemm, zgemm
+from ..fixes import _infer_dimension_, svd_flip, stable_cumsum, _safe_svd
+from .docs import fill_doc
 
 
 def split_list(l, n, idx=False):
@@ -86,7 +88,7 @@ def _compute_row_norms(data):
     return norms
 
 
-def _reg_pinv(x, reg=0, rank='full', rcond=1e-15):
+def _reg_pinv(x, reg=0, rank='full', rcond=1e-15, svd_lwork=None):
     """Compute a regularized pseudoinverse of a square matrix.
 
     Regularization is performed by adding a constant value to each diagonal
@@ -140,7 +142,9 @@ def _reg_pinv(x, reg=0, rank='full', rcond=1e-15):
         raise ValueError('Input matrix must be Hermitian (symmetric)')
 
     # Decompose the matrix
-    U, s, V = linalg.svd(x)
+    if svd_lwork is None:
+        svd_lwork = _svd_lwork(x.shape, x.dtype)
+    U, s, V = _repeated_svd(x, lwork=svd_lwork)
 
     # Estimate the rank before regularization
     tol = 'auto' if rcond == 'auto' else rcond * s.max()
@@ -148,7 +152,8 @@ def _reg_pinv(x, reg=0, rank='full', rcond=1e-15):
 
     # Decompose the matrix again after regularization
     loading_factor = reg * np.mean(s)
-    U, s, V = linalg.svd(x + loading_factor * np.eye(len(x)))
+    U, s, V = _repeated_svd(x + loading_factor * np.eye(len(x)),
+                            lwork=svd_lwork)
 
     # Estimate the rank after regularization
     tol = 'auto' if rcond == 'auto' else rcond * s.max()
@@ -179,7 +184,13 @@ def _reg_pinv(x, reg=0, rank='full', rcond=1e-15):
         s_inv[nonzero_inds] = 1. / sel_s[nonzero_inds]
 
     # Compute the pseudo inverse
-    x_inv = np.dot(V.T, s_inv[:, np.newaxis] * U.T)
+    U *= s_inv
+    if U.dtype == np.float64:
+        gemm = dgemm
+    else:
+        assert U.dtype == np.complex128
+        gemm = zgemm
+    x_inv = gemm(1., U, V).T
 
     if rank is None or rank == 'full':
         return x_inv, loading_factor, rank_before
@@ -256,6 +267,7 @@ def compute_corr(x, y):
     return (np.dot(X.T, Y) / float(len(X) - 1)) / (x_sd * y_sd)
 
 
+@fill_doc
 def random_permutation(n_samples, random_state=None):
     """Emulate the randperm matlab function.
 
@@ -278,8 +290,7 @@ def random_permutation(n_samples, random_state=None):
     n_samples : int
         End point of the sequence to be permuted (excluded, i.e., the end point
         is equal to n_samples-1)
-    random_state : int | None
-        Random seed for initializing the pseudo-random number generator.
+    %(random_state)s
 
     Returns
     -------
@@ -287,7 +298,9 @@ def random_permutation(n_samples, random_state=None):
         Randomly permuted sequence between 0 and n-1.
     """
     rng = check_random_state(random_state)
-    idx = rng.rand(n_samples)
+    # This can't just be rng.permutation(n_samples) because it's not identical
+    # to what MATLAB produces
+    idx = rng.uniform(size=n_samples)
     randperm = np.argsort(idx)
     return randperm
 
@@ -384,33 +397,6 @@ def _check_scaling_inputs(data, picks_list, scalings):
     return scalings_
 
 
-@deprecated('mne.utils.md5sum will be deprecated in 0.19, please use '
-            'mne.utils.hashfunc(... , hash_type="md5") instead.')
-def md5sum(fname, block_size=1048576):  # 2 ** 20
-    """Calculate the md5sum for a file.
-
-    Parameters
-    ----------
-    fname : str
-        Filename.
-    block_size : int
-        Block size to use when reading.
-
-    Returns
-    -------
-    hash_ : str
-        The hexadecimal digest of the hash.
-    """
-    md5 = hashlib.md5()
-    with open(fname, 'rb') as fid:
-        while True:
-            data = fid.read(block_size)
-            if not data:
-                break
-            md5.update(data)
-    return md5.hexdigest()
-
-
 def hashfunc(fname, block_size=1048576, hash_type="md5"):  # 2 ** 20
     """Calculate the hash for a file.
 
@@ -480,7 +466,8 @@ def create_slices(start, stop, step=None, length=1):
     return slices
 
 
-def _time_mask(times, tmin=None, tmax=None, sfreq=None, raise_error=True):
+def _time_mask(times, tmin=None, tmax=None, sfreq=None, raise_error=True,
+               include_tmax=True):
     """Safely find sample boundaries."""
     orig_tmin = tmin
     orig_tmax = tmax
@@ -490,20 +477,25 @@ def _time_mask(times, tmin=None, tmax=None, sfreq=None, raise_error=True):
         tmin = times[0]
     if not np.isfinite(tmax):
         tmax = times[-1]
+        include_tmax = True  # ignore this param when tmax is infinite
     if sfreq is not None:
         # Push to a bit past the nearest sample boundary first
         sfreq = float(sfreq)
         tmin = int(round(tmin * sfreq)) / sfreq - 0.5 / sfreq
-        tmax = int(round(tmax * sfreq)) / sfreq + 0.5 / sfreq
+        tmax = int(round(tmax * sfreq)) / sfreq
+        tmax += (0.5 if include_tmax else -0.5) / sfreq
+    else:
+        assert include_tmax  # can only be used when sfreq is known
     if raise_error and tmin > tmax:
         raise ValueError('tmin (%s) must be less than or equal to tmax (%s)'
                          % (orig_tmin, orig_tmax))
     mask = (times >= tmin)
     mask &= (times <= tmax)
     if raise_error and not mask.any():
-        raise ValueError('No samples remain when using tmin=%s and tmax=%s '
+        extra = '' if include_tmax else 'when include_tmax=False '
+        raise ValueError('No samples remain when using tmin=%s and tmax=%s %s'
                          '(original time bounds are [%s, %s])'
-                         % (orig_tmin, orig_tmax, times[0], times[-1]))
+                         % (orig_tmin, orig_tmax, extra, times[0], times[-1]))
     return mask
 
 
@@ -538,8 +530,8 @@ def _freq_mask(freqs, sfreq, fmin=None, fmax=None, raise_error=True):
 def grand_average(all_inst, interpolate_bads=True, drop_bads=True):
     """Make grand average of a list evoked or AverageTFR data.
 
-    For evoked data, the function interpolates bad channels based on
-    `interpolate_bads` parameter. If `interpolate_bads` is True, the grand
+    For evoked data, the function interpolates bad channels based on the
+    ``interpolate_bads`` parameter. If ``interpolate_bads`` is True, the grand
     average file will contain good channels and the bad channels interpolated
     from the good MEG/EEG channels.
     For AverageTFR data, the function takes the subset of channels not marked
@@ -592,8 +584,10 @@ def grand_average(all_inst, interpolate_bads=True, drop_bads=True):
                         else inst for inst in all_inst]
         equalize_channels(all_inst)  # apply equalize_channels
         from ..evoked import combine_evoked as combine
+        weights = [1. / len(all_inst)] * len(all_inst)
     else:  # isinstance(all_inst[0], AverageTFR):
         from ..time_frequency.tfr import combine_tfr as combine
+        weights = 'equal'
 
     if drop_bads:
         bads = list({b for inst in all_inst for b in inst.info['bads']})
@@ -602,7 +596,7 @@ def grand_average(all_inst, interpolate_bads=True, drop_bads=True):
                 inst.drop_channels(bads)
 
     # make grand_average object using combine_[evoked/tfr]
-    grand_average = combine(all_inst, weights='equal')
+    grand_average = combine(all_inst, weights=weights)
     # change the grand_average.nave to the number of Evokeds
     grand_average.nave = len(all_inst)
     # change comment field
@@ -703,6 +697,14 @@ def _sort_keys(x):
     return keys
 
 
+def _array_equal_nan(a, b):
+    try:
+        np.testing.assert_array_equal(a, b)
+    except AssertionError:
+        return False
+    return True
+
+
 def object_diff(a, b, pre=''):
     """Compute all differences between two python variables.
 
@@ -712,7 +714,7 @@ def object_diff(a, b, pre=''):
         Currently supported: dict, list, tuple, ndarray, int, str, bytes,
         float, StringIO, BytesIO.
     b : object
-        Must be same type as x1.
+        Must be same type as ``a``.
     pre : str
         String to prepend to each line.
 
@@ -723,8 +725,13 @@ def object_diff(a, b, pre=''):
     """
     out = ''
     if type(a) != type(b):
-        out += pre + ' type mismatch (%s, %s)\n' % (type(a), type(b))
-    elif isinstance(a, dict):
+        # Deal with NamedInt and NamedFloat
+        for sub in (int, float):
+            if isinstance(a, sub) and isinstance(b, sub):
+                break
+        else:
+            return pre + ' type mismatch (%s, %s)\n' % (type(a), type(b))
+    if isinstance(a, dict):
         k1s = _sort_keys(a)
         k2s = _sort_keys(b)
         m1 = set(k2s) - set(k1s)
@@ -734,7 +741,8 @@ def object_diff(a, b, pre=''):
             if key not in k2s:
                 out += pre + ' right missing key %s\n' % key
             else:
-                out += object_diff(a[key], b[key], pre + '[%s]' % repr(key))
+                out += object_diff(a[key], b[key],
+                                   pre=(pre + '[%s]' % repr(key)))
     elif isinstance(a, (list, tuple)):
         if len(a) != len(b):
             out += pre + ' length mismatch (%s, %s)\n' % (len(a), len(b))
@@ -748,7 +756,7 @@ def object_diff(a, b, pre=''):
         if b is not None:
             out += pre + ' left is None, right is not (%s)\n' % (b)
     elif isinstance(a, np.ndarray):
-        if not np.array_equal(a, b):
+        if not _array_equal_nan(a, b):
             out += pre + ' array mismatch\n'
     elif isinstance(a, (StringIO, BytesIO)):
         if a.getvalue() != b.getvalue():
@@ -821,7 +829,7 @@ class _PCA(object):
         self.mean_ = np.mean(X, axis=0)
         X -= self.mean_
 
-        U, S, V = linalg.svd(X, full_matrices=False)
+        U, S, V = _safe_svd(X, full_matrices=False)
         # flip eigenvectors' sign to enforce deterministic output
         U, V = svd_flip(U, V)
 
@@ -874,3 +882,98 @@ def _mask_to_onsets_offsets(mask):
         offsets = np.concatenate([offsets, [len(mask)]])
     assert len(onsets) == len(offsets)
     return onsets, offsets
+
+
+def _julian_to_dt(jd):
+    """Convert Julian integer to a datetime object.
+
+    Parameters
+    ----------
+    jd : int
+        Julian date - number of days since julian day 0
+        Julian day number 0 assigned to the day starting at
+        noon on January 1, 4713 BC, proleptic Julian calendar
+        November 24, 4714 BC, in the proleptic Gregorian calendar
+
+    Returns
+    -------
+    jd_date : datetime
+        Datetime representation of jd
+
+    """
+    # https://aa.usno.navy.mil/data/docs/JulianDate.php
+    # Thursday, A.D. 1970 Jan 1 12:00:00.0  2440588.000000
+    jd_t0 = 2440588
+    datetime_t0 = datetime(1970, 1, 1, 12, 0, 0, 0, tzinfo=timezone.utc)
+
+    dt = timedelta(days=(jd - jd_t0))
+    return datetime_t0 + dt
+
+
+def _dt_to_julian(jd_date):
+    """Convert datetime object to a Julian integer.
+
+    Parameters
+    ----------
+    jd_date : datetime
+
+    Returns
+    -------
+    jd : float
+        Julian date corresponding to jd_date
+        - number of days since julian day 0
+        Julian day number 0 assigned to the day starting at
+        noon on January 1, 4713 BC, proleptic Julian calendar
+        November 24, 4714 BC, in the proleptic Gregorian calendar
+
+    """
+    # https://aa.usno.navy.mil/data/docs/JulianDate.php
+    # Thursday, A.D. 1970 Jan 1 12:00:00.0  2440588.000000
+    jd_t0 = 2440588
+    datetime_t0 = datetime(1970, 1, 1, 12, 0, 0, 0, tzinfo=timezone.utc)
+
+    dt = jd_date - datetime_t0
+    return jd_t0 + dt.days
+
+
+def _cal_to_julian(year, month, day):
+    """Convert calendar date (year, month, day) to a Julian integer.
+
+    Parameters
+    ----------
+    year : int
+        Year as an integer.
+    month : int
+        Month as an integer.
+    day : int
+        Day as an integer.
+
+    Returns
+    -------
+    jd: int
+        Julian date.
+    """
+    return int(_dt_to_julian(datetime(year, month, day, 12, 0, 0,
+                                      tzinfo=timezone.utc)))
+
+
+def _julian_to_cal(jd):
+    """Convert calendar date (year, month, day) to a Julian integer.
+
+    Parameters
+    ----------
+    jd: int, float
+        Julian date.
+
+    Returns
+    -------
+    year : int
+        Year as an integer.
+    month : int
+        Month as an integer.
+    day : int
+        Day as an integer.
+
+    """
+    tmp_date = _julian_to_dt(jd)
+    return tmp_date.year, tmp_date.month, tmp_date.day

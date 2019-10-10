@@ -16,7 +16,7 @@
 # Dev branch marker is: 'X.Y.devN' where N is an integer.
 #
 
-__version__ = '0.18.dev0'
+__version__ = '0.20.dev0'
 
 # have to import verbose first since it's needed by many things
 from .utils import (set_log_level, set_log_file, verbose, set_config,
@@ -25,7 +25,8 @@ from .utils import (set_log_level, set_log_file, verbose, set_config,
 from .io.pick import (pick_types, pick_channels,
                       pick_channels_regexp, pick_channels_forward,
                       pick_types_forward, pick_channels_cov,
-                      pick_channels_evoked, pick_info)
+                      pick_channels_evoked, pick_info,
+                      channel_type, channel_indices_by_type)
 from .io.base import concatenate_raws
 from .io.meas_info import create_info, Info
 from .io.proj import Projection
@@ -33,6 +34,7 @@ from .io.kit import read_epochs_kit
 from .io.eeglab import read_epochs_eeglab
 from .io.reference import (set_eeg_reference, set_bipolar_reference,
                            add_reference_channels)
+from .io.what import what
 from .bem import (make_sphere_model, make_bem_model, make_bem_solution,
                   read_bem_surfaces, write_bem_surfaces,
                   read_bem_solution, write_bem_solution)
@@ -59,9 +61,10 @@ from .source_estimate import (read_source_estimate, MixedSourceEstimate,
                               spatio_temporal_dist_connectivity,
                               extract_label_time_course)
 from .surface import (read_surface, write_surface, decimate_surface, read_tri,
-                      read_morph_map, get_head_surf, get_meg_helmet_surf)
+                      read_morph_map, get_head_surf, get_meg_helmet_surf,
+                      dig_mri_distances)
 from .morph import (SourceMorph, read_source_morph, grade_to_vertices,
-                    compute_morph_matrix, compute_source_morph)
+                    compute_source_morph)
 from .source_space import (read_source_spaces, vertex_to_mni,
                            head_to_mni, head_to_mri,
                            write_source_spaces, setup_source_space,
@@ -71,7 +74,7 @@ from .source_space import (read_source_spaces, vertex_to_mni,
                            get_volume_labels_from_src)
 from .annotations import Annotations, read_annotations, events_from_annotations
 from .epochs import (BaseEpochs, Epochs, EpochsArray, read_epochs,
-                     concatenate_epochs)
+                     concatenate_epochs, make_fixed_length_epochs)
 from .evoked import Evoked, EvokedArray, read_evokeds, write_evokeds, combine_evoked
 from .label import (read_label, label_sign_flip,
                     write_label, stc_to_label, grow_labels, Label, split_label,
@@ -107,6 +110,7 @@ from . import externals
 from . import io
 from . import filter
 from . import gui
+from . import inverse_sparse
 from . import minimum_norm
 from . import preprocessing
 from . import simulation
@@ -114,7 +118,6 @@ from . import stats
 from . import time_frequency
 from . import viz
 from . import decoding
-from . import realtime
 
 # initialize logging
 set_log_level(None, False)

@@ -1,9 +1,12 @@
-# Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
-#          Matti Hamalainen <msh@nmr.mgh.harvard.edu>
+# Authors: Matti Hämäläinen <msh@nmr.mgh.harvard.edu>
+#          Alexandre Gramfort <alexandre.gramfort@inria.fr>
 #          Eric Larson <larson.eric.d@gmail.com>
 #          Lorenzo De Santis <lorenzo.de-santis@u-psud.fr>
 #
 # License: BSD (3-clause)
+
+# The computations in this code were primarily derived from Matti Hämäläinen's
+# C code.
 
 from functools import partial
 import glob
@@ -16,7 +19,7 @@ import numpy as np
 from scipy import linalg
 
 from .io.constants import FIFF, FWD
-from .io.meas_info import _dig_kind_dict, _dig_kind_rev, _dig_kind_ints
+from .io._digitization import _dig_kind_dict, _dig_kind_rev, _dig_kind_ints
 from .io.write import (start_file, start_block, write_float, write_int,
                        write_float_matrix, write_int_matrix, end_block,
                        end_file)
@@ -26,7 +29,7 @@ from .io.open import fiff_open
 from .surface import (read_surface, write_surface, complete_surface_info,
                       _compute_nearest, _get_ico_surface, read_tri,
                       _fast_cross_nd_sum, _get_solids)
-from .transforms import _ensure_trans, apply_trans
+from .transforms import _ensure_trans, apply_trans, Transform
 from .utils import (verbose, logger, run_subprocess, get_subjects_dir, warn,
                     _pl, _validate_type, _TempDir)
 from .fixes import einsum
@@ -253,15 +256,14 @@ def _fwd_bem_ip_modify_solution(solution, ip_solution, ip_mult, n_tri):
     return
 
 
-def _check_complete_surface(surf, copy=False, incomplete='raise'):
+def _check_complete_surface(surf, copy=False, incomplete='raise', extra=''):
     surf = complete_surface_info(surf, copy=copy, verbose=False)
     fewer = np.where([len(t) < 3 for t in surf['neighbor_tri']])[0]
     if len(fewer) > 0:
-        msg = ('Surface %s has topological defects: %d / %d '
-               'vertices have fewer than three neighboring '
-               'triangles [%s]' % (_surf_name[surf['id']],
-                                   len(fewer), surf['ntri'],
-                                   ', '.join(str(f) for f in fewer)))
+        msg = ('Surface {} has topological defects: {:.0f} / {:.0f} vertices '
+               'have fewer than three neighboring triangles [{}]{}'
+               .format(_surf_name[surf['id']], len(fewer), surf['ntri'],
+                       ', '.join(str(f) for f in fewer), extra))
         if incomplete == 'raise':
             raise RuntimeError(msg)
         else:
@@ -484,7 +486,7 @@ def _check_thicknesses(surfs):
 
 
 def _surfaces_to_bem(surfs, ids, sigmas, ico=None, rescale=True,
-                     incomplete='raise'):
+                     incomplete='raise', extra=''):
     """Convert surfaces to a BEM."""
     # equivalent of mne_surf2bem
     # surfs can be strings (filenames) or surface dicts
@@ -502,7 +504,8 @@ def _surfaces_to_bem(surfs, ids, sigmas, ico=None, rescale=True,
     for surf, id_ in zip(surfs, ids):
         # Do topology checks (but don't save data) to fail early
         surf['id'] = id_
-        _check_complete_surface(surf, copy=True, incomplete=incomplete)
+        _check_complete_surface(surf, copy=True, incomplete=incomplete,
+                                extra=extra)
         surf['coord_frame'] = surf.get('coord_frame', FIFF.FIFFV_COORD_MRI)
         surf.update(np=len(surf['rr']), ntri=len(surf['tris']))
         if rescale:
@@ -867,19 +870,19 @@ def fit_sphere_to_headshape(info, dig_kinds='auto', units='m', verbose=None):
 
 
 @verbose
-def get_fitting_dig(info, dig_kinds='auto', verbose=None):
+def get_fitting_dig(info, dig_kinds='auto', exclude_frontal=True,
+                    verbose=None):
     """Get digitization points suitable for sphere fitting.
 
     Parameters
     ----------
     info : instance of Info
         The measurement info.
-    dig_kinds : list of str | str
-        Kind of digitization points to use in the fitting. These can be any
-        combination of ('cardinal', 'hpi', 'eeg', 'extra'). Can also
-        be 'auto' (default), which will use only the 'extra' points if
-        enough (more than 10) are available, and if not, uses 'extra' and
-        'eeg' points.
+    %(dig_kinds)s
+    %(exclude_frontal)s
+        Default is True.
+
+        .. versionadded:: 0.19
     %(verbose)s
 
     Returns
@@ -923,7 +926,9 @@ def get_fitting_dig(info, dig_kinds='auto', verbose=None):
                            'contact mne-python developers')
 
     # exclude some frontal points (nose etc.)
-    hsp = np.array([p for p in hsp if not (p[2] < -1e-6 and p[1] > 1e-6)])
+    if exclude_frontal:
+        hsp = [p for p in hsp if not (p[2] < -1e-6 and p[1] > 1e-6)]
+    hsp = np.array(hsp)
 
     if len(hsp) <= 10:
         kinds_str = ', '.join(['"%s"' % _dig_kind_rev[d]
@@ -943,7 +948,10 @@ def _fit_sphere_to_headshape(info, dig_kinds, verbose=None):
     hsp = get_fitting_dig(info, dig_kinds)
     radius, origin_head = _fit_sphere(np.array(hsp), disp=False)
     # compute origin in device coordinates
-    head_to_dev = _ensure_trans(info['dev_head_t'], 'head', 'meg')
+    dev_head_t = info['dev_head_t']
+    if dev_head_t is None:
+        dev_head_t = Transform('meg', 'head')
+    head_to_dev = _ensure_trans(dev_head_t, 'head', 'meg')
     origin_device = apply_trans(head_to_dev, origin_head)
     logger.info('Fitted sphere radius:'.ljust(30) + '%0.1f mm'
                 % (radius * 1e3,))
@@ -1028,24 +1036,23 @@ def _check_origin(origin, info, coord_frame='head', disp=False):
 @verbose
 def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
                        volume='T1', atlas=False, gcaatlas=False, preflood=None,
-                       show=False, copy=False, verbose=None):
+                       show=False, copy=False, T1=None, brainmask='ws',
+                       verbose=None):
     """Create BEM surfaces using the FreeSurfer watershed algorithm.
 
     Parameters
     ----------
     subject : str
-        Subject name (required)
-    subjects_dir : str
-        Directory containing subjects data. If None use
-        the Freesurfer SUBJECTS_DIR environment variable.
+        Subject name.
+    $(subjects_dir)s
     overwrite : bool
-        Write over existing files
+        Write over existing files.
     volume : str
-        Defaults to T1
+        Defaults to T1.
     atlas : bool
-        Specify the --atlas option for mri_watershed
+        Specify the --atlas option for mri_watershed.
     gcaatlas : bool
-        Use the subcortical atlas
+        Specify the --brain_atlas option for mri_watershed.
     preflood : int
         Change the preflood height
     show : bool
@@ -1058,6 +1065,18 @@ def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
         (if they do not already exist).
 
         .. versionadded:: 0.18
+    T1 : bool | None
+        If True, pass the ``-T1`` flag.
+        By default (None), this takes the same value as ``gcaatlas``.
+
+        .. versionadded:: 0.19
+    brainmask : str
+        The filename for the brainmask output file relative to the
+        ``$SUBJECTS_DIR/$SUBJECT/bem/watershed/`` directory.
+        Can be for example ``"../../mri/brainmask.mgz"`` to overwrite
+        the brainmask obtained via ``recon-all -autorecon1``.
+
+        .. versionadded:: 0.19
     %(verbose)s
 
     Notes
@@ -1075,13 +1094,16 @@ def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
     subject_dir = op.join(subjects_dir, subject)
     mri_dir = op.join(subject_dir, 'mri')
     T1_dir = op.join(mri_dir, volume)
-    T1_mgz = op.join(mri_dir, volume + '.mgz')
+    T1_mgz = T1_dir
+    if not T1_dir.endswith('.mgz'):
+        T1_mgz += '.mgz'
     bem_dir = op.join(subject_dir, 'bem')
     ws_dir = op.join(subject_dir, 'bem', 'watershed')
     if not op.isdir(bem_dir):
         os.makedirs(bem_dir)
     if not op.isdir(T1_dir) and not op.isfile(T1_mgz):
-        raise RuntimeError('Could not find the MRI data')
+        raise RuntimeError('Could not find the MRI data:\n%s\nor\n%s'
+                           % (T1_dir, T1_mgz))
     if op.isdir(ws_dir):
         if not overwrite:
             raise RuntimeError('%s already exists. Use the --overwrite option'
@@ -1093,27 +1115,31 @@ def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
     if preflood:
         cmd += ["-h", "%s" % int(preflood)]
 
+    if T1 is None:
+        T1 = gcaatlas
+    if T1:
+        cmd += ['-T1']
     if gcaatlas:
-        cmd += ['-atlas', '-T1', '-brain_atlas', env['FREESURFER_HOME'] +
-                '/average/RB_all_withskull_2007-08-08.gca',
+        fname = op.join(env['FREESURFER_HOME'], 'average',
+                        'RB_all_withskull_*.gca')
+        fname = sorted(glob.glob(fname))[::-1][0]
+        logger.info('Using GCA atlas: %s' % (fname,))
+        cmd += ['-atlas', '-brain_atlas', fname,
                 subject_dir + '/mri/transforms/talairach_with_skull.lta']
     elif atlas:
         cmd += ['-atlas']
     if op.exists(T1_mgz):
         cmd += ['-useSRAS', '-surf', op.join(ws_dir, subject), T1_mgz,
-                op.join(ws_dir, 'ws')]
+                op.join(ws_dir, brainmask)]
     else:
         cmd += ['-useSRAS', '-surf', op.join(ws_dir, subject), T1_dir,
-                op.join(ws_dir, 'ws')]
+                op.join(ws_dir, brainmask)]
     # report and run
     logger.info('\nRunning mri_watershed for BEM segmentation with the '
-                'following parameters:\n\n'
-                'SUBJECTS_DIR = %s\n'
-                'SUBJECT = %s\n'
-                'Results dir = %s\n' % (subjects_dir, subject, ws_dir))
-    os.makedirs(op.join(ws_dir, 'ws'))
+                'following parameters:\n\nResults dir = %s\nCommand = %s\n'
+                % (ws_dir, ' '.join(cmd)))
+    os.makedirs(op.join(ws_dir))
     run_subprocess_env(cmd)
-
     if op.isfile(T1_mgz):
         new_info = _extract_volume_info(T1_mgz)
         if new_info is None:
@@ -1586,22 +1612,22 @@ def convert_flash_mris(subject, flash30=True, convert=True, unwarp=False,
     Before running this script do the following:
     (unless convert=False is specified)
 
-        1. Copy all of your FLASH images in a single directory <source> and
-           create a directory <dest> to hold the output of mne_organize_dicom
-        2. cd to <dest> and run
-           $ mne_organize_dicom <source>
-           to create an appropriate directory structure
-        3. Create symbolic links to make flash05 and flash30 point to the
-           appropriate series:
-           $ ln -s <FLASH 5 series dir> flash05
-           $ ln -s <FLASH 30 series dir> flash30
-           Some partition formats (e.g. FAT32) do not support symbolic links.
-           In this case, copy the file to the appropriate series:
-           $ cp <FLASH 5 series dir> flash05
-           $ cp <FLASH 30 series dir> flash30
-        4. cd to the directory where flash05 and flash30 links are
-        5. Set SUBJECTS_DIR and SUBJECT environment variables appropriately
-        6. Run this script
+    1. Copy all of your FLASH images in a single directory <source> and
+        create a directory <dest> to hold the output of mne_organize_dicom
+    2. cd to <dest> and run
+        $ mne_organize_dicom <source>
+        to create an appropriate directory structure
+    3. Create symbolic links to make flash05 and flash30 point to the
+        appropriate series:
+        $ ln -s <FLASH 5 series dir> flash05
+        $ ln -s <FLASH 30 series dir> flash30
+        Some partition formats (e.g. FAT32) do not support symbolic links.
+        In this case, copy the file to the appropriate series:
+        $ cp <FLASH 5 series dir> flash05
+        $ cp <FLASH 30 series dir> flash30
+    4. cd to the directory where flash05 and flash30 links are
+    5. Set SUBJECTS_DIR and SUBJECT environment variables appropriately
+    6. Run this script
 
     This function assumes that the Freesurfer segmentation of the subject
     has been completed. In particular, the T1.mgz and brain.mgz MRI volumes
@@ -1844,7 +1870,8 @@ def make_flash_bem(subject, overwrite=False, show=True, subjects_dir=None,
         nodes, tris = read_tri(out_fname, swap=True)
         # Do not write volume info here because the tris are already in
         # standard Freesurfer coords
-        write_surface(op.splitext(out_fname)[0] + '.surf', nodes, tris)
+        write_surface(op.splitext(out_fname)[0] + '.surf', nodes, tris,
+                      overwrite=True)
 
     # Cleanup section
     logger.info("\n---- Cleaning up ----")

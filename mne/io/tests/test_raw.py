@@ -19,6 +19,7 @@ from mne.datasets import testing
 from mne.io import read_raw_fif, RawArray, BaseRaw
 from mne.utils import _TempDir, catch_logging, _raw_annot
 from mne.io.meas_info import _get_valid_units
+from mne.io._digitization import DigPoint
 
 
 def test_orig_units():
@@ -39,7 +40,8 @@ def test_orig_units():
         BaseRaw(info, last_samps=[1], orig_units=True)
 
 
-def _test_raw_reader(reader, test_preloading=True, **kwargs):
+def _test_raw_reader(reader, test_preloading=True, test_kwargs=True,
+                     boundary_decimal=2, **kwargs):
     """Test reading, writing and slicing of raw classes.
 
     Parameters
@@ -49,6 +51,10 @@ def _test_raw_reader(reader, test_preloading=True, **kwargs):
     test_preloading : bool
         Whether not preloading is implemented for the reader. If True, both
         cases and memory mapping to file are tested.
+    test_kwargs : dict
+        Test _init_kwargs support.
+    boundary_decimal : int
+        Number of decimals up to which the boundary should match.
     **kwargs :
         Arguments for the reader. Note: Do not use preload as kwarg.
         Use ``test_preloading`` instead.
@@ -60,8 +66,14 @@ def _test_raw_reader(reader, test_preloading=True, **kwargs):
     """
     tempdir = _TempDir()
     rng = np.random.RandomState(0)
+    montage = None
+    if "montage" in kwargs:
+        montage = kwargs['montage']
+        del kwargs['montage']
     if test_preloading:
         raw = reader(preload=True, **kwargs)
+        if montage is not None:
+            raw.set_montage(montage)
         # don't assume the first is preloaded
         buffer_fname = op.join(tempdir, 'buffer')
         picks = rng.permutation(np.arange(len(raw.ch_names) - 1))[:10]
@@ -87,14 +99,19 @@ def _test_raw_reader(reader, test_preloading=True, **kwargs):
     full_data = raw._data
     assert raw.__class__.__name__ in repr(raw)  # to test repr
     assert raw.info.__class__.__name__ in repr(raw.info)
+    assert isinstance(raw.info['dig'], (type(None), list))
+    if isinstance(raw.info['dig'], list):
+        for di, d in enumerate(raw.info['dig']):
+            assert isinstance(d, DigPoint), (di, d)
 
     # gh-5604
     assert _handle_meas_date(raw.info['meas_date']) >= 0
 
     # test resetting raw
-    raw2 = reader(**raw._init_kwargs)
-    assert set(raw.info.keys()) == set(raw2.info.keys())
-    assert_array_equal(raw.times, raw2.times)
+    if test_kwargs:
+        raw2 = reader(**raw._init_kwargs)
+        assert set(raw.info.keys()) == set(raw2.info.keys())
+        assert_array_equal(raw.times, raw2.times)
 
     # Test saving and reading
     out_fname = op.join(tempdir, 'test_raw.fif')
@@ -130,7 +147,7 @@ def _test_raw_reader(reader, test_preloading=True, **kwargs):
 
     assert_array_almost_equal(concat_raw.annotations.onset[idx],
                               expected_bad_boundary_onset,
-                              decimal=2)
+                              decimal=boundary_decimal)
 
     if raw.info['meas_id'] is not None:
         for key in ['secs', 'usecs', 'version']:

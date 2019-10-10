@@ -28,6 +28,29 @@ verbose : bool, str, int, or None
     and :ref:`Logging documentation <tut_logging>` for more)."""
 docdict['verbose_meth'] = (docdict['verbose'] + ' Defaults to self.verbose.')
 
+# Preload
+docdict['preload'] = """
+preload : bool or str (default False)
+    Preload data into memory for data manipulation and faster indexing.
+    If True, the data will be preloaded into memory (fast, requires
+    large amount of memory). If preload is a string, preload is the
+    file name of a memory-mapped file which is used to store the data
+    on the hard drive (slower, requires less memory)."""
+
+# Cropping
+docdict['include_tmax'] = """
+include_tmax : bool
+    If True (default), include tmax. If False, exclude tmax (similar to how
+    Python indexing typically works).
+
+    .. versionadded:: 0.19
+"""
+
+# General plotting
+docdict["show"] = """
+show : bool
+    Show figure if True."""
+
 # Picks
 docdict['picks_header'] = 'picks : str | list | slice | None'
 docdict['picks_base'] = docdict['picks_header'] + """
@@ -51,6 +74,123 @@ picks : list | slice | None
     interpreted as channel indices. None (default) will pick all channels.
 """
 
+# Filtering
+docdict['l_freq'] = """
+l_freq : float | None
+    For FIR filters, the lower pass-band edge; for IIR filters, the upper
+    cutoff frequency. If None the data are only low-passed.
+"""
+docdict['h_freq'] = """
+h_freq : float | None
+    For FIR filters, the upper pass-band edge; for IIR filters, the upper
+    cutoff frequency. If None the data are only high-passed.
+"""
+docdict['filter_length'] = """
+filter_length : str | int
+    Length of the FIR filter to use (if applicable):
+
+    * **'auto' (default)**: The filter length is chosen based
+      on the size of the transition regions (6.6 times the reciprocal
+      of the shortest transition band for fir_window='hamming'
+      and fir_design="firwin2", and half that for "firwin").
+    * **str**: A human-readable time in
+      units of "s" or "ms" (e.g., "10s" or "5500ms") will be
+      converted to that number of samples if ``phase="zero"``, or
+      the shortest power-of-two length at least that duration for
+      ``phase="zero-double"``.
+    * **int**: Specified length in samples. For fir_design="firwin",
+      this should not be used.
+
+"""
+docdict['l_trans_bandwidth'] = """
+l_trans_bandwidth : float | str
+    Width of the transition band at the low cut-off frequency in Hz
+    (high pass or cutoff 1 in bandpass). Can be "auto"
+    (default) to use a multiple of ``l_freq``::
+
+        min(max(l_freq * 0.25, 2), l_freq)
+
+    Only used for ``method='fir'``.
+"""
+docdict['h_trans_bandwidth'] = """
+h_trans_bandwidth : float | str
+    Width of the transition band at the high cut-off frequency in Hz
+    (low pass or cutoff 2 in bandpass). Can be "auto"
+    (default in 0.14) to use a multiple of ``h_freq``::
+
+        min(max(h_freq * 0.25, 2.), info['sfreq'] / 2. - h_freq)
+
+    Only used for ``method='fir'``.
+"""
+docdict['phase'] = """
+phase : str
+    Phase of the filter, only used if ``method='fir'``.
+    Symmetric linear-phase FIR filters are constructed, and if ``phase='zero'``
+    (default), the delay of this filter is compensated for, making it
+    non-causal. If ``phase=='zero-double'``,
+    then this filter is applied twice, once forward, and once backward
+    (also making it non-causal). If 'minimum', then a minimum-phase filter will
+    be constricted and applied, which is causal but has weaker stop-band
+    suppression.
+
+    .. versionadded:: 0.13
+"""
+docdict['fir_design'] = """
+fir_design : str
+    Can be "firwin" (default) to use :func:`scipy.signal.firwin`,
+    or "firwin2" to use :func:`scipy.signal.firwin2`. "firwin" uses
+    a time-domain design technique that generally gives improved
+    attenuation using fewer samples than "firwin2".
+
+    .. versionadded:: 0.15
+"""
+docdict['fir_window'] = """
+fir_window : str
+    The window to use in FIR design, can be "hamming" (default),
+    "hann" (default in 0.13), or "blackman".
+
+    .. versionadded:: 0.15
+"""
+docdict['pad-fir'] = """
+pad : str
+    The type of padding to use. Supports all :func:`numpy.pad` ``mode``
+    options. Can also be "reflect_limited", which pads with a
+    reflected version of each vector mirrored on the first and last
+    values of the vector, followed by zeros. Only used for ``method='fir'``.
+"""
+docdict['method-fir'] = """
+method : str
+    'fir' will use overlap-add FIR filtering, 'iir' will use IIR
+    forward-backward filtering (via filtfilt).
+"""
+docdict['n_jobs-fir'] = """
+n_jobs : int | str
+    Number of jobs to run in parallel. Can be 'cuda' if ``cupy``
+    is installed properly and method='fir'.
+"""
+docdict['n_jobs-cuda'] = """
+n_jobs : int | str
+    Number of jobs to run in parallel. Can be 'cuda' if ``cupy``
+    is installed properly.
+"""
+docdict['iir_params'] = """
+iir_params : dict | None
+    Dictionary of parameters to use for IIR filtering.
+    If iir_params is None and method="iir", 4th order Butterworth will be used.
+    For more information, see :func:`mne.filter.construct_iir_filter`.
+"""
+docdict['npad'] = """
+npad : int | str
+    Amount to pad the start and end of the data.
+    Can also be "auto" to use a padding that will result in
+    a power-of-two size (can be much faster).
+"""
+docdict['window-resample'] = """
+window : str | tuple
+    Frequency-domain window to use in resampling.
+    See :func:`scipy.signal.resample`.
+"""
+
 # Rank
 docdict['rank'] = """
 rank : None | dict | 'info' | 'full'
@@ -63,11 +203,298 @@ docdict['rank_info'] = docdict['rank'] + 'The default is "info".'
 # Inverses
 docdict['depth'] = """
 depth : None | float | dict
+    How to weight (or normalize) the forward using a depth prior.
     If float (default 0.8), it acts as the depth weighting exponent (``exp``)
-    to use (must be between 0 and 1). None is equivalent to 0, meaning no depth
-    weighting is performed. Can also be a `dict` containing additional keyword
-    arguments to pass to :func:`mne.forward.compute_depth_prior` (see docstring
-    for details and defaults).
+    to use, which must be between 0 and 1. None is equivalent to 0, meaning
+    no depth weighting is performed. It can also be a `dict` containing
+    keyword arguments to pass to :func:`mne.forward.compute_depth_prior`
+    (see docstring for details and defaults).
+"""
+
+# Forward
+docdict['on_missing'] = """
+on_missing : str
+    Behavior when ``stc`` has vertices that are not in ``fwd``.
+    Can be "ignore", "warn"", or "raise"."""
+docdict['dig_kinds'] = """
+dig_kinds : list of str | str
+    Kind of digitization points to use in the fitting. These can be any
+    combination of ('cardinal', 'hpi', 'eeg', 'extra'). Can also
+    be 'auto' (default), which will use only the 'extra' points if
+    enough (more than 10) are available, and if not, uses 'extra' and
+    'eeg' points.
+"""
+docdict['exclude_frontal'] = """
+exclude_frontal : bool
+    If True, exclude points that have both negative Z values
+    (below the nasion) and positivy Y values (in front of the LPA/RPA).
+"""
+docdict['trans'] = """
+trans : str | dict | instance of Transform | None
+    If str, the path to the head<->MRI transform ``*-trans.fif`` file produced
+    during coregistration. Can also be ``'fsaverage'`` to use the built-in
+    fsaverage transformation. If trans is None, an identity matrix is assumed.
+
+    .. versionchanged:: 0.19
+       Support for 'fsaverage' argument.
+"""
+docdict['subjects_dir'] = """
+subjects_dir : str | None
+    The path to the freesurfer subjects reconstructions.
+    It corresponds to Freesurfer environment variable SUBJECTS_DIR.
+"""
+
+# Simulation
+docdict['interp'] = """
+interp : str
+    Either 'hann', 'cos2' (default), 'linear', or 'zero', the type of
+    forward-solution interpolation to use between forward solutions
+    at different head positions.
+"""
+docdict['head_pos'] = """
+head_pos : None | str | dict | tuple | array
+    Name of the position estimates file. Should be in the format of
+    the files produced by MaxFilter. If dict, keys should
+    be the time points and entries should be 4x4 ``dev_head_t``
+    matrices. If None, the original head position (from
+    ``info['dev_head_t']``) will be used. If tuple, should have the
+    same format as data returned by `head_pos_to_trans_rot_t`.
+    If array, should be of the form returned by
+    :func:`mne.chpi.read_head_pos`.
+"""
+docdict['n_jobs'] = """
+n_jobs : int
+    The number of jobs to run in parallel (default 1).
+    Requires the joblib package.
+"""
+
+# Random state
+docdict['random_state'] = """
+random_state : None | int | instance of ~numpy.random.RandomState
+    If ``random_state`` is an :class:`int`, it will be used as a seed for
+    :class:`~numpy.random.RandomState`. If ``None``, the seed will be
+    obtained from the operating system (see
+    :class:`~numpy.random.RandomState` for details). Default is
+    ``None``.
+"""
+
+docdict['seed'] = """
+seed : None | int | instance of ~numpy.random.RandomState
+    If ``seed`` is an :class:`int`, it will be used as a seed for
+    :class:`~numpy.random.RandomState`. If ``None``, the seed will be
+    obtained from the operating system (see
+    :class:`~numpy.random.RandomState` for details). Default is
+    ``None``.
+"""
+
+# Visualization
+docdict['combine'] = """
+combine : None | str | callable
+    How to combine information across channels. If a :class:`str`, must be
+    one of 'mean', 'median', 'std' (standard deviation) or 'gfp' (global
+    field power).
+"""
+
+docdict['show_scrollbars'] = """
+show_scrollbars : bool
+    Whether to show scrollbars when the plot is initialized. Can be toggled
+    after initialization by pressing :kbd:`z` ("zen mode") while the plot
+    window is focused. Default is ``True``.
+
+    .. versionadded:: 0.19.0
+"""
+
+# PSD plotting
+docdict["plot_psd_doc"] = """
+Plot the power spectral density across channels.
+
+Different channel types are drawn in sub-plots. When the data have been
+processed with a bandpass, lowpass or highpass filter, dashed lines
+indicate the boundaries of the filter (--). The line noise frequency is
+also indicated with a dashed line (-.)
+"""
+docdict['plot_psd_picks_good_data'] = docdict['picks_good_data'][:-2] + """
+    Cannot be None if `ax` is supplied.If both `picks` and `ax` are None
+    separate subplots will be created for each standard channel type
+    (`mag`, `grad`, and `eeg`).
+"""
+docdict["plot_psd_color"] = """
+color : str | tuple
+    A matplotlib-compatible color to use. Has no effect when
+    spatial_colors=True.
+"""
+docdict["plot_psd_xscale"] = """
+xscale : str
+    Can be 'linear' (default) or 'log'.
+"""
+docdict["plot_psd_area_mode"] = """
+area_mode : str | None
+    Mode for plotting area. If 'std', the mean +/- 1 STD (across channels)
+    will be plotted. If 'range', the min and max (across channels) will be
+    plotted. Bad channels will be excluded from these calculations.
+    If None, no area will be plotted. If average=False, no area is plotted.
+"""
+docdict["plot_psd_area_alpha"] = """
+area_alpha : float
+    Alpha for the area.
+"""
+docdict["plot_psd_dB"] = """
+dB : bool
+    Plot Power Spectral Density (PSD), in units (amplitude**2/Hz (dB)) if
+    ``dB=True``, and ``estimate='power'`` or ``estimate='auto'``. Plot PSD
+    in units (amplitude**2/Hz) if ``dB=False`` and,
+    ``estimate='power'``. Plot Amplitude Spectral Density (ASD), in units
+    (amplitude/sqrt(Hz)), if ``dB=False`` and ``estimate='amplitude'`` or
+    ``estimate='auto'``. Plot ASD, in units (amplitude/sqrt(Hz) (db)), if
+    ``dB=True`` and ``estimate='amplitude'``.
+"""
+docdict["plot_psd_estimate"] = """
+estimate : str, {'auto', 'power', 'amplitude'}
+    Can be "power" for power spectral density (PSD), "amplitude" for
+    amplitude spectrum density (ASD), or "auto" (default), which uses
+    "power" when dB is True and "amplitude" otherwise.
+"""
+docdict["plot_psd_average"] = """
+average : bool
+    If False, the PSDs of all channels is displayed. No averaging
+    is done and parameters area_mode and area_alpha are ignored. When
+    False, it is possible to paint an area (hold left mouse button and
+    drag) to plot a topomap.
+"""
+docdict["plot_psd_line_alpha"] = """
+line_alpha : float | None
+    Alpha for the PSD line. Can be None (default) to use 1.0 when
+    ``average=True`` and 0.1 when ``average=False``.
+"""
+docdict["plot_psd_spatial_colors"] = """
+spatial_colors : bool
+    Whether to use spatial colors. Only used when ``average=False``.
+"""
+
+# plot_projs_topomap
+docdict["proj_topomap_kwargs"] = """
+    layout : None | Layout | list of Layout
+        Layout instance specifying sensor positions (does not need to be
+        specified for Neuromag data). Or a list of Layout if projections
+        are from different sensor types.
+    cmap : matplotlib colormap | (colormap, bool) | 'interactive' | None
+        Colormap to use. If tuple, the first value indicates the colormap to
+        use and the second value is a boolean defining interactivity. In
+        interactive mode (only works if ``colorbar=True``) the colors are
+        adjustable by clicking and dragging the colorbar with left and right
+        mouse button. Left mouse button moves the scale up and down and right
+        mouse button adjusts the range. Hitting space bar resets the range. Up
+        and down arrows can be used to change the colormap. If None (default),
+        'Reds' is used for all positive data, otherwise defaults to 'RdBu_r'.
+        If 'interactive', translates to (None, True).
+    sensors : bool | str
+        Add markers for sensor locations to the plot. Accepts matplotlib plot
+        format string (e.g., 'r+' for red plusses). If True, a circle will be
+        used (via .add_artist). Defaults to True.
+    colorbar : bool
+        Plot a colorbar.
+    res : int
+        The resolution of the topomap image (n pixels along each side).
+    size : scalar
+        Side length of the topomaps in inches (only applies when plotting
+        multiple topomaps at a time).
+    show : bool
+        Show figure if True.
+    outlines : 'head' | 'skirt' | dict | None
+        The outlines to be drawn. If 'head', the default head scheme will be
+        drawn. If 'skirt' the head scheme will be drawn, but sensors are
+        allowed to be plotted outside of the head circle. If dict, each key
+        refers to a tuple of x and y positions, the values in 'mask_pos' will
+        serve as image mask, and the 'autoshrink' (bool) field will trigger
+        automated shrinking of the positions due to points outside the outline.
+        Alternatively, a matplotlib patch object can be passed for advanced
+        masking options, either directly or as a function that returns patches
+        (required for multi-axis plots). If None, nothing will be drawn.
+        Defaults to 'head'.
+    contours : int | array of float
+        The number of contour lines to draw. If 0, no contours will be drawn.
+        When an integer, matplotlib ticker locator is used to find suitable
+        values for the contour thresholds (may sometimes be inaccurate, use
+        array for accuracy). If an array, the values represent the levels for
+        the contours. Defaults to 6.
+    image_interp : str
+        The image interpolation to be used. All matplotlib options are
+        accepted.
+    axes : instance of Axes | list | None
+        The axes to plot to. If list, the list must be a list of Axes of
+        the same length as the number of projectors. If instance of Axes,
+        there must be only one projector. Defaults to None.
+    vlim : tuple of length 2 | 'joint'
+        Colormap limits to use. If :class:`tuple`, specifies the lower and
+        upper bounds of the colormap (in that order); providing ``None`` for
+        either of these will set the corresponding boundary at the min/max of
+        the data (separately for each projector). The keyword value ``'joint'``
+        will compute the colormap limits jointly across all provided
+        projectors of the same channel type, using the min/max of the projector
+        data. If vlim is ``'joint'``, ``info`` must not be ``None``. Defaults
+        to ``(None, None)``.
+"""
+
+# Montage
+docdict["montage_deprecated"] = """
+montage : str | None | instance of Montage
+    Path or instance of montage containing electrode positions.
+    If None, sensor locations are (0,0,0). See the documentation of
+    :func:`mne.channels.read_montage` for more information.
+
+    DEPRECATED in version 0.19
+    Use the `set_montage` method.
+"""
+docdict["montage"] = """
+montage : None | str | DigMontage
+    A montage containing channel positions. If str or DigMontage is
+    specified, the channel info will be updated with the channel
+    positions. Default is None. See also the documentation of
+    :class:`mne.channels.DigMontage` for more information.
+"""
+
+# Brain plotting
+docdict["clim"] = """
+clim : str | dict
+    Colorbar properties specification. If 'auto', set clim automatically
+    based on data percentiles. If dict, should contain:
+
+        ``kind`` : 'value' | 'percent'
+            Flag to specify type of limits.
+        ``lims`` : list | np.ndarray | tuple of float, 3 elements
+            Lower, middle, and upper bounds for colormap.
+        ``pos_lims`` : list | np.ndarray | tuple of float, 3 elements
+            Lower, middle, and upper bound for colormap. Positive values
+            will be mirrored directly across zero during colormap
+            construction to obtain negative control points.
+
+    .. note:: Only one of ``lims`` or ``pos_lims`` should be provided.
+              Only sequential colormaps should be used with ``lims``, and
+              only divergent colormaps should be used with ``pos_lims``.
+"""
+docdict["clim_onesided"] = """
+clim : str | dict
+    Colorbar properties specification. If 'auto', set clim automatically
+    based on data percentiles. If dict, should contain:
+
+        ``kind`` : 'value' | 'percent'
+            Flag to specify type of limits.
+        ``lims`` : list | np.ndarray | tuple of float, 3 elements
+            Lower, middle, and upper bound for colormap.
+
+    Unlike :meth:`stc.plot <mne.SourceEstimate.plot>`, it cannot use
+    ``pos_lims``, as the surface plot must show the magnitude.
+"""
+docdict["colormap"] = """
+colormap : str | np.ndarray of float, shape(n_colors, 3 | 4)
+    Name of colormap to use or a custom look up table. If array, must
+    be (n x 3) or (n x 4) array for with RGB or RGBA values between
+    0 and 255.
+"""
+docdict["transparent"] = """
+transparent : bool | None
+    If True, use a linear transparency between fmin and fmid.
+    None will choose automatically based on colormap type.
 """
 
 # Finalize
@@ -192,6 +619,12 @@ def copy_function_doc_to_method_doc(source):
     """
     def wrapper(func):
         doc = source.__doc__.split('\n')
+        if len(doc) == 1:
+            doc = doc[0]
+            if func.__doc__ is not None:
+                doc += func.__doc__
+            func.__doc__ = doc
+            return func
 
         # Find parameter block
         for line, text in enumerate(doc[:-2]):
@@ -247,6 +680,42 @@ def copy_function_doc_to_method_doc(source):
         func.__doc__ = doc
         return func
     return wrapper
+
+
+def copy_base_doc_to_subclass_doc(subclass):
+    """Use the docstring from a parent class methods in derived class.
+
+    The docstring of a parent class method is prepended to the
+    docstring of the method of the class wrapped by this decorator.
+
+    Parameters
+    ----------
+    subclass : wrapped class
+        Class to copy the docstring to.
+
+    Returns
+    -------
+    subclass : Derived class
+        The decorated class with copied docstrings.
+    """
+    ancestors = subclass.mro()[1:-1]
+
+    for source in ancestors:
+        methodList = [method for method in dir(source)
+                      if callable(getattr(source, method))]
+        for method_name in methodList:
+            # discard private methods
+            if method_name[0] == '_':
+                continue
+            base_method = getattr(source, method_name)
+            sub_method = getattr(subclass, method_name)
+            if base_method is not None and sub_method is not None:
+                doc = base_method.__doc__
+                if sub_method.__doc__ is not None:
+                    doc += '\n' + sub_method.__doc__
+                sub_method.__doc__ = doc
+
+    return subclass
 
 
 def linkcode_resolve(domain, info):
@@ -346,7 +815,7 @@ def open_docs(kind=None, version=None):
     if version is None:
         version = get_config('MNE_DOCS_VERSION', 'stable')
     _check_option('version', version, ['stable', 'dev'])
-    webbrowser.open_new_tab('https://martinos.org/mne/%s/%s' % (version, kind))
+    webbrowser.open_new_tab('https://mne.tools/%s/%s' % (version, kind))
 
 
 # Following deprecated class copied from scikit-learn
@@ -448,4 +917,5 @@ class deprecated(object):
                     n_space = len(line) - len(line.lstrip())
                     break
             newdoc = "%s\n\n%s%s" % (newdoc, ' ' * n_space, olddoc)
+
         return newdoc

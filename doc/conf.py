@@ -14,6 +14,7 @@
 
 from datetime import date
 from distutils.version import LooseVersion
+import gc
 import os
 import os.path as op
 import sys
@@ -22,12 +23,15 @@ import warnings
 import sphinx_gallery
 from sphinx_gallery.sorting import FileNameSortKey, ExplicitOrder
 from numpydoc import docscrape
+import matplotlib
 import mne
 from mne.utils import linkcode_resolve  # noqa, analysis:ignore
 
 if LooseVersion(sphinx_gallery.__version__) < LooseVersion('0.2'):
     raise ImportError('Must have at least version 0.2 of sphinx-gallery, got '
                       '%s' % (sphinx_gallery.__version__,))
+
+matplotlib.use('agg')
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
@@ -56,11 +60,13 @@ extensions = [
     'sphinx.ext.linkcode',
     'sphinx.ext.mathjax',
     'sphinx.ext.todo',
+    'sphinx.ext.graphviz',
+    'numpydoc',
     'sphinx_gallery.gen_gallery',
     'sphinx_fontawesome',
-    'numpydoc',
     'gen_commands',
     'sphinx_bootstrap_theme',
+    'sphinx_bootstrap_divs',
 ]
 
 linkcheck_ignore = [
@@ -77,6 +83,11 @@ autodoc_default_options = {'inherited-members': None}
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
+
+# List of patterns, relative to source directory, that match files and
+# directories to ignore when looking for source files.
+# This pattern also affects html_static_path and html_extra_path.
+exclude_patterns = ['_includes']
 
 # The suffix of source filenames.
 source_suffix = '.rst'
@@ -165,14 +176,15 @@ html_theme_options = {
     'navbar_class': "navbar",
     'bootstrap_version': "3",  # default
     'navbar_links': [
-        ("Install", "getting_started"),
-        ("Documentation", "documentation"),
-        ("API", "python_reference"),
-        ("Glossary", "glossary"),
+        ("Install", "install/index"),
+        ("Overview", "overview/index"),
+        ("Tutorials", "auto_tutorials/index"),
         ("Examples", "auto_examples/index"),
-        ("Contribute", "contributing"),
+        ("Glossary", "glossary"),
+        ("API", "python_reference"),
+        ("Contribute", "install/contributing"),
     ],
-    }
+}
 
 # The name for this set of Sphinx documents.  If None, it defaults to
 # "<project> v<release> documentation".
@@ -198,7 +210,12 @@ html_static_path = ['_static', '_images']
 # Add any extra paths that contain custom files (such as robots.txt or
 # .htaccess) here, relative to this directory. These files are copied
 # directly to the root of the documentation.
-#html_extra_path = []
+html_extra_path = [
+    'contributing.html',
+    'documentation.html',
+    'getting_started.html',
+    'install_mne_python.html',
+]
 
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.
@@ -290,17 +307,24 @@ trim_doctests_flags = True
 # Example configuration for intersphinx: refer to the Python standard library.
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3', None),
-    'numpy': ('https://www.numpy.org/devdocs', None),
+    'numpy': ('https://numpy.org/devdocs', None),
     'scipy': ('https://scipy.github.io/devdocs', None),
     'matplotlib': ('https://matplotlib.org', None),
     'sklearn': ('https://scikit-learn.org/stable', None),
+    'numba': ('https://numba.pydata.org/numba-doc/latest', None),
+    'joblib': ('https://joblib.readthedocs.io/en/latest', None),
     'mayavi': ('http://docs.enthought.com/mayavi/mayavi', None),
-    'nibabel': ('http://nipy.org/nibabel', None),
+    'nibabel': ('https://nipy.org/nibabel', None),
     'nilearn': ('http://nilearn.github.io', None),
     'surfer': ('https://pysurfer.github.io/', None),
     'pandas': ('https://pandas.pydata.org/pandas-docs/stable', None),
     'statsmodels': ('http://www.statsmodels.org/stable/', None),
-    'dipy': ('http://nipy.org/dipy', None),
+    # There are some problems with dipy's redirect:
+    # https://github.com/nipy/dipy/issues/1955
+    'dipy': ('https://dipy.org/documentation/latest',
+             'https://dipy.org/documentation/1.0.0./objects.inv/'),
+    'mne_realtime': ('https://mne.tools/mne-realtime', None),
+    'picard': ('https://pierreablin.github.io/picard/', None),
 }
 
 ##############################################################################
@@ -308,19 +332,67 @@ intersphinx_mapping = {
 
 examples_dirs = ['../examples', '../tutorials']
 gallery_dirs = ['auto_examples', 'auto_tutorials']
+os.environ['_MNE_BUILDING_DOC'] = 'true'
 
+scrapers = ('matplotlib',)
 try:
     mlab = mne.utils._import_mlab()
     # Do not pop up any mayavi windows while running the
     # examples. These are very annoying since they steal the focus.
     mlab.options.offscreen = True
-    scrapers = ('matplotlib', 'mayavi')
+    # hack to initialize the Mayavi Engine
+    mlab.test_plot3d()
+    mlab.close()
 except Exception:
-    scrapers = ('matplotlib',)
+    pass
 else:
-    # Let's do the same thing we do in tests: reraise traits exceptions
+    scrapers += ('mayavi',)
+try:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        import pyvista
+    pyvista.OFF_SCREEN = True
+except Exception:
+    pass
+else:
+    scrapers += ('pyvista',)
+if any(x in scrapers for x in ('pyvista', 'mayavi')):
     from traits.api import push_exception_handler
     push_exception_handler(reraise_exceptions=True)
+    report_scraper = mne.report._ReportScraper()
+    scrapers += (report_scraper,)
+else:
+    report_scraper = None
+
+
+def append_attr_meth_examples(app, what, name, obj, options, lines):
+    """Append SG examples backreferences to method and attr docstrings."""
+    # NumpyDoc nicely embeds method and attribute docstrings for us, but it
+    # does not respect the autodoc templates that would otherwise insert
+    # the .. include:: lines, so we need to do it.
+    # Eventually this could perhaps live in SG.
+    if what in ('attribute', 'method'):
+        size = os.path.getsize(op.join(
+            op.dirname(__file__), 'generated', '%s.examples' % (name,)))
+        if size > 0:
+            lines += """
+.. rubric:: Examples using ``{0}``:
+
+.. include:: {1}.examples
+   :start-line: 5
+
+.. raw:: html
+
+    <div style="clear:both"></div>
+""".format(name.split('.')[-1], name).split('\n')
+
+
+def setup(app):
+    """Set up the Sphinx app."""
+    app.connect('autodoc-process-docstring', append_attr_meth_examples)
+    if report_scraper is not None:
+        report_scraper.app = app
+        app.connect('build-finished', report_scraper.copyfiles)
 
 
 class Resetter(object):
@@ -330,7 +402,12 @@ class Resetter(object):
         return '<%s>' % (self.__class__.__name__,)
 
     def __call__(self, gallery_conf, fname):
+        import matplotlib.pyplot as plt
         reset_warnings(gallery_conf, fname)
+        # in case users have interactive mode turned on in matplotlibrc,
+        # turn it off here (otherwise the build can be very slow)
+        plt.ioff()
+        gc.collect()
 
 
 def reset_warnings(gallery_conf, fname):
@@ -345,6 +422,8 @@ def reset_warnings(gallery_conf, fname):
     # restrict
     warnings.filterwarnings('error')
     # allow these, but show them
+    warnings.filterwarnings('always', '.*non-standard config type: "foo".*')
+    warnings.filterwarnings('always', '.*config type: "MNEE_USE_CUUDAA".*')
     warnings.filterwarnings('always', '.*cannot make axes width small.*')
     warnings.filterwarnings('always', '.*Axes that are not compatible.*')
     warnings.filterwarnings('always', '.*FastICA did not converge.*')
@@ -366,7 +445,10 @@ def reset_warnings(gallery_conf, fname):
     for key in ('HasTraits', r'numpy\.testing', 'importlib', r'np\.loads',
                 'Using or importing the ABCs from',  # internal modules on 3.7
                 r"it will be an error for 'np\.bool_'",  # ndimage
+                "DocumenterBridge requires a state object",  # sphinx dev
                 "'U' mode is deprecated",  # sphinx io
+                r"joblib is deprecated in 0\.21",  # nilearn
+                'The usage of `cmp` is deprecated and will',  # sklearn/pytest
                 ):
         warnings.filterwarnings(  # deal with other modules having bad imports
             'ignore', message=".*%s.*" % key, category=DeprecationWarning)
@@ -375,9 +457,14 @@ def reset_warnings(gallery_conf, fname):
         category=Warning)
     warnings.filterwarnings(  # deal with other modules having bad imports
         'ignore', message=".*ufunc size changed.*", category=RuntimeWarning)
+    warnings.filterwarnings(  # realtime
+        'ignore', message=".*unclosed file.*", category=ResourceWarning)
+    warnings.filterwarnings('ignore', message='Exception ignored in.*')
     # allow this ImportWarning, but don't show it
     warnings.filterwarnings(
         'ignore', message="can't resolve package from", category=ImportWarning)
+    warnings.filterwarnings(
+        'ignore', message='.*mne-realtime.*', category=DeprecationWarning)
 
 
 reset_warnings(None, None)
@@ -397,13 +484,28 @@ sphinx_gallery_conf = {
                                        '../examples/inverse/',
                                        '../examples/realtime/',
                                        '../examples/datasets/',
-                                       '../tutorials/']),
+                                       '../tutorials/intro/',
+                                       '../tutorials/io/',
+                                       '../tutorials/raw/',
+                                       '../tutorials/preprocessing/',
+                                       '../tutorials/epochs/',
+                                       '../tutorials/evoked/',
+                                       '../tutorials/time-freq/',
+                                       '../tutorials/source-modeling/',
+                                       '../tutorials/stats-sensor-space/',
+                                       '../tutorials/stats-source-space/',
+                                       '../tutorials/machine-learning/',
+                                       '../tutorials/simulation/',
+                                       '../tutorials/sample-datasets/',
+                                       '../tutorials/discussions/',
+                                       '../tutorials/misc/']),
     'gallery_dirs': gallery_dirs,
     'default_thumb_file': os.path.join('_static', 'mne_helmet.png'),
     'backreferences_dir': 'generated',
     'plot_gallery': 'True',  # Avoid annoying Unicode/bool default warning
     'download_section_examples': False,
     'thumbnail_size': (160, 112),
+    'remove_config_comments': True,
     'min_reported_time': 1.,
     'abort_on_example_error': False,
     'reset_modules': ('matplotlib', Resetter()),  # called w/each script
@@ -423,6 +525,8 @@ numpydoc_class_members_toctree = False
 numpydoc_attributes_as_param_list = False
 numpydoc_xref_param_type = True
 numpydoc_xref_aliases = {
+    'Popen': 'python:subprocess.Popen',
+    'file-like': ':term:`file-like <python:file object>`',
     # Matplotlib
     'colormap': ':doc:`colormap <matplotlib:tutorials/colors/colormaps>`',
     'color': ':doc:`color <matplotlib:api/colors_api>`',
@@ -430,24 +534,28 @@ numpydoc_xref_aliases = {
     'Axes': 'matplotlib.axes.Axes',
     'Figure': 'matplotlib.figure.Figure',
     'Axes3D': 'mpl_toolkits.mplot3d.axes3d.Axes3D',
+    'ColorbarBase': 'matplotlib.colorbar.ColorbarBase',
     # Mayavi
     'mayavi.mlab.Figure': 'mayavi.core.api.Scene',
     'mlab.Figure': 'mayavi.core.api.Scene',
     # sklearn
     'LeaveOneOut': 'sklearn.model_selection.LeaveOneOut',
+    # joblib
+    'joblib.Parallel': 'joblib.Parallel',
     # nibabel
     'Nifti1Image': 'nibabel.nifti1.Nifti1Image',
     'Nifti2Image': 'nibabel.nifti2.Nifti2Image',
+    'SpatialImage': 'nibabel.spatialimages.SpatialImage',
     # MNE
     'Label': 'mne.Label', 'Forward': 'mne.Forward', 'Evoked': 'mne.Evoked',
     'Info': 'mne.Info', 'SourceSpaces': 'mne.SourceSpaces',
+    'SourceMorph': 'mne.SourceMorph',
     'Epochs': 'mne.Epochs', 'Layout': 'mne.channels.Layout',
     'EvokedArray': 'mne.EvokedArray', 'BiHemiLabel': 'mne.BiHemiLabel',
     'AverageTFR': 'mne.time_frequency.AverageTFR',
     'EpochsTFR': 'mne.time_frequency.EpochsTFR',
     'Raw': 'mne.io.Raw', 'ICA': 'mne.preprocessing.ICA',
     'Covariance': 'mne.Covariance', 'Annotations': 'mne.Annotations',
-    'Montage': 'mne.channels.Montage',
     'DigMontage': 'mne.channels.DigMontage',
     'VectorSourceEstimate': 'mne.VectorSourceEstimate',
     'VolSourceEstimate': 'mne.VolSourceEstimate',
@@ -458,7 +566,6 @@ numpydoc_xref_aliases = {
     'Dipole': 'mne.Dipole', 'DipoleFixed': 'mne.DipoleFixed',
     'InverseOperator': 'mne.minimum_norm.InverseOperator',
     'CrossSpectralDensity': 'mne.time_frequency.CrossSpectralDensity',
-    'RtEpochs': 'mne.realtime.RtEpochs',
     'SourceMorph': 'mne.SourceMorph',
     'Xdawn': 'mne.preprocessing.Xdawn',
     'Report': 'mne.Report', 'Forward': 'mne.Forward',
@@ -472,6 +579,7 @@ numpydoc_xref_aliases = {
     'FilterEstimator': 'mne.decoding.FilterEstimator',
     'EMS': 'mne.decoding.EMS', 'CSP': 'mne.decoding.CSP',
     'Beamformer': 'mne.beamformer.Beamformer',
+    'Transform': 'mne.transforms.Transform',
 }
 numpydoc_xref_ignore = {
     # words
@@ -489,9 +597,10 @@ numpydoc_xref_ignore = {
     'n_splits', 'n_scores', 'n_outputs', 'n_trials', 'n_estimators', 'n_tasks',
     'nd_features', 'n_classes', 'n_targets', 'n_slices', 'n_hpi', 'n_fids',
     'n_elp', 'n_pts', 'n_tris', 'n_nodes', 'n_nonzero', 'n_events_out',
+    'n_segments', 'n_orient_inv', 'n_orient_fwd',
     # Undocumented (on purpose)
     'RawKIT', 'RawEximia', 'RawEGI', 'RawEEGLAB', 'RawEDF', 'RawCTF', 'RawBTi',
-    'RawBrainVision',
+    'RawBrainVision', 'RawCurry', 'RawNIRX',
     # sklearn subclasses
     'mapping', 'to', 'any',
     # unlinkable
