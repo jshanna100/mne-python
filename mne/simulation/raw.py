@@ -190,7 +190,7 @@ def simulate_raw(info, stc=None, trans=None, src=None, bem=None, head_pos=None,
         This is a sanity parameter to prevent accidental blowups.
 
     ref_meg : make use of reference channels in forward model
-        .. versionadded:: 0.18
+
     %(verbose)s
 
     Returns
@@ -294,7 +294,7 @@ def simulate_raw(info, stc=None, trans=None, src=None, bem=None, head_pos=None,
     n = 1
     for fi, fwd in enumerate(_iter_forward_solutions(
             info, trans, src, bem, dev_head_ts, mindist, n_jobs, forward,
-            meeg_picks)):
+            meeg_picks, ref_meg=ref_meg)):
         # must be fixed orientation
         # XXX eventually we could speed this up by allowing the forward
         # solution code to only compute the normal direction
