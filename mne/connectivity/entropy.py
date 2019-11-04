@@ -51,13 +51,13 @@ def _estimate_entropy(signals, epsilon=1e-8):
     return entropy
 
 
-def _diff_transfer_entropy(signals, sfreq, delay, epsilon=1e-8):
+def _diff_transfer_entropy(x_phase, y_phase, sfreq, delay, epsilon=1e-8):
     # differential transfer entropy of x to y; to get y to x, just * -1
     samp_delay = np.int(np.round(delay*sfreq))
-    x_past = x_phases[...,:-samp_delay]
-    y_past = y_phases[...,:-samp_delay]
-    x = x_phases[...,samp_delay:]
-    y = y_phases[...,samp_delay:]
+    x_past = x_phase[...,:-samp_delay]
+    y_past = y_phase[...,:-samp_delay]
+    x = x_phase[...,samp_delay:]
+    y = y_phase[...,samp_delay:]
 
     # calculate the histograms
     samp_nums = x.size # x is arbitrary; any other variable would do
