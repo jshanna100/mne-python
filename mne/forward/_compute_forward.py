@@ -428,7 +428,6 @@ def _bem_pot_or_field(rr, mri_rr, mri_Q, coils, solution, bem_rr, n_jobs,
                                            nas(solution.T, n_jobs))), axis=0)
     # The copy()s above should make it so the whole objects don't need to be
     # pickled...
-
     # Only MEG coils are sensitive to the primary current distribution.
     if coil_type == 'meg':
         # Primary current contribution (can be calc. in coil/dipole coords)
@@ -437,6 +436,7 @@ def _bem_pot_or_field(rr, mri_rr, mri_Q, coils, solution, bem_rr, n_jobs,
                                       for r in nas(rr, n_jobs)), axis=0)
         B += pcc
         B *= _MAG_FACTOR
+        
     return B
 
 
@@ -708,6 +708,7 @@ def _prep_field_computation(rr, bem, fwd_data, n_jobs, verbose=None):
     %(n_jobs)s
     %(verbose)s
     """
+
     bem_rr = mults = mri_Q = head_mri_t = None
     if not bem['is_sphere']:
         if bem['bem_method'] != FWD.BEM_LINEAR_COLL:
@@ -783,7 +784,6 @@ def _prep_field_computation(rr, bem, fwd_data, n_jobs, verbose=None):
                          csolutions=csolutions, fun=fun,
                          coils_list=coils_list, ccoils_list=ccoils_list))
 
-
 @fill_doc
 def _compute_forwards_meeg(rr, fd, n_jobs, silent=False):
     """Compute MEG and EEG forward solutions for all sensor types.
@@ -805,6 +805,7 @@ def _compute_forwards_meeg(rr, fd, n_jobs, silent=False):
         Each element contains ndarray, shape (3 * n_dipoles, n_sensors) where
         n_sensors depends on which channel types are requested (MEG and/or EEG)
     """
+
     n_jobs = max(min(n_jobs, len(rr)), 1)
     Bs = list()
     # The dipole location and orientation must be transformed to mri coords

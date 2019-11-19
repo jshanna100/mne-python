@@ -626,8 +626,6 @@ def make_forward_solution(info, trans, src, bem, meg=True, eeg=True,
     # spaces are in head coords.
     fwd.update(**update_kwargs)
     logger.info('Finished.')
-    import code
-    code.interact(local=locals())
     return fwd
 
 
