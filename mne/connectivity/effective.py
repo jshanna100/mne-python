@@ -12,17 +12,17 @@ from .entropy import _instant_phase
 
 @verbose
 def phase_transfer_entropy(data, freqs, sfreq, phase_method="wavelet",
-                           cwt_n_cycle=7, freq_band=2, n_jobs=1):
+                           cwt_n_cycle=7, freq_band=2, n_jobs=1, cuda=False):
     # get instantaneous phase
-    if phase == "wavelet" or phase == "hilbert":
+    if phase_method == "wavelet" or phase_method == "hilbert":
         inst_phases = _instant_phase(data, method=phase_method,
                                      cwt_n_cycle=cyc_n_cycle,
                                      freq_band=freq_band,
-                                     n_jobs=n_jobs)
+                                     n_jobs=n_jobs, cuda=cuda)
     else:
-        raise ValueError("{} not a recognised phase transform.".format(phase))
+        raise ValueError("{} not a recognised phase transform.".format(
+                         phase_method))
 
-    return inst_phases
 
 @verbose
 def phase_slope_index(data, indices=None, sfreq=2 * np.pi,
