@@ -24,6 +24,8 @@ def phase_transfer_entropy(data, freqs, sfreq, phase_method="wavelet",
                          phase_method))
 
 
+
+
 @verbose
 def phase_slope_index(data, indices=None, sfreq=2 * np.pi,
                       mode='multitaper', fmin=None, fmax=np.inf,
