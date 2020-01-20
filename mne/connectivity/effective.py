@@ -8,7 +8,8 @@ import numpy as np
 
 from ..utils import logger, verbose
 from .spectral import spectral_connectivity
-from .entropy import _instant_phase
+from .entropy import _instant_phase, scotts_bins
+from ..parallel import parallel_func
 
 @verbose
 def phase_transfer_entropy(data, freqs, sfreq, phase_method="wavelet",
@@ -23,7 +24,10 @@ def phase_transfer_entropy(data, freqs, sfreq, phase_method="wavelet",
         raise ValueError("{} not a recognised phase transform.".format(
                          phase_method))
 
-
+    # histograms for univariates as well as joints of delayed signal against
+    # itself
+    if n_jobs == 1:
+        hist_list
 
 
 @verbose

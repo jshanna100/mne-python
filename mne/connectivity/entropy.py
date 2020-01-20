@@ -1,6 +1,5 @@
 from ..time_frequency.tfr import tfr_array_morlet
 from ..filter import filter_data
-from ..parallel import parallel_func
 from scipy.signal import hilbert
 from scipy.stats import circstd
 import numpy as np
@@ -54,9 +53,12 @@ def _histo_1d(phases, epsilon=1e-8):
     histo = np.histogram(phases,bins=bin_edges)[0] / samp_nums + epsilon
     return histo
 
+
+
 def _diff_transfer_entropy(x_phase, y_phase, x_be, y_be, x_past_be, y_past_be,
                            x_past_histo, y_past_histo, sfreq, delay,
                            epsilon=1e-8):
+
     # differential transfer entropy of x to y; to get y to x, just * -1
 
     # we need the delayed and non-delayed phase for x and y
