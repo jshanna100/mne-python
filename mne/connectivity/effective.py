@@ -8,7 +8,7 @@ import numpy as np
 
 from ..utils import logger, verbose
 from .spectral import spectral_connectivity
-from .entropy import _instant_phase, scotts_bins
+#from .entropy import _instant_phase, scotts_bins
 from ..parallel import parallel_func
 
 @verbose
