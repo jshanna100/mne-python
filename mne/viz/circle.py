@@ -118,8 +118,8 @@ def _plot_connectivity_circle_onpick(event, fig=None, axes=None, indices=None,
         fig.canvas.draw()
 
 
-def plot_connectivity_circle(con, node_names, indices=None, n_lines=None,
-                             node_angles=None, node_width=None,
+def plot_connectivity_circle(con, node_names, alphas=None, indices=None,
+                             n_lines=None, node_angles=None, node_width=None,
                              node_colors=None, facecolor='black',
                              textcolor='white', node_edgecolor='black',
                              linewidth=1.5, colormap='hot', vmin=None,
@@ -139,6 +139,9 @@ def plot_connectivity_circle(con, node_names, indices=None, n_lines=None,
         indices.
     node_names : list of str
         Node names. The order corresponds to the order in con.
+    alphas : array
+        Alpha values (transparency) for each edge. Must be same length as
+        con and [0,1]. If None, then all edges have alpha of 1.
     indices : tuple of array | None
         Two arrays with indices of connections for which the connections
         strengths are defined in con. Only needed if con is a 1D array.
@@ -269,6 +272,15 @@ def plot_connectivity_circle(con, node_names, indices=None, n_lines=None,
     else:
         raise ValueError('con has to be 1D or a square matrix')
 
+    # check and initialise alpha values
+    if alphas is not None:
+        if np.any(alphas < 0) or np.any(alphas > 1):
+            raise ValueError('all alphas must be between 0 and 1')
+        if len(con) != len(alphas):
+            raise ValueError('alphas has to be be the same length as con')
+    else:
+        alphas = np.ones_like(con, dtype=float)
+
     # get the colormap
     if isinstance(colormap, str):
         colormap = plt.get_cmap(colormap)
@@ -369,10 +381,11 @@ def plot_connectivity_circle(con, node_names, indices=None, n_lines=None,
         path = m_path.Path(verts, codes)
 
         color = colormap(con_val_scaled[pos])
+        alpha = alphas[pos]
 
         # Actual line
         patch = m_patches.PathPatch(path, fill=False, edgecolor=color,
-                                    linewidth=linewidth, alpha=1.)
+                                    linewidth=linewidth, alpha=alpha)
         axes.add_patch(patch)
 
     # Draw ring with colored nodes
