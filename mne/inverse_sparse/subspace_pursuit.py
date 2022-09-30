@@ -1,0 +1,340 @@
+import numpy as np
+from ..utils.numerics import _PCA
+from ..utils import verbose, logger
+from .. import make_forward_solution, convert_forward_solution
+from ..source_space import _set_source_space_vertices, setup_source_space
+from ..io.constants import FIFF
+from ..minimum_norm import make_inverse_operator, apply_inverse
+from ..minimum_norm.inverse import (_log_exp_var, _check_or_prepare,
+                                    _pick_channels_inverse_operator)
+from ..dipole import Dipole
+from ..io.pick import pick_types, channel_type, _picks_by_type
+from sklearn.preprocessing import RobustScaler
+
+def _expl_var(data, resid, inv):
+    sel = _pick_channels_inverse_operator(data.ch_names, inv)
+    data_arr, resid_arr = data.data[sel], resid.data[sel]
+    est_arr = data_arr - resid_arr
+    data_w = np.dot(inv["whitener"] , np.dot(inv["proj"], data_arr))
+    est_w = np.dot(inv["whitener"] , np.dot(inv["proj"], est_arr))
+    expl_var = _log_exp_var(data_w, est_w)
+    return expl_var
+
+def make_dipoles_from_stc(stc, fwd):
+    times = stc.times
+    dipoles = []
+    for src_idx in range(fwd["nsource"]):
+        pos = fwd["source_rr"][src_idx]
+        ori = fwd["source_nn"][src_idx]
+        dipole = Dipole(times, pos, stc.data[src_idx,], ori, 0)
+        dipoles.append(dipole)
+    return dipoles
+
+def _restrict_forward_patch(fwd, inds, copy=True):
+    """Restrict a forward model to forward model indices"""
+    if any(np.diff(inds) <= 0):
+        raise ValueError('Indices must be ordered in increasing order.')
+    fwd = fwd.copy() if copy else fwd
+    verts = np.concatenate([s["vertno"].astype(int) for s in fwd["src"]])
+    src_inds = np.concatenate([np.ones(len(s["vertno"]), dtype=int)*s_idx
+                               for s_idx, s in enumerate(fwd["src"])])
+    new_verts = [[] for s in fwd["src"]]
+    for idx in inds:
+        vert, src_idx = verts[idx], src_inds[idx]
+        new_verts[src_idx].append(vert)
+
+    fwd["nsource"] = len(inds)
+    fwd['source_nn'] = fwd["source_nn"][inds]
+    fwd['source_rr'] = fwd["source_rr"][inds]
+    fwd["sol"]["data"] = fwd["sol"]["data"][:, inds]
+    fwd["sol"]["ncol"] = len(inds)
+    _set_source_space_vertices(fwd["src"], new_verts)
+    return fwd
+
+def _convert_forward_patch(fwd, new_nns, new_rrs, new_gain, new_verts,
+                           copy=True):
+    fwd = fwd.copy() if copy else fwd
+    # make sure order corresponds to increasing vertices
+    start_inds = [0] + [len(nv) for nv in new_verts[:-1]]
+    ordered_inds = np.concatenate([np.argsort(nv) + start_idx for
+                                   nv, start_idx in zip(new_verts, start_inds)])
+    new_verts = [np.sort(nv) for nv in new_verts]
+    fwd["nsource"] = len(new_nns)
+    fwd['source_nn'] = new_nns[ordered_inds]
+    fwd['source_rr'] = new_rrs[ordered_inds]
+    fwd["sol"]["data"] = new_gain[:, ordered_inds]
+    fwd["sol"]["ncol"] = len(new_nns)
+    fwd["source_ori"] = FIFF.FIFFV_MNE_FIXED_ORI
+    fwd['surf_ori'] = True
+    fwd["_orig_sol"] = fwd["sol"]["data"]
+    fwd["_orig_source_ori"] = FIFF.FIFFV_MNE_FIXED_ORI
+    _set_source_space_vertices(fwd["src"], new_verts)
+    return fwd
+
+def _union_s(s1, s2):
+    support = np.union1d(s1, s2)
+    support = np.sort(support)
+    return support
+
+def _select_s(proxy, confl_mat, s):
+    """
+    Get s strongest sources, with the constraint that mutual coherence
+    is below threshold
+    """
+    norm_sort_inds = np.argsort(np.linalg.norm(proxy, axis=1))[::-1]
+    support = np.array([norm_sort_inds[0]])
+    for idx in norm_sort_inds[1:]:
+        if len(support) == s:
+            break
+        if sum(confl_mat[support, idx]) == 0:
+            support = np.append(support, idx)
+
+    support = np.sort(support)
+    return support
+
+def _proxy_matrix(evo, fwd, cov, lambda2):
+    inv_op = make_inverse_operator(evo.info, fwd, cov, loose=0, fixed=True,
+                                   depth=None, verbose="warning")
+    stc, resid = apply_inverse(evo, inv_op, lambda2, method="MNE",
+                               return_residual=True, verbose="warning")
+    return stc.data, resid
+
+def telescope_vertices(subject, coarse_spacing, fine_spacing, vertices,
+                       subjects_dir=None, n_jobs=1):
+    """
+    For all vertices, find a) which patch they inhabit in coarse space, and
+    then b) find all the patches in fine space which overlap with the coarse
+    patch.
+    """
+    coarse_src = setup_source_space(subject, spacing=coarse_spacing,
+                                    subjects_dir=subjects_dir, n_jobs=n_jobs,
+                                    verbose="warning")
+    fine_src = setup_source_space(subject, spacing=fine_spacing,
+                                  subjects_dir=subjects_dir, n_jobs=n_jobs,
+                                  verbose="warning")
+    # find patches in coarse space
+    pinfos = [s["pinfo"] for s in coarse_src]
+    coarse_patch_inds = [[] for s in coarse_src]
+    for src_idx, (vertex, pinfo) in enumerate(zip(vertices, pinfos)):
+        for pi in pinfo:
+            for vtx in vertex:
+                if vtx in pi:
+                    coarse_patch_inds[src_idx].append(pi)
+    # overlapping patches in fine space
+    pinfos = [s["pinfo"] for s in fine_src]
+    fine_patch_inds = [[] for s in coarse_src]
+    for src_idx, pinfo in enumerate(pinfos):
+        for pi_idx, pi in enumerate(pinfo):
+            for c_pinfo in coarse_patch_inds[src_idx]:
+                if len(np.intersect1d(pi, c_pinfo)):
+                    fine_patch_inds[src_idx].append(
+                                        fine_src[src_idx]["vertno"][pi_idx])
+    fine_patch_inds = [np.array(fpi) for fpi in fine_patch_inds]
+    return fine_patch_inds
+
+def _chantype_scale_gain_mat(gain, info, scale=True):
+    "scale/unscale the gain matrix by channel-type units"
+    scalings = {"eeg":1e+6, "mag":1e15, "grad":1e13}
+    if not scale:
+        # invert the scalings to put them back to original values
+        scalings = {k:1/v for k, v in scalings.items()}
+    gain = gain.copy()
+    ch_types = [channel_type(info, idx)
+                for idx in range(len(info["chs"]))]
+    ch_types = list(np.unique(ch_types))
+    for ch_type in ch_types:
+        if ch_type == "eeg":
+            sel = pick_types(info, eeg=True, meg=False)
+        elif ch_type == "mag":
+            sel = pick_types(info, eeg=False, meg="mag")
+        elif ch_type == "grad":
+            sel = pick_types(info, eeg=False, meg="grad")
+        else:
+            raise ValueError(f"Channel type {ch_type} not recognised.")
+        gain[sel,] *= scalings[ch_type]
+    return gain
+
+def _whiten_gain(gain, info):
+    pre_whitener = np.empty([len(gain), 1])
+    for _, picks_ in _picks_by_type(info, ref_meg=False, exclude=[]):
+        pre_whitener[picks_] = np.std(gain[picks_])
+    wh_gain = gain / pre_whitener
+    return wh_gain, pre_whitener
+
+def _svd_gain(gain, info, n_components, whiten=False):
+    gain = gain.copy()
+    if whiten:
+        gain, pre_whitener = _whiten_gain(gain, info)
+    pca = _PCA(n_components=n_components, whiten=whiten)
+    u, s, v = pca._fit(gain)
+    if whiten:
+        svd_gain = u[:, :pca.n_components_] * np.sqrt(gain.shape[0] - 1)
+        svd_gain = svd_gain * pre_whitener
+    else:
+        svd_gain = u[:, :pca.n_components_] * s[:pca.n_components_]
+    return svd_gain, u, s, v, pca.n_components_
+
+def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
+                       restrict_to=None, patch_comp_n=None, meg=True, eeg=True,
+                       ignore_ref=False, mindist=0., n_jobs=1):
+    src = setup_source_space(subject, spacing=spacing,
+                             subjects_dir=subjects_dir,
+                             n_jobs=n_jobs, verbose="warning")
+    if restrict_to:
+        _set_source_space_vertices(src, restrict_to)
+
+    # make a forward model for each cortical patch
+    pinfos = [np.array(s["pinfo"], dtype=object) for s in src]
+    new_nns, new_rrs, new_gain, new_verts = [], [], [], [[] for s in src]
+    for sr_idx, sr in enumerate(src):
+        for p_count, p_idx in enumerate(sr["patch_inds"]):
+            pi = sr["pinfo"][p_idx]
+            logger.info(f"Source {sr_idx}, Patch {p_count} of {sr['nuse']}")
+            # restrict source space to patch and calc forward
+            p_src = src.copy()
+            pinfo_list = [[] for s in src]
+            pinfo_list[sr_idx] = pi.astype(int)
+            _set_source_space_vertices(p_src, pinfo_list)
+            fwd = make_forward_solution(info, trans, p_src,
+                                        bem, meg=meg, eeg=eeg,
+                                        mindist=mindist,
+                                        ignore_ref=ignore_ref,
+                                        n_jobs=n_jobs,
+                                        verbose="warning")
+            # reduce gain matrix dimensionality to n best components
+            # or components that explain n variance
+            gain = fwd["sol"]["data"].copy()
+            reduce_gain, u, s, v, n_comps = _svd_gain(gain, fwd["info"],
+                                                      patch_comp_n,
+                                                      whiten=True)
+            # get prominence of sources in decomposition and use those to derive
+            # locations and orientations for components
+            nn_weights = v[:n_comps,:].T * s[:n_comps].T
+            # reduce this to norm of 3 orientations for location weights
+            rr_weights = np.stack([nn_weights[0::3], nn_weights[1::3],
+                                   nn_weights[2::3]])
+            rr_weights = np.linalg.norm(rr_weights, axis=0)
+            nn_weights = nn_weights / sum(nn_weights) # rows sum to 1
+            rr_weights = rr_weights / sum(rr_weights) # rows sum to 1
+            nns = fwd["source_nn"]
+            rrs = fwd["source_rr"]
+            # get nn and rr weighted by SVD component contribution
+            w_nns = np.dot(nn_weights.T, nns)
+            w_rrs = np.dot(rr_weights.T, rrs)
+            # find vertex nums which are closest to new_rrs
+            for rr, nn in zip(w_rrs, w_nns):
+                dists = np.linalg.norm((rrs - rr), axis=1)
+                # don't allow repeats of vertices; breaks stuff downstream
+                idx = 0
+                sort_inds = np.argsort(dists)
+                closest_idx = sort_inds[idx]
+                while pi[closest_idx] in new_verts[sr_idx]:
+                    idx += 1
+                    closest_idx = sort_inds[idx]
+                new_verts[sr_idx].append(pi[closest_idx])
+                new_rrs.append(rrs[closest_idx])
+                new_nns.append(nn)
+            new_gain.append(reduce_gain)
+            logger.info(f"Patch constructed from {fwd['nsource']} of "
+                        f"{sum([ps['nuse'] for ps in p_src])} sources, "
+                        f"reduced to {n_comps} components.")
+
+    new_nns = np.vstack(new_nns)
+    new_rrs = np.vstack(new_rrs)
+    new_gain = np.hstack(new_gain)
+    new_fwd = _convert_forward_patch(fwd, new_nns, new_rrs, new_gain, new_verts)
+
+
+    return new_fwd
+
+def subspace_pursuit_level(fwd, evo, cov, s, mu, lambda2, max_iter=200):
+    # conflict matrix for mutual coherence of gain matrix columns
+    gain = fwd["sol"]["data"].copy()
+    src_n = gain.shape[1]
+    confl_mat = np.zeros((src_n, src_n), dtype=bool)
+    wh_gain, _ = _whiten_gain(gain, fwd["info"])
+    for src_i in range(src_n):
+        for src_j in range(src_i+1, src_n):
+            inner = np.inner(wh_gain[:, src_i], wh_gain[:, src_j])
+            if inner > (mu * (np.linalg.norm(wh_gain[:, src_i]) *
+                              np.linalg.norm(wh_gain[:, src_j]))):
+                confl_mat[src_i, src_j] = 1
+    # initial proxy matrix and top s sources
+    proxy, _ = _proxy_matrix(evo, fwd, cov, lambda2)
+    support = _select_s(proxy, confl_mat, s)
+    # initial residual
+    proxy_fwd = _restrict_forward_patch(fwd, support)
+    _, resid = _proxy_matrix(evo, proxy_fwd, cov, lambda2)
+    # now iterate
+    all_supports = [set(support)]
+    support = set([])
+    for iter_idx in range(max_iter):
+        logger.info(f"Iteration {iter_idx}")
+        proxy, _ = _proxy_matrix(resid, fwd, cov, lambda2)
+        proxy_support = _select_s(proxy, confl_mat, s)
+        test_support = _union_s(np.array(list(all_supports[-1])),
+                                proxy_support)
+        proxy_fwd = _restrict_forward_patch(fwd, test_support)
+        est_proxy, _ = _proxy_matrix(evo, proxy_fwd, cov, lambda2)
+        est_support_inds = _select_s(est_proxy, confl_mat, s)
+        est_support = test_support[est_support_inds]
+        est_fwd = _restrict_forward_patch(fwd, est_support)
+        _, resid = _proxy_matrix(evo, est_fwd, cov, lambda2)
+        support = set(est_support)
+        if support in all_supports:
+            break
+        else:
+            all_supports.append(set(support))
+
+    inv = make_inverse_operator(evo.info, est_fwd, cov, loose=0, fixed=True,
+                                depth=None, verbose="warning")
+    # run this because we need the explained variance later
+    inv = _check_or_prepare(inv, evo.nave, lambda2, "MNE",
+                            None, False)
+    stc, resid = apply_inverse(evo, inv, lambda2, method="MNE",
+                               return_residual=True, verbose=None,
+                               prepared=True)
+    var_expl = _expl_var(evo, resid, inv)
+    return stc, est_fwd, var_expl
+
+def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
+                     fwd0=None, return_fwd0=False, return_as_dipoles=False,
+                     patch_comp_n=.9, max_iter=200, n_jobs=1):
+    if isinstance(s, int):
+        s = [s] * len(spacings)
+    elif len(s) != len(spacings):
+        raise ValueError("Length of s must be 1 or equal to # of spacings.")
+
+    if fwd0:
+        fwd = fwd0.copy()
+    else:
+        fwd = make_patch_forward(subject, spacings[0], bem, evo.info, trans,
+                                 patch_comp_n=patch_comp_n, n_jobs=16)
+        if return_fwd0:
+            fwd0 = fwd.copy()
+
+    for spacing_idx in range(len(spacings)-1):
+        stc, _, var_expl = subspace_pursuit_level(fwd, evo, cov, s[spacing_idx],
+                                                  mu, lambda2,
+                                                  max_iter=max_iter)
+        logger.info(f"Spacing {spacings[spacing_idx]} explained {var_expl:.1f}"
+                     " percent variance.")
+        new_verts = telescope_vertices(subject, spacings[spacing_idx],
+                                       spacings[spacing_idx+1],
+                                       stc.vertices, n_jobs=16)
+        fwd = make_patch_forward(subject, spacings[spacing_idx+1], bem,
+                                 evo.info, trans, restrict_to=new_verts,
+                                 patch_comp_n=0.9, n_jobs=n_jobs)
+
+    out, est_fwd, var_expl = subspace_pursuit_level(fwd, evo, cov,
+                                                    s[spacing_idx], mu,
+                                                    lambda2, max_iter=max_iter)
+
+    logger.info(f"Spacing {spacings[spacing_idx+1]} explained {var_expl:.1f} "
+                 " percent variance.")
+    if return_as_dipoles:
+        out = make_dipoles_from_stc(out, est_fwd)
+    if return_fwd0:
+        return out, fwd0
+    else:
+        return out

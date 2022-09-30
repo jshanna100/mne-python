@@ -2735,7 +2735,8 @@ def _set_source_space_vertices(src, vertices):
         s['inuse'].fill(0)
         s['nuse'] = len(v)
         s['vertno'] = np.array(v)
-        s['inuse'][s['vertno']] = 1
+        if len(v):
+            s['inuse'][s['vertno']] = 1
         s['use_tris'] = np.array([[]], int)
         s['nuse_tri'] = np.array([0])
         # This will fix 'patch_info' and 'pinfo'
