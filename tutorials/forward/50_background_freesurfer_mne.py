@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 .. _tut-freesurfer-mne:
 
@@ -6,8 +7,8 @@ How MNE uses FreeSurfer's outputs
 =================================
 
 This tutorial explains how MRI coordinate frames are handled in MNE-Python,
-and how MNE-Python integrates with FreeSurfer for handling MRI data and
-source space data in general.
+and how MNE-Python integrates with FreeSurfer for handling MRI data and source
+space data in general.
 
 As usual we'll start by importing the necessary packages; for this tutorial
 that includes :mod:`nibabel` to handle loading the MRI images (MNE-Python also
@@ -17,8 +18,6 @@ readable on top of an MRI image.
 """
 
 # %%
-
-import os
 
 import numpy as np
 import nibabel
@@ -41,9 +40,9 @@ from mne.io.constants import FIFF
 # :meth:`~nibabel.spatialimages.SpatialImage.orthoview` method to view it.
 
 data_path = mne.datasets.sample.data_path()
-subjects_dir = os.path.join(data_path, 'subjects')
+subjects_dir = data_path / 'subjects'
 subject = 'sample'
-t1_fname = os.path.join(subjects_dir, subject, 'mri', 'T1.mgz')
+t1_fname = subjects_dir / subject / 'mri' / 'T1.mgz'
 t1 = nibabel.load(t1_fname)
 t1.orthoview()
 
@@ -84,7 +83,8 @@ print(data.shape)
 # location ``(x, y, z)`` in the *scanner's native coordinate frame* is saved in
 # the image's *affine transformation*.
 #
-# .. sidebar:: Under the hood
+# .. admonition:: Under the hood
+#     :class: sidebar note
 #
 #     ``mne.transforms.apply_trans`` effectively does a matrix multiplication
 #     (i.e., :func:`numpy.dot`), with a little extra work to handle the shape
@@ -114,8 +114,7 @@ print('Our voxel has real-world coordinates {}, {}, {} (mm)'
 ras_coords_mm = np.array([1, -17, -18])
 inv_affine = np.linalg.inv(t1.affine)
 i_, j_, k_ = np.round(apply_trans(inv_affine, ras_coords_mm)).astype(int)
-print('Our real-world coordinates correspond to voxel ({}, {}, {})'
-      .format(i_, j_, k_))
+print(f'Our real-world coordinates correspond to voxel ({i_}, {j_}, {k_})')
 
 # %%
 # Let's write a short function to visualize where our voxel lies in an
@@ -218,7 +217,7 @@ imshow_mri(data, t1, vox, dict(MRI=xyz_mri), 'MRI slice')
 # %%
 # Knowing these relationships and being mindful about transformations, we
 # can get from a point in any given space to any other space. Let's start out
-# by plotting the Nasion on a saggital MRI slice:
+# by plotting the Nasion on a sagittal MRI slice:
 
 fiducials = mne.coreg.get_mni_fiducials(subject, subjects_dir=subjects_dir)
 nasion_mri = [d for d in fiducials if d['ident'] == FIFF.FIFFV_POINT_NASION][0]
@@ -242,22 +241,23 @@ imshow_mri(data, t1, nasion_vox, dict(MRI=nasion_mri),
 #
 # Let's look at the nasion in the head coordinate frame:
 
-info = mne.io.read_info(
-    os.path.join(data_path, 'MEG', 'sample', 'sample_audvis_raw.fif'))
+info = mne.io.read_info(data_path / 'MEG' / 'sample' /
+                        'sample_audvis_raw.fif')
 nasion_head = [d for d in info['dig'] if
                d['kind'] == FIFF.FIFFV_POINT_CARDINAL and
                d['ident'] == FIFF.FIFFV_POINT_NASION][0]
 print(nasion_head)  # note it's in "head" coordinates
 
 # %%
-# .. sidebar:: Head coordinate frame
+# .. admonition:: Head coordinate frame
+#     :class: sidebar note
 #
-#      The head coordinate frame in MNE is the "Neuromag" head coordinate
-#      frame. The origin is given by the intersection between a line connecting
-#      the LPA and RPA and the line orthogonal to it that runs through the
-#      nasion. It is also in RAS orientation, meaning that +X runs through
-#      the RPA, +Y goes through the nasion, and +Z is orthogonal to these
-#      pointing upward. See :ref:`coordinate_systems` for more information.
+#     The head coordinate frame in MNE is the "Neuromag" head coordinate
+#     frame. The origin is given by the intersection between a line connecting
+#     the LPA and RPA and the line orthogonal to it that runs through the
+#     nasion. It is also in RAS orientation, meaning that +X runs through
+#     the RPA, +Y goes through the nasion, and +Z is orthogonal to these
+#     pointing upward. See :ref:`coordinate_systems` for more information.
 #
 # Notice that in "head" coordinate frame the nasion has values of 0 for the
 # ``x`` and ``z`` directions (which makes sense given that the nasion is used
@@ -272,8 +272,8 @@ print(nasion_head)  # note it's in "head" coordinates
 # :func:`mne.setup_volume_source_space`, and :func:`mne.compute_source_morph`
 # make extensive use of these coordinate frames.
 
-trans = mne.read_trans(
-    os.path.join(data_path, 'MEG', 'sample', 'sample_audvis_raw-trans.fif'))
+trans = mne.read_trans(data_path / 'MEG' / 'sample' /
+                       'sample_audvis_raw-trans.fif')
 
 # first we transform from head to MRI, and *then* convert to millimeters
 nasion_dig_mri = apply_trans(trans, nasion_head['r']) * 1000
@@ -294,7 +294,7 @@ imshow_mri(data, t1, nasion_dig_vox, dict(MRI=nasion_dig_mri),
 # (``tris``) with shape ``(n_tris, 3)`` defining which vertices in ``rr`` form
 # each triangular facet of the mesh.
 
-fname = os.path.join(subjects_dir, subject, 'surf', 'rh.white')
+fname = subjects_dir / subject / 'surf' / 'rh.white'
 rr_mm, tris = mne.read_surface(fname)
 print(f'rr_mm.shape == {rr_mm.shape}')
 print(f'tris.shape == {tris.shape}')
@@ -307,7 +307,7 @@ renderer = mne.viz.backends.renderer.create_3d_figure(
     size=(600, 600), bgcolor='w', scene=False)
 gray = (0.5, 0.5, 0.5)
 renderer.mesh(*rr_mm.T, triangles=tris, color=gray)
-view_kwargs = dict(elevation=90, azimuth=0)
+view_kwargs = dict(elevation=90, azimuth=0)  # camera at +X with +Z up
 mne.viz.set_3d_view(
     figure=renderer.figure, distance=350, focalpoint=(0., 0., 40.),
     **view_kwargs)
@@ -341,15 +341,14 @@ fig.axes[0].tricontour(rr_vox[:, 2], rr_vox[:, 1], tris, rr_vox[:, 0],
 # sphere, a given vertex in the source (sample) mesh can be mapped easily
 # to the same location in the destination (fsaverage) mesh, and vice-versa.
 
-renderer_kwargs = dict(bgcolor='w', smooth_shading=False)
+renderer_kwargs = dict(bgcolor='w')
 renderer = mne.viz.backends.renderer.create_3d_figure(
     size=(800, 400), scene=False, **renderer_kwargs)
 curvs = [
-    (mne.surface.read_curvature(os.path.join(
-        subjects_dir, subj, 'surf', 'rh.curv'),
-        binary=False) > 0).astype(float)
+    (mne.surface.read_curvature(subjects_dir / subj / 'surf' / 'rh.curv',
+                                binary=False) > 0).astype(float)
     for subj in ('sample', 'fsaverage') for _ in range(2)]
-fnames = [os.path.join(subjects_dir, subj, 'surf', surf)
+fnames = [subjects_dir / subj / 'surf' / surf
           for subj in ('sample', 'fsaverage')
           for surf in ('rh.white', 'rh.sphere')]
 y_shifts = [-450, -150, 450, 150]
@@ -366,30 +365,34 @@ y = (y[1:] + y[:-1]) / 2. - width / 2.
 renderer.quiver3d(zero, y, zero,
                   zero, [1] * 3, zero, 'k', width, 'arrow')
 view_kwargs['focalpoint'] = (0., 0., 0.)
-mne.viz.set_3d_view(figure=renderer.figure, distance=1000, **view_kwargs)
+mne.viz.set_3d_view(figure=renderer.figure, distance=1050, **view_kwargs)
 renderer.show()
 
 # %%
 # Let's look a bit more closely at the spherical alignment by overlaying the
-# two spherical meshes as wireframes and zooming way in (the purple points are
-# separated by about 1 mm):
+# two spherical meshes as wireframes and zooming way in (the vertices of the
+# black mesh are separated by about 1 mm):
 
 cyan = '#66CCEE'
-purple = '#AA3377'
+black = 'k'
 renderer = mne.viz.backends.renderer.create_3d_figure(
     size=(800, 800), scene=False, **renderer_kwargs)
-fnames = [os.path.join(subjects_dir, subj, 'surf', 'rh.sphere')
-          for subj in ('sample', 'fsaverage')]
-colors = [cyan, purple]
-for name, color in zip(fnames, colors):
-    this_rr, this_tri = mne.read_surface(name)
+surfs = [mne.read_surface(subjects_dir / subj / 'surf' / 'rh.sphere')
+         for subj in ('fsaverage', 'sample')]
+colors = [black, cyan]
+line_widths = [2, 3]
+for surf, color, line_width in zip(surfs, colors, line_widths):
+    this_rr, this_tri = surf
+    # cull to the subset of tris with all positive X (toward camera)
+    this_tri = this_tri[(this_rr[this_tri, 0] > 0).all(axis=1)]
     renderer.mesh(*this_rr.T, triangles=this_tri, color=color,
-                  representation='wireframe')
-mne.viz.set_3d_view(figure=renderer.figure, distance=20, **view_kwargs)
+                  representation='wireframe', line_width=line_width,
+                  render_lines_as_tubes=True)
+mne.viz.set_3d_view(figure=renderer.figure, distance=150, **view_kwargs)
 renderer.show()
 
 # %%
-# You can see that the fsaverage (purple) mesh is uniformly spaced, and the
+# You can see that the fsaverage (black) mesh is uniformly spaced, and the
 # mesh for subject "sample" (in cyan) has been deformed along the spherical
 # surface by
 # FreeSurfer. This deformation is designed to optimize the sulcal-gyral
@@ -402,21 +405,24 @@ renderer.show()
 # easily be achieved by subsampling in the spherical space. To do this, we
 # use a recursively subdivided icosahedron or octahedron. For example, let's
 # load a standard oct-6 source space, and at the same zoom level as before
-# visualize how it subsampled the dense mesh:
+# visualize how it subsampled (in red) the dense mesh:
 
-src = mne.read_source_spaces(os.path.join(subjects_dir, 'sample', 'bem',
-                                          'sample-oct-6-src.fif'))
+src = mne.read_source_spaces(subjects_dir / 'sample' / 'bem' /
+                             'sample-oct-6-src.fif')
 print(src)
 
 # sphinx_gallery_thumbnail_number = 10
-blue = '#4477AA'
+red = '#EE6677'
 renderer = mne.viz.backends.renderer.create_3d_figure(
     size=(800, 800), scene=False, **renderer_kwargs)
-rr_sph, _ = mne.read_surface(fnames[0])
-for tris, color in [(src[1]['tris'], cyan), (src[1]['use_tris'], blue)]:
+rr_sph, _ = mne.read_surface(fnames[1])
+for tris, color in [(src[1]['tris'], cyan), (src[1]['use_tris'], red)]:
+    # cull to the subset of tris with all positive X (toward camera)
+    tris = tris[(rr_sph[tris, 0] > 0).all(axis=1)]
     renderer.mesh(*rr_sph.T, triangles=tris, color=color,
-                  representation='wireframe')
-mne.viz.set_3d_view(figure=renderer.figure, distance=20, **view_kwargs)
+                  representation='wireframe', line_width=3,
+                  render_lines_as_tubes=True)
+mne.viz.set_3d_view(figure=renderer.figure, distance=150, **view_kwargs)
 renderer.show()
 
 # %%
@@ -432,7 +438,7 @@ for y_shift, tris in zip(y_shifts, tris):
     renderer.mesh(*this_rr.T, triangles=tris, color=None, scalars=curvs[0],
                   colormap='copper_r', vmin=-0.2, vmax=1.2)
 renderer.quiver3d([0], [-width / 2.], [0], [0], [1], [0], 'k', width, 'arrow')
-mne.viz.set_3d_view(figure=renderer.figure, distance=400, **view_kwargs)
+mne.viz.set_3d_view(figure=renderer.figure, distance=450, **view_kwargs)
 renderer.show()
 
 

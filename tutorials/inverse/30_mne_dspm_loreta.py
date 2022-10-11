@@ -1,16 +1,16 @@
+# -*- coding: utf-8 -*-
 """
 .. _tut-inverse-methods:
 
-Source localization with MNE/dSPM/sLORETA/eLORETA
-=================================================
+========================================================
+Source localization with MNE, dSPM, sLORETA, and eLORETA
+========================================================
 
 The aim of this tutorial is to teach you how to compute and apply a linear
 minimum-norm inverse method on evoked/raw/epochs data.
 """
 
 # %%
-
-import os.path as op
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,8 +23,7 @@ from mne.minimum_norm import make_inverse_operator, apply_inverse
 # Process MEG data
 
 data_path = sample.data_path()
-raw_fname = op.join(data_path, 'MEG', 'sample',
-                    'sample_audvis_filt-0-40_raw.fif')
+raw_fname = data_path / 'MEG' / 'sample' / 'sample_audvis_filt-0-40_raw.fif'
 
 raw = mne.io.read_raw_fif(raw_fname)  # already has an average reference
 events = mne.find_events(raw, stim_channel='STI 014')
@@ -56,8 +55,7 @@ fig_cov, fig_spectra = mne.viz.plot_cov(noise_cov, raw.info)
 
 evoked = epochs.average().pick('meg')
 evoked.plot(time_unit='s')
-evoked.plot_topomap(times=np.linspace(0.05, 0.15, 5), ch_type='mag',
-                    time_unit='s')
+evoked.plot_topomap(times=np.linspace(0.05, 0.15, 5), ch_type='mag')
 
 # %%
 # It's also a good idea to look at whitened data:
@@ -72,7 +70,7 @@ del epochs, raw  # to save memory
 # one for your own data -- see :ref:`tut-forward` for information on how
 # to do it.
 
-fname_fwd = data_path + '/MEG/sample/sample_audvis-meg-oct-6-fwd.fif'
+fname_fwd = data_path / 'MEG' / 'sample' / 'sample_audvis-meg-oct-6-fwd.fif'
 fwd = mne.read_forward_solution(fname_fwd)
 
 # %%
@@ -130,7 +128,7 @@ residual.plot(axes=axes)
 
 vertno_max, time_max = stc.get_peak(hemi='rh')
 
-subjects_dir = data_path + '/subjects'
+subjects_dir = data_path / 'subjects'
 surfer_kwargs = dict(
     hemi='rh', subjects_dir=subjects_dir,
     clim=dict(kind='value', lims=[8, 12, 15]), views='lateral',

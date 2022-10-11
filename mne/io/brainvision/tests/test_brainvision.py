@@ -53,6 +53,10 @@ vhdr_mixed_lowpass_s_path = op.join(data_dir, 'test_mixed_lowpass_s.vhdr')
 data_path = testing.data_path(download=False)
 neuroone_vhdr = op.join(data_path, 'Brainvision', 'test_NO.vhdr')
 
+# AHDR exported with VAmp
+data_path = testing.data_path(download=False)
+vamp_ahdr = op.join(data_path, 'Brainvision', 'test_VAmp.ahdr')
+
 # Test for nanovolts as unit
 vhdr_units_path = op.join(data_dir, 'test_units.vhdr')
 
@@ -201,8 +205,10 @@ def test_vhdr_codepage_ansi(tmp_path):
     b'BrainVision Data Exchange %s File Version 1.0\n',
     # 2.0, space, core, comma
     b'Brain Vision Core Data Exchange %s File, Version 2.0\n',
-    # bad
+    # unsupported version
     b'Brain Vision Core Data Exchange %s File, Version 3.0\n',
+    # missing header
+    b'\n',
 ])
 def test_vhdr_versions(tmp_path, header):
     """Test BV reading with different header variants."""
@@ -217,23 +223,34 @@ def test_vhdr_versions(tmp_path, header):
             for line in fin:
                 # Common Infos section
                 if line.startswith(b'Brain'):
-                    line = header % b'Header'
+                    if header != b'\n':
+                        line = header % b'Header'
+                    else:
+                        line = header
                 fout.write(line)
     with open(use_vmrk_path, 'wb') as fout:
         with open(vmrk_path, 'rb') as fin:
             for line in fin:
                 # Common Infos section
                 if line.startswith(b'Brain'):
-                    line = header % b'Marker'
+                    if header != b'\n':
+                        line = header % b'Marker'
+                    else:
+                        line = header
                 fout.write(line)
 
-    if b'3.0' in header:  # bad case
-        with pytest.raises(ValueError, match=r'3\.0.*Contact MNE-Python'):
+    if (b'3.0' in header):  # unsupported version
+        with pytest.warns(RuntimeWarning, match=r'3\.0.*Contact MNE-Python'):
             read_raw_brainvision(use_vhdr_path)
         return
-    raw = read_raw_brainvision(use_vhdr_path)
-    data_new, _ = raw[:]
-    assert_allclose(data_new, data_expected, atol=1e-15)
+    elif header == b'\n':  # no version header
+        with pytest.warns(RuntimeWarning, match='Missing header'):
+            read_raw_brainvision(use_vhdr_path)
+        return
+    else:
+        raw = read_raw_brainvision(use_vhdr_path)
+        data_new, _ = raw[:]
+        assert_allclose(data_new, data_expected, atol=1e-15)
 
 
 @pytest.mark.parametrize('data_sep', (b' ', b',', b'+'))
@@ -277,6 +294,7 @@ def test_ascii(tmp_path, data_sep):
         return
 
     raw = read_raw_brainvision(ascii_vhdr_path)
+    assert isinstance(raw.orig_format, str)
     data_new, times_new = raw[:]
     assert_allclose(data_new, data, atol=1e-15)
     assert_allclose(times_new, times)
@@ -596,7 +614,9 @@ def test_coodinates_extraction():
     diglist = raw.info['dig']
     coords = np.array([dig['r'] for dig in diglist])
     EXPECTED_SHAPE = (
-        len(raw.ch_names) - 4,  # HL, HR, Vb, ReRef are not set in dig
+        # HL, HR, Vb, ReRef are not set in dig
+        # but LPA, Nasion, RPA are estimated
+        len(raw.ch_names) - 4 + 3,
         3,
     )
     assert coords.shape == EXPECTED_SHAPE
@@ -779,3 +799,16 @@ def test_parse_impedance():
         raw = read_raw_brainvision(vhdr_mixed_lowpass_path,
                                    eog=['HEOG', 'VEOG'], misc=['ECG'])
     assert object_diff(expected_impedances, raw.impedances) == ''
+
+
+@testing.requires_testing_data
+def test_ahdr_format():
+    """Test case for parsing data in ahdr format."""
+    expected_num_channels = 6
+    expected_hp = 0.0
+    expected_lp = 250.0
+
+    raw = read_raw_brainvision(vamp_ahdr)
+    assert raw.info['nchan'] == expected_num_channels
+    assert raw.info['highpass'] == expected_hp
+    assert raw.info['lowpass'] == expected_lp

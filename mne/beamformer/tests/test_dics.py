@@ -24,7 +24,7 @@ from mne.surface import _compute_nearest
 from mne.time_frequency import CrossSpectralDensity, csd_morlet
 from mne.time_frequency.csd import _sym_mat_to_vector
 from mne.transforms import invert_transform, apply_trans
-from mne.utils import object_diff, requires_h5py, catch_logging
+from mne.utils import object_diff, requires_version, catch_logging
 
 data_path = testing.data_path(download=False)
 fname_raw = op.join(data_path, 'MEG', 'sample', 'sample_audvis_trunc_raw.fif')
@@ -144,7 +144,7 @@ def _make_rand_csd(info, csd):
 
 @pytest.mark.slowtest
 @testing.requires_testing_data
-@requires_h5py
+@requires_version('h5io')
 @idx_param
 @pytest.mark.parametrize('whiten', [
     pytest.param(False, marks=pytest.mark.slowtest),
@@ -368,7 +368,7 @@ def test_apply_dics_csd(_load_forward, idx, inversion, weight_norm):
         assert power.data[source_ind, 1] > power.data[source_ind, 0]
 
 
-@pytest.mark.parametrize('pick_ori', [None, 'normal', 'max-power'])
+@pytest.mark.parametrize('pick_ori', [None, 'normal', 'max-power', 'vector'])
 @pytest.mark.parametrize('inversion', ['single', 'matrix'])
 @idx_param
 def test_apply_dics_ori_inv(_load_forward, pick_ori, inversion, idx):
@@ -395,7 +395,7 @@ def test_apply_dics_ori_inv(_load_forward, pick_ori, inversion, idx):
     inds = np.triu_indices(csd.n_channels)
     csd_noise._data[...] = np.eye(csd.n_channels)[inds][:, np.newaxis]
     noise_power, f = apply_dics_csd(csd_noise, filters)
-    want_norm = 3 if pick_ori is None else 1.
+    want_norm = 3 if pick_ori in (None, 'vector') else 1
     assert_allclose(noise_power.data, want_norm, atol=1e-7)
 
     # Test filter with forward normalization instead of weight
@@ -429,11 +429,9 @@ def test_real(_load_forward, idx):
     reg = 1  # Lots of regularization for our toy dataset
     filters_real = make_dics(epochs.info, fwd_surf, csd, label=label, reg=reg,
                              real_filter=True, inversion='single')
-    # Also test here that no warings are thrown - implemented to check whether
+    # Also test here that no warnings are thrown - implemented to check whether
     # src should not be None warning occurs:
-    with pytest.warns(None) as w:
-        power, f = apply_dics_csd(csd, filters_real)
-    assert len(w) == 0
+    power, f = apply_dics_csd(csd, filters_real)
 
     assert f == [10, 20]
     dist = _fwd_dist(power, fwd_surf, vertices, source_ind)
@@ -506,9 +504,7 @@ def test_apply_dics_timeseries(_load_forward, idx):
     # Sanity checks on the resulting STC after applying DICS on epochs.
     # Also test here that no warnings are thrown - implemented to check whether
     # src should not be None warning occurs
-    with pytest.warns(None) as w:
-        stcs = apply_dics_epochs(epochs, filters)
-    assert len(w) == 0
+    stcs = apply_dics_epochs(epochs, filters)
 
     assert isinstance(stcs, list)
     assert len(stcs) == 1
@@ -589,6 +585,10 @@ def _cov_as_csd(cov, info):
 @pytest.mark.slowtest
 @pytest.mark.parametrize(
     'reg, pick_ori, weight_norm, use_cov, depth, lower, upper, real_filter', [
+        (0.05, 'vector', 'unit-noise-gain-invariant',
+         False, None, 26, 28, True),
+        (0.05, 'vector', 'unit-noise-gain', False, None, 13, 15, True),
+        (0.05, 'vector', 'nai', False, None, 13, 15, True),
         (0.05, None, 'unit-noise-gain-invariant', False, None, 26, 28, False),
         (0.05, None, 'unit-noise-gain-invariant', True, None, 40, 42, False),
         (0.05, None, 'unit-noise-gain-invariant', True, None, 40, 42, True),

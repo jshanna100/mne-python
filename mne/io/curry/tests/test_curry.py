@@ -5,12 +5,12 @@
 #
 # License: BSD-3-Clause
 
-import os.path as op
-import numpy as np
-from shutil import copyfile
 from datetime import datetime, timezone
+import os.path as op
+from shutil import copyfile
 
 import pytest
+import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 
 from mne.annotations import events_from_annotations
@@ -22,7 +22,8 @@ from mne.io.constants import FIFF
 from mne.io.edf import read_raw_bdf
 from mne.io.bti import read_raw_bti
 from mne.io.curry import read_raw_curry
-from mne.utils import check_version, catch_logging
+from mne.io.tests.test_raw import _test_raw_reader
+from mne.utils import check_version, catch_logging, _record_warnings
 from mne.annotations import read_annotations
 from mne.io.curry.curry import (_get_curry_version, _get_curry_file_structure,
                                 _read_events_curry, FILE_EXTENSIONS)
@@ -70,7 +71,7 @@ def bdf_curry_ref():
 @pytest.mark.parametrize('preload', [True, False])
 def test_read_raw_curry(fname, tol, preload, bdf_curry_ref):
     """Test reading CURRY files."""
-    with pytest.warns(None) as wrn:
+    with _record_warnings() as wrn:
         raw = read_raw_curry(fname, preload=preload)
 
     if not check_version('numpy', '1.16') and preload and fname.endswith(
@@ -87,15 +88,27 @@ def test_read_raw_curry(fname, tol, preload, bdf_curry_ref):
         assert_array_equal([ch[field] for ch in raw.info['chs']],
                            [ch[field] for ch in bdf_curry_ref.info['chs']])
 
-    raw.verbose = 'error'  # don't emit warnings about slow reading
-    assert_allclose(raw.get_data(), bdf_curry_ref.get_data(), atol=tol)
+    assert_allclose(raw.get_data(verbose='error'),
+                    bdf_curry_ref.get_data(), atol=tol)
 
     picks, start, stop = ["C3", "C4"], 200, 800
     assert_allclose(
-        raw.get_data(picks=picks, start=start, stop=stop),
+        raw.get_data(picks=picks, start=start, stop=stop, verbose='error'),
         bdf_curry_ref.get_data(picks=picks, start=start, stop=stop),
         rtol=tol)
     assert raw.info['dev_head_t'] is None
+
+
+@testing.requires_testing_data
+@pytest.mark.parametrize('fname', [
+    pytest.param(curry7_bdf_file, id='curry 7'),
+    pytest.param(curry8_bdf_file, id='curry 8'),
+    pytest.param(curry7_bdf_ascii_file, id='curry 7 ascii'),
+    pytest.param(curry8_bdf_ascii_file, id='curry 8 ascii'),
+])
+def test_read_raw_curry_test_raw(fname):
+    """Test read_raw_curry with _test_raw_reader."""
+    _test_raw_reader(read_raw_curry, fname=fname)
 
 
 # These values taken from a different recording but allow us to test

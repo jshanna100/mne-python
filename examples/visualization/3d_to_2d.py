@@ -1,14 +1,14 @@
+# -*- coding: utf-8 -*-
 """
 .. _ex-electrode-pos-2d:
 
-====================================================
-How to convert 3D electrode positions to a 2D image.
-====================================================
+===================================================
+How to convert 3D electrode positions to a 2D image
+===================================================
 
 Sometimes we want to convert a 3D representation of electrodes into a 2D
-image. For example, if we are using electrocorticography it is common to
-create scatterplots on top of a brain, with each point representing an
-electrode.
+image. For example, if we are using electrocorticography it is common to create
+scatterplots on top of a brain, with each point representing an electrode.
 
 In this example, we'll show two ways of doing this in MNE-Python. First,
 if we have the 3D locations of each electrode then we can use PyVista to
@@ -23,21 +23,23 @@ on the image.
 # License: BSD-3-Clause
 
 # %%
-from mne.io.fiff.raw import read_raw_fif
+from os.path import dirname
+from pathlib import Path
+
 import numpy as np
 from matplotlib import pyplot as plt
-from os import path as op
 
 import mne
+from mne.io.fiff.raw import read_raw_fif
 from mne.viz import ClickableImage  # noqa: F401
-from mne.viz import (plot_alignment, snapshot_brain_montage, set_3d_view)
+from mne.viz import plot_alignment, set_3d_view, snapshot_brain_montage
 
 misc_path = mne.datasets.misc.data_path()
-ecog_data_fname = op.join(misc_path, 'ecog', 'sample_ecog_ieeg.fif')
-subjects_dir = op.join(misc_path, 'ecog')
+subjects_dir = misc_path / 'ecog'
+ecog_data_fname = subjects_dir / 'sample_ecog_ieeg.fif'
 
 # We've already clicked and exported
-layout_path = op.join(op.dirname(mne.__file__), 'data', 'image')
+layout_path = Path(dirname(mne.__file__)) / 'data' / 'image'
 layout_name = 'custom_layout.lout'
 
 # %%
@@ -70,7 +72,7 @@ montage.apply_trans(trans)
 fig = plot_alignment(raw.info, trans=trans, subject='sample_ecog',
                      subjects_dir=subjects_dir, surfaces=dict(pial=0.9))
 set_3d_view(figure=fig, azimuth=20, elevation=80)
-xy, im = snapshot_brain_montage(fig, raw.info)
+xy, im = snapshot_brain_montage(fig, montage)
 
 # Convert from a dictionary to array to plot
 xy_pts = np.vstack([xy[ch] for ch in raw.ch_names])
@@ -117,7 +119,7 @@ ax.set_axis_off()
 # # Generate a layout from our clicks and normalize by the image
 # print('Generating and saving layout...')
 # lt = click.to_layout()
-# lt.save(op.join(layout_path, layout_name))  # save if we want
+# lt.save(layout_path / layout_name)  # save if we want
 
 # # We've already got the layout, load it
 lt = mne.channels.read_layout(layout_name, path=layout_path, scale=False)

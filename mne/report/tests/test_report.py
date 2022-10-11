@@ -19,16 +19,19 @@ import numpy as np
 import pytest
 from matplotlib import pyplot as plt
 
-from mne import Epochs, read_events, read_evokeds, read_cov, pick_channels_cov
+from mne import (Epochs, read_events, read_evokeds, read_cov,
+                 pick_channels_cov, create_info)
 from mne.report import report as report_mod
 from mne.report.report import CONTENT_ORDER
-from mne.io import read_raw_fif
+from mne.io import read_raw_fif, read_info, RawArray
 from mne.datasets import testing
 from mne.report import Report, open_report, _ReportScraper, report
-from mne.utils import requires_nibabel, Bunch, requires_h5py, requires_sklearn
+from mne.utils import (requires_nibabel, Bunch, requires_version,
+                       requires_sklearn)
 from mne.viz import plot_alignment
 from mne.io.write import DATE_NONE
 from mne.preprocessing import ICA
+from mne.epochs import make_metadata
 
 
 data_dir = testing.data_path(download=False)
@@ -130,7 +133,7 @@ def test_render_report(renderer_pyvistaqt, tmp_path, invisible_fig):
     # This can take forever, so let's make it fast
     # Also, make sure crop range is wide enough to avoid rendering bug
     evoked = epochs.average()
-    with pytest.warns(RuntimeWarning, match='tmax is not in Evoked'):
+    with pytest.warns(RuntimeWarning, match='tmax is not in time interval'):
         evoked.crop(0.1, 0.2)
     evoked.save(evoked_fname)
 
@@ -150,12 +153,12 @@ def test_render_report(renderer_pyvistaqt, tmp_path, invisible_fig):
     titles = [op.basename(x) for x in fnames if not x.endswith('-ave.fif')]
     titles.append(f'{op.basename(evoked_fname)}: {evoked.comment}')
 
-    content_names = [element.name for element in report._content]
+    _, _, content_titles, _ = report._content_as_html()
     for title in titles:
-        assert title in content_names
+        assert title in content_titles
         assert (''.join(report.html).find(title) != -1)
 
-    assert len(report._content) == len(fnames)
+    assert len(content_titles) == len(fnames)
 
     # Check saving functionality
     report.data_path = tempdir
@@ -167,8 +170,6 @@ def test_render_report(renderer_pyvistaqt, tmp_path, invisible_fig):
     assert f'{op.basename(evoked_fname)}: {evoked.comment}' in html
     assert 'Topographies' in html
     assert 'Global field power' in html
-
-    assert len(report._content) == len(fnames)
 
     # Check saving same report to new filename
     report.save(fname=op.join(tempdir, 'report2.html'), open_browser=False)
@@ -205,6 +206,23 @@ def test_render_report(renderer_pyvistaqt, tmp_path, invisible_fig):
 
     with pytest.raises(TypeError, match='It seems you passed a path'):
         report.add_figure(fig='foo', title='title')
+    with pytest.raises(TypeError, match='.*MNEQtBrowser.*Figure3D.*got.*'):
+        report.add_figure(fig=1., title='title')
+
+
+def test_render_mne_qt_browser(tmp_path, browser_backend):
+    """Test adding a mne_qt_browser (and matplotlib) raw plot."""
+    report = Report()
+    info = create_info(1, 1000., 'eeg')
+    data = np.zeros((1, 1000))
+    raw = RawArray(data, info)
+    fig = raw.plot()
+    name = fig.__class__.__name__
+    if browser_backend.name == 'matplotlib':
+        assert 'MNEBrowseFigure' in name
+    else:
+        assert 'MNEQtBrowser' in name or 'PyQtGraphBrowser' in name
+    report.add_figure(fig, title='raw')
 
 
 @testing.requires_testing_data
@@ -228,7 +246,7 @@ def test_render_report_extra(renderer_pyvistaqt, tmp_path, invisible_fig):
     assert op.isfile(fname)
     html = Path(fname).read_text(encoding='utf-8')
     # Projectors in Raw.info
-    assert 'SSP Projectors' in html
+    assert 'Projectors' in html
 
 
 def test_add_custom_css(tmp_path):
@@ -286,12 +304,12 @@ def test_render_non_fiff(tmp_path):
                         raw_butterfly=False)
 
     # Check correct paths and filenames
-    content_names = [element.name for element in report._content]
-    for fname in fnames_out:
+    _, _, content_titles, _ = report._content_as_html()
+    for fname in content_titles:
         assert (op.basename(fname) in
-                [op.basename(x) for x in content_names])
+                [op.basename(x) for x in content_titles])
 
-    assert len(report._content) == len(fnames_out)
+    assert len(content_titles) == len(fnames_out)
 
     report.data_path = tempdir
     fname = op.join(tempdir, 'report.html')
@@ -354,16 +372,22 @@ def test_report_raw_psd_and_date(tmp_path):
 @testing.requires_testing_data
 def test_render_add_sections(renderer, tmp_path):
     """Test adding figures/images to section."""
+    from pyvista.plotting import plotting
     tempdir = str(tmp_path)
     report = Report(subjects_dir=subjects_dir)
     # Check add_figure functionality
+    plt.close('all')
+    assert len(plt.get_fignums()) == 0
     fig = plt.plot([1, 2], [1, 2])[0].figure
+    assert len(plt.get_fignums()) == 1
 
     report.add_figure(fig=fig, title='evoked response', image_format='svg')
     assert 'caption' not in report._content[-1].html
+    assert len(plt.get_fignums()) == 1
 
     report.add_figure(fig=fig, title='evoked with caption', caption='descr')
     assert 'caption' in report._content[-1].html
+    assert len(plt.get_fignums()) == 1
 
     # Check add_image with png
     img_fname = op.join(tempdir, 'testimage.png')
@@ -375,10 +399,14 @@ def test_render_add_sections(renderer, tmp_path):
 
     evoked = read_evokeds(evoked_fname, condition='Left Auditory',
                           baseline=(-0.2, 0.0))
+    n_before = len(plotting._ALL_PLOTTERS)
     fig = plot_alignment(evoked.info, trans_fname, subject='sample',
                          subjects_dir=subjects_dir)
+    n_after = n_before + 1
+    assert n_after == len(plotting._ALL_PLOTTERS)
 
     report.add_figure(fig=fig, title='random image')
+    assert n_after == len(plotting._ALL_PLOTTERS)  # not closed
     assert (repr(report))
     fname = op.join(str(tmp_path), 'test.html')
     report.save(fname, open_browser=False)
@@ -518,7 +546,7 @@ def test_validate_input():
     items_new, captions_new, comments_new = values
 
 
-@requires_h5py
+@requires_version('h5io')
 def test_open_report(tmp_path):
     """Test the open_report function."""
     tempdir = str(tmp_path)
@@ -526,8 +554,9 @@ def test_open_report(tmp_path):
 
     # Test creating a new report through the open_report function
     fig1 = _get_example_figures()[0]
-    with open_report(hdf5, subjects_dir=subjects_dir) as report:
-        assert report.subjects_dir == subjects_dir
+    this_sub_dir = tempdir
+    with open_report(hdf5, subjects_dir=this_sub_dir) as report:
+        assert report.subjects_dir == this_sub_dir
         assert report.fname == hdf5
         report.add_figure(fig=fig1, title='evoked response')
     # Exiting the context block should have triggered saving to HDF5
@@ -544,11 +573,11 @@ def test_open_report(tmp_path):
     # Check parameters when loading a report
     pytest.raises(ValueError, open_report, hdf5, foo='bar')  # non-existing
     pytest.raises(ValueError, open_report, hdf5, subjects_dir='foo')
-    open_report(hdf5, subjects_dir=subjects_dir)  # This should work
+    open_report(hdf5, subjects_dir=this_sub_dir)  # This should work
 
     # Check that the context manager doesn't swallow exceptions
     with pytest.raises(ZeroDivisionError):
-        with open_report(hdf5, subjects_dir=subjects_dir) as report:
+        with open_report(hdf5, subjects_dir=this_sub_dir) as report:
             1 / 0
 
 
@@ -693,7 +722,21 @@ def test_manual_report_2d(tmp_path, invisible_fig):
     cov = read_cov(cov_fname)
     cov = pick_channels_cov(cov, raw.ch_names)
     events = read_events(events_fname)
-    epochs = Epochs(raw=raw, events=events, baseline=None)
+    event_id = {
+        'auditory/left': 1, 'auditory/right': 2, 'visual/left': 3,
+        'visual/right': 4, 'face': 5, 'buttonpress': 32
+    }
+    metadata, metadata_events, metadata_event_id = make_metadata(
+        events=events, event_id=event_id, tmin=-0.2, tmax=0.5,
+        sfreq=raw.info['sfreq']
+    )
+    epochs_without_metadata = Epochs(
+        raw=raw, events=events, event_id=event_id, baseline=None
+    )
+    epochs_with_metadata = Epochs(
+        raw=raw, events=metadata_events, event_id=metadata_event_id,
+        baseline=None, metadata=metadata
+    )
     evokeds = read_evokeds(evoked_fname)
     evoked = evokeds[0].pick('eeg')
 
@@ -701,14 +744,43 @@ def test_manual_report_2d(tmp_path, invisible_fig):
         ica = (ICA(n_components=2, max_iter=1, random_state=42)
                .fit(inst=raw.copy().crop(tmax=1)))
     ica_ecg_scores = ica_eog_scores = np.array([3, 0])
-    ica_ecg_evoked = ica_eog_evoked = epochs.average()
+    ica_ecg_evoked = ica_eog_evoked = epochs_without_metadata.average()
 
     r.add_raw(raw=raw, title='my raw data', tags=('raw',), psd=True,
               projs=False)
+    r.add_raw(raw=raw, title='my raw data 2', psd=False, projs=False,
+              butterfly=1)
     r.add_events(events=events_fname, title='my events',
                  sfreq=raw.info['sfreq'])
-    r.add_epochs(epochs=epochs, title='my epochs', tags=('epochs',), psd=False,
-                 projs=False)
+    r.add_epochs(
+        epochs=epochs_without_metadata, title='my epochs', tags=('epochs',),
+        psd=False, projs=False
+    )
+    r.add_epochs(
+        epochs=epochs_without_metadata, title='my epochs 2', psd=1, projs=False
+    )
+    r.add_epochs(
+        epochs=epochs_without_metadata, title='my epochs 2', psd=True,
+        projs=False
+    )
+    assert 'Metadata' not in r.html[-1]
+
+    # Try with metadata
+    r.add_epochs(
+        epochs=epochs_with_metadata, title='my epochs with metadata',
+        psd=False, projs=False
+    )
+    assert 'Metadata' in r.html[-1]
+
+    with pytest.raises(
+        ValueError,
+        match='requested to calculate PSD on a duration'
+    ):
+        r.add_epochs(
+            epochs=epochs_with_metadata, title='my epochs 2', psd=100000000,
+            projs=False
+        )
+
     r.add_evokeds(evokeds=evoked, noise_cov=cov_fname,
                   titles=['my evoked 1'], tags=('evoked',), projs=False,
                   n_time_points=2)
@@ -718,13 +790,20 @@ def test_manual_report_2d(tmp_path, invisible_fig):
     with pytest.raises(RuntimeError, match='not preloaded'):
         r.add_ica(ica=ica, title='ica', inst=raw)
     r.add_ica(
-        ica=ica, title='my ica with inst',
+        ica=ica, title='my ica with raw inst',
         inst=raw.copy().load_data(),
         picks=[0],
         ecg_evoked=ica_ecg_evoked,
         eog_evoked=ica_eog_evoked,
         ecg_scores=ica_ecg_scores,
         eog_scores=ica_eog_scores
+    )
+    epochs_baseline = epochs_without_metadata.copy().load_data()
+    epochs_baseline.apply_baseline((None, 0))
+    r.add_ica(
+        ica=ica, title='my ica with epochs inst',
+        inst=epochs_baseline,
+        picks=[0],
     )
     r.add_covariance(cov=cov, info=raw_fname, title='my cov')
     r.add_forward(forward=fwd_fname, title='my forward', subject='sample',
@@ -738,15 +817,18 @@ def test_manual_report_2d(tmp_path, invisible_fig):
     for ch in evoked_no_ch_locs.info['chs']:
         ch['loc'][:3] = np.nan
 
-    with pytest.warns(RuntimeWarning, match='No EEG channel locations'):
+    with pytest.warns(
+        RuntimeWarning,
+        match='No EEG channel locations found, cannot create joint plot'
+    ):
         r.add_evokeds(
             evokeds=evoked_no_ch_locs, titles=['evoked no chan locs'],
-            tags=('evoked',), projs=True, n_time_points=1
+            tags=('evoked',), projs=False, n_time_points=1
         )
     assert 'Time course' not in r._content[-1].html
     assert 'Topographies' not in r._content[-1].html
     assert evoked.info['projs']  # only then the following test makes sense
-    assert 'SSP' not in r._content[-1].html
+    assert 'Projectors' not in r._content[-1].html
     assert 'Global field power' in r._content[-1].html
 
     # Drop locations from Info used for projs
@@ -754,7 +836,10 @@ def test_manual_report_2d(tmp_path, invisible_fig):
     for ch in info_no_ch_locs['chs']:
         ch['loc'][:3] = np.nan
 
-    with pytest.warns(RuntimeWarning, match='No channel locations found'):
+    with pytest.raises(
+        ValueError,
+        match='does not contain.*channel locations'
+    ):
         r.add_projs(info=info_no_ch_locs, title='Projs no chan locs')
 
     # Drop locations from ICA
@@ -783,8 +868,20 @@ def test_manual_report_2d(tmp_path, invisible_fig):
 def test_manual_report_3d(tmp_path, renderer):
     """Simulate adding 3D sections."""
     r = Report(title='My Report')
-    r.add_trans(trans=trans_fname, info=raw_fname, title='my coreg',
-                subject='sample', subjects_dir=subjects_dir)
+    info = read_info(raw_fname)
+    with info._unlock():
+        dig, info['dig'] = info['dig'], []
+    add_kwargs = dict(trans=trans_fname, info=info, subject='sample',
+                      subjects_dir=subjects_dir)
+    with pytest.warns(RuntimeWarning, match='could not be calculated'):
+        r.add_trans(title='coreg no dig', **add_kwargs)
+    with info._unlock():
+        info['dig'] = dig
+    # TODO: We should probably speed this up. We could expose an arg to allow
+    # use of sparse rather than dense head, and also possibly an arg to specify
+    # which views to actually show. Both of these could probably be useful to
+    # end-users, too.
+    r.add_trans(title='my coreg', **add_kwargs)
     r.add_bem(subject='sample', subjects_dir=subjects_dir, title='my bem',
               decim=100)
     r.add_inverse_operator(
@@ -823,3 +920,38 @@ def test_sorting(tmp_path):
 
     r.save(fname=op.join(tmp_path, 'report.html'), sort_content=True,
            open_browser=False)
+
+
+@pytest.mark.parametrize(
+    ('tags', 'str_or_array', 'wrong_dtype', 'invalid_chars'),
+    [
+        # wrong dtype
+        (123, False, True, False),
+        ([1, 2, 3], True, True, False),
+        (['foo', 1], True, True, False),
+        # invalid characters
+        (['foo bar'], True, False, True),
+        (['foo"'], True, False, True),
+        (['foo\n'], True, False, True),
+        # all good
+        ('foo', True, False, False),
+        (['foo'], True, False, False),
+        (['foo', 'bar'], True, False, False),
+        (np.array(['foo', 'bar']), True, False, False)
+    ]
+)
+def test_tags(tags, str_or_array, wrong_dtype, invalid_chars):
+    """Test handling of invalid tags."""
+    r = Report()
+
+    if not str_or_array:
+        with pytest.raises(TypeError, match='must be a string.*or an array.*'):
+            r.add_code(code='foo', title='bar', tags=tags)
+    elif wrong_dtype:
+        with pytest.raises(TypeError, match='tags must be strings'):
+            r.add_code(code='foo', title='bar', tags=tags)
+    elif invalid_chars:
+        with pytest.raises(ValueError, match='contained invalid characters'):
+            r.add_code(code='foo', title='bar', tags=tags)
+    else:
+        r.add_code(code='foo', title='bar', tags=tags)

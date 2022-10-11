@@ -1,4 +1,7 @@
+# -*- coding: utf-8 -*-
 """
+.. _ex-eog:
+
 ========================
 Show EOG artifact timing
 ========================
@@ -26,7 +29,8 @@ data_path = sample.data_path()
 
 # %%
 # Set parameters
-raw_fname = data_path + '/MEG/sample/sample_audvis_filt-0-40_raw.fif'
+meg_path = data_path / 'MEG' / 'sample'
+raw_fname = meg_path / 'sample_audvis_filt-0-40_raw.fif'
 
 # Setup for reading the raw data
 raw = io.read_raw_fif(raw_fname, preload=True)
@@ -49,7 +53,7 @@ data = np.sum((data.astype(int) & eog_event_id) == eog_event_id, axis=0)
 # %%
 # Plot EOG artifact distribution
 fig, ax = plt.subplots()
-ax.stem(1e3 * epochs.times, data, use_line_collection=True)
+ax.stem(1e3 * epochs.times, data)
 ax.set(xlabel='Times (ms)',
        ylabel='Blink counts (from %s trials)' % len(epochs))
 fig.tight_layout()

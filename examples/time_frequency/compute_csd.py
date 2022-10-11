@@ -1,7 +1,10 @@
+# -*- coding: utf-8 -*-
 """
-==================================================
+.. _ex-csd-matrix:
+
+=============================================
 Compute a cross-spectral density (CSD) matrix
-==================================================
+=============================================
 
 A cross-spectral density (CSD) matrix is similar to a covariance matrix, but in
 the time-frequency domain. It is the first step towards computing
@@ -18,8 +21,6 @@ the CSD:
 # License: BSD-3-Clause
 
 # %%
-from matplotlib import pyplot as plt
-
 import mne
 from mne.datasets import sample
 from mne.time_frequency import csd_fourier, csd_multitaper, csd_morlet
@@ -35,8 +36,9 @@ n_jobs = 1
 # %%
 # Loading the sample dataset.
 data_path = sample.data_path()
-fname_raw = data_path + '/MEG/sample/sample_audvis_raw.fif'
-fname_event = data_path + '/MEG/sample/sample_audvis_raw-eve.fif'
+meg_path = data_path / 'MEG' / 'sample'
+fname_raw = meg_path / 'sample_audvis_raw.fif'
+fname_event = meg_path / 'sample_audvis_raw-eve.fif'
 raw = mne.io.read_raw_fif(fname_raw)
 events = mne.read_events(fname_event)
 
@@ -80,11 +82,13 @@ csd_wav = csd_morlet(epochs, frequencies, decim=10, n_jobs=n_jobs)
 # The resulting :class:`mne.time_frequency.CrossSpectralDensity` objects have a
 # plotting function we can use to compare the results of the different methods.
 # We're plotting the mean CSD across frequencies.
-csd_fft.mean().plot()
-plt.suptitle('short-term Fourier transform')
-
-csd_mt.mean().plot()
-plt.suptitle('adaptive multitapers')
-
-csd_wav.mean().plot()
-plt.suptitle('Morlet wavelet transform')
+# :func:`mne.time_frequency.CrossSpectralDensity.plot()` returns a list of
+# created figures; in this case, each returned list has only one figure
+# so we use a Python trick of including a comma after our variable name
+# to assign the figure (not the list) to our ``fig`` variable:
+plot_dict = {'Short-time Fourier transform': csd_fft,
+             'Adaptive multitapers': csd_mt,
+             'Morlet wavelet transform': csd_wav}
+for title, csd in plot_dict.items():
+    fig, = csd.mean().plot()
+    fig.suptitle(title)

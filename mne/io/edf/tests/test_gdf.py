@@ -19,8 +19,8 @@ from mne.io.tests.test_raw import _test_raw_reader
 from mne import pick_types, find_events, events_from_annotations
 
 data_path = testing.data_path(download=False)
-gdf1_path = op.join(data_path, 'GDF', 'test_gdf_1.25')
-gdf2_path = op.join(data_path, 'GDF', 'test_gdf_2.20')
+gdf1_path = str(op.join(data_path, 'GDF', 'test_gdf_1.25'))
+gdf2_path = str(op.join(data_path, 'GDF', 'test_gdf_2.20'))
 gdf_1ch_path = op.join(data_path, 'GDF', 'test_1ch.gdf')
 
 
@@ -137,3 +137,10 @@ def test_gdf_exclude_channels():
     assert 'Cz' not in raw.ch_names
     assert 'Pz' not in raw.ch_names
     assert 'Oz' not in raw.ch_names
+
+
+@testing.requires_testing_data
+def test_gdf_include():
+    """Test reading GDF data with include."""
+    raw = read_raw_gdf(gdf1_path + '.gdf', include=('FP1', 'O1'))
+    assert sorted(raw.ch_names) == ['FP1', 'O1']

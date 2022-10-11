@@ -20,14 +20,13 @@ import traceback
 import numpy as np
 
 from ..utils import _check_option, _validate_type
-from ..fixes import _get_args
 from ._logging import logger, verbose, warn
 
 
-def _pl(x, non_pl=''):
+def _pl(x, non_pl='', pl='s'):
     """Determine if plural should be used."""
     len_x = x if isinstance(x, (int, np.generic)) else len(x)
-    return non_pl if len_x == 1 else 's'
+    return non_pl if len_x == 1 else pl
 
 
 def _explain_exception(start=-1, stop=None, prefix='> '):
@@ -133,30 +132,60 @@ def run_subprocess(command, return_code=False, verbose=None, *args, **kwargs):
         while True:
             do_break = p.poll() is not None
             # read all current lines without blocking
-            while True:
+            while True:  # process stdout
                 try:
                     out = out_q.get(timeout=0.01)
                 except Empty:
                     break
                 else:
                     out = out.decode('utf-8')
-                    logger.info(out)
+                    # Strip newline at end of the string, otherwise we'll end
+                    # up with two subsequent newlines (as the logger adds one)
+                    #
+                    # XXX Once we drop support for Python <3.9, uncomment the
+                    # following line and remove the if/else block below.
+                    #
+                    # log_out = out.removesuffix('\n')
+                    if sys.version_info[:2] >= (3, 9):
+                        log_out = out.removesuffix('\n')
+                    elif out.endswith('\n'):
+                        log_out = out[:-1]
+                    else:
+                        log_out = out
+
+                    logger.info(log_out)
                     all_out += out
-            while True:
+
+            while True:  # process stderr
                 try:
                     err = err_q.get(timeout=0.01)
                 except Empty:
                     break
                 else:
                     err = err.decode('utf-8')
+                    # Strip newline at end of the string, otherwise we'll end
+                    # up with two subsequent newlines (as the logger adds one)
+                    #
+                    # XXX Once we drop support for Python <3.9, uncomment the
+                    # following line and remove the if/else block below.
+                    #
+                    # err_out = err.removesuffix('\n')
+                    if sys.version_info[:2] >= (3, 9):
+                        err_out = err.removesuffix('\n')
+                    elif err.endswith('\n'):
+                        err_out = err[:-1]
+                    else:
+                        err_out = err
+
                     # Leave this as logger.warning rather than warn(...) to
                     # mirror the logger.info above for stdout. This function
                     # is basically just a version of subprocess.call, and
                     # shouldn't emit Python warnings due to stderr outputs
                     # (the calling function can check for stderr output and
                     # emit a warning if it wants).
-                    logger.warning(err)
+                    logger.warning(err_out)
                     all_err += err
+
             if do_break:
                 break
     output = (all_out, all_err)
@@ -166,7 +195,7 @@ def run_subprocess(command, return_code=False, verbose=None, *args, **kwargs):
     elif p.returncode:
         print(output)
         err_fun = subprocess.CalledProcessError.__init__
-        if 'output' in _get_args(err_fun):
+        if 'output' in inspect.signature(err_fun).parameters:
             raise subprocess.CalledProcessError(p.returncode, command, output)
         else:
             raise subprocess.CalledProcessError(p.returncode, command)
@@ -326,6 +355,14 @@ def _file_like(obj):
     return all(callable(getattr(obj, name, None)) for name in ('read', 'seek'))
 
 
+def _fullname(obj):
+    klass = obj.__class__
+    module = klass.__module__
+    if module == 'builtins':
+        return klass.__qualname__
+    return module + '.' + klass.__qualname__
+
+
 def _assert_no_instances(cls, when=''):
     __tracebackhide__ = True
     n = 0
@@ -339,7 +376,8 @@ def _assert_no_instances(cls, when=''):
             check = False
         if check:
             if cls.__name__ == 'Brain':
-                ref.append(f'Brain._cleaned = {obj._cleaned}')
+                ref.append(
+                    f'Brain._cleaned = {getattr(obj, "_cleaned", None)}')
             rr = gc.get_referrers(obj)
             count = 0
             for r in rr:
@@ -347,17 +385,24 @@ def _assert_no_instances(cls, when=''):
                         r is not globals() and \
                         r is not locals() and \
                         not inspect.isframe(r):
-                    if isinstance(r, (list, dict)):
+                    if isinstance(r, (list, dict, tuple)):
                         rep = f'len={len(r)}'
                         r_ = gc.get_referrers(r)
-                        types = (x.__class__.__name__ for x in r_)
+                        types = (_fullname(x) for x in r_)
                         types = "/".join(sorted(set(
                             x for x in types if x is not None)))
                         rep += f', {len(r_)} referrers: {types}'
                         del r_
                     else:
                         rep = repr(r)[:100].replace('\n', ' ')
-                    ref.append(f'{r.__class__.__name__}: {rep}')
+                        # If it's a __closure__, get more information
+                        if rep.startswith('<cell at '):
+                            try:
+                                rep += f' ({repr(r.cell_contents)[:100]})'
+                            except Exception:
+                                pass
+                    name = _fullname(r)
+                    ref.append(f'{name}: {rep}')
                     count += 1
                 del r
             del rr
@@ -390,3 +435,32 @@ def _resource_path(submodule, filename):
     except ImportError:
         from pkg_resources import resource_filename
         return resource_filename(submodule, filename)
+
+
+def repr_html(f):
+    """Decorate _repr_html_ methods.
+
+    If a _repr_html_ method is decorated with this decorator, the repr in a
+    notebook will show HTML or plain text depending on the config value
+    MNE_REPR_HTML (by default "true", which will render HTML).
+
+    Parameters
+    ----------
+    f : function
+        The function to decorate.
+
+    Returns
+    -------
+    wrapper : function
+        The decorated function.
+    """
+    from ..utils import get_config
+
+    def wrapper(*args, **kwargs):
+        if get_config("MNE_REPR_HTML", "true").lower() == "false":
+            import html
+            r = "<pre>" + html.escape(repr(args[0])) + "</pre>"
+            return r.replace("\n", "<br/>")
+        else:
+            return f(*args, **kwargs)
+    return wrapper

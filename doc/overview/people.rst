@@ -16,7 +16,9 @@ Alexandre Gramfort is the Benevolent Dictator for Life (BDFL)
 Steering Council
 ----------------
 
+* `Adam Li`_
 * `Alex Gramfort`_
+* `Alex Rockhill`_
 * `Britta Westner`_
 * `Clemens Brunner`_
 * `Daniel McCloy`_
@@ -30,6 +32,18 @@ Steering Council
 * `Richard Höchenberger`_
 * `Robert Luke`_
 * `Stefan Appelhoff`_
+
+
+.. _governance-cpgrl:
+
+Community Participation Guidelines Response Leads
+-------------------------------------------------
+
+See our `Community Participation Guidelines <https://github.com/mne-tools/.github/blob/main/CODE_OF_CONDUCT.md>`__ for explanation. Current Response Leads are:
+
+* `Daniel McCloy`_
+* `Eric Larson`_
+
 
 Institutional Partners
 ----------------------

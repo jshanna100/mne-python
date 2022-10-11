@@ -123,9 +123,9 @@ def _get_artemis123_info(fname, pos_fname=None):
 
     for k in ['Temporal Filter Active?', 'Decimation Active?',
               'Spatial Filter Active?']:
-        if(header_info[k] != 'FALSE'):
+        if header_info[k] != 'FALSE':
             warn('%s - set to but is not supported' % k)
-    if(header_info['filter_hist']):
+    if header_info['filter_hist']:
         warn('Non-Empty Filter history found, BUT is not supported' % k)
 
     # build mne info struct
@@ -194,7 +194,7 @@ def _get_artemis123_info(fname, pos_fname=None):
             t['unit'] = FIFF.FIFF_UNIT_T
             t['unit_mul'] = FIFF.FIFF_UNITM_F
 
-        # 3 axis referance magnetometers
+        # 3 axis reference magnetometers
         elif (chan['name'] in ref_mag_names):
             t['coil_type'] = FIFF.FIFFV_COIL_ARTEMIS123_REF_MAG
             t['kind'] = FIFF.FIFFV_REF_MEG_CH
@@ -326,7 +326,7 @@ class RawArtemis123(BaseRaw):
 
         super(RawArtemis123, self).__init__(
             info, preload, filenames=[input_fname], raw_extras=[header_info],
-            last_samps=last_samps, orig_format=np.float32,
+            last_samps=last_samps, orig_format="single",
             verbose=verbose)
 
         if add_head_trans:

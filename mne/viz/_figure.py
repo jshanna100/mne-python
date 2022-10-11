@@ -20,9 +20,9 @@ from ..defaults import _handle_default
 from ..utils import logger, _validate_type, _check_option
 from ..io.pick import _DATA_CH_TYPES_SPLIT
 from .backends._utils import VALID_BROWSE_BACKENDS
-from .utils import _get_color_list, _setup_plot_projector
+from .utils import _get_color_list, _setup_plot_projector, _show_browser
 
-MNE_BROWSE_BACKEND = None
+MNE_BROWSER_BACKEND = None
 backend = None
 
 
@@ -66,6 +66,8 @@ class BrowserBase(ABC):
         else:
             raise TypeError('Expected an instance of Raw, Epochs, or ICA, '
                             f'got {type(inst)}.')
+
+        logger.debug(f'Opening {self.mne.instance_type} browser...')
 
         self.mne.ica_type = None
         if self.mne.instance_type == 'ica':
@@ -127,6 +129,11 @@ class BrowserBase(ABC):
             self.mne.midpoints = np.convolve(self.mne.boundary_times,
                                              np.ones(2), mode='valid') / 2
 
+        # initialize picks and projectors
+        self._update_picks()
+        if not self.mne.instance_type == 'ica':
+            self._update_projector()
+
     # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
     # ANNOTATIONS
     # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -135,10 +142,6 @@ class BrowserBase(ABC):
         """Get the unique labels in the raw object and added in the UI."""
         return sorted(set(self.mne.inst.annotations.description) |
                       set(self.mne.new_annotation_labels))
-
-    def _toggle_draggable_annotations(self):
-        """Enable/disable draggable annotation edges."""
-        self.mne.draggable_annotations = not self.mne.draggable_annotations
 
     def _setup_annotation_colors(self):
         """Set up colors for annotations; init some annotation vars."""
@@ -251,6 +254,8 @@ class BrowserBase(ABC):
                            self.mne.ch_start + self.mne.n_channels)
             self.mne.picks = self.mne.ch_order[_slice]
             self.mne.n_channels = len(self.mne.picks)
+        assert isinstance(self.mne.picks, np.ndarray)
+        assert self.mne.picks.dtype.kind == 'i'
 
     def _make_butterfly_selections_dict(self):
         """Make an altered copy of the selections dict for butterfly mode."""
@@ -298,12 +303,13 @@ class BrowserBase(ABC):
             # subtract one sample from tstart before searchsorted, to make sure
             # we land on the left side of the boundary time (avoid precision
             # errors)
-            ix = np.searchsorted(self.mne.boundary_times,
-                                 self.mne.t_start - self.mne.sampling_period)
-            item = slice(ix, ix + self.mne.n_epochs)
+            ix_start = np.searchsorted(self.mne.boundary_times,
+                                       self.mne.t_start -
+                                       self.mne.sampling_period)
+            ix_stop = ix_start + self.mne.n_epochs
+            item = slice(ix_start, ix_stop)
             data = np.concatenate(self.mne.inst.get_data(item=item), axis=-1)
-            times = np.arange(len(self.mne.inst) * len(self.mne.inst.times)
-                              )[start:stop] / self.mne.info['sfreq']
+            times = np.arange(start, stop) / self.mne.info['sfreq']
             return data, times
 
     def _apply_filter(self, data, start, stop, picks):
@@ -327,28 +333,29 @@ class BrowserBase(ABC):
             data[_picks, _start:_stop] = this_data
 
     def _process_data(self, data, start, stop, picks,
-                      signals=None):
+                      thread=None):
         """Update self.mne.data after user interaction."""
         # apply projectors
         if self.mne.projector is not None:
-            if signals:
-                signals.processText.emit('Applying Projectors...')
+            # thread is the loading-thread only available in Qt-backend
+            if thread:
+                thread.processText.emit('Applying Projectors...')
             data = self.mne.projector @ data
         # get only the channels we're displaying
         data = data[picks]
         # remove DC
         if self.mne.remove_dc:
-            if signals:
-                signals.processText.emit('Removing DC...')
-            data -= data.mean(axis=1, keepdims=True)
+            if thread:
+                thread.processText.emit('Removing DC...')
+            data -= np.nanmean(data, axis=1, keepdims=True)
         # apply filter
         if self.mne.filter_coefs is not None:
-            if signals:
-                signals.processText.emit('Apply Filter...')
+            if thread:
+                thread.processText.emit('Apply Filter...')
             self._apply_filter(data, start, stop, picks)
         # scale the data for display in a 1-vertical-axis-unit slot
-        if signals:
-            signals.processText.emit('Scale Data...')
+        if thread:
+            thread.processText.emit('Scale Data...')
         this_names = self.mne.ch_names[picks]
         this_types = self.mne.ch_types[picks]
         stims = this_types == 'stim'
@@ -389,17 +396,24 @@ class BrowserBase(ABC):
 
     def _close(self, event):
         """Handle close events (via keypress or window [x])."""
+        from matplotlib.pyplot import close
+
+        logger.debug(f'Closing {self.mne.instance_type} browser...')
         # write out bad epochs (after converting epoch numbers to indices)
         if self.mne.instance_type == 'epochs':
             bad_ixs = np.in1d(self.mne.inst.selection,
                               self.mne.bad_epochs).nonzero()[0]
             self.mne.inst.drop(bad_ixs)
+            logger.info('The following epochs were marked as bad '
+                        'and are dropped:\n'
+                        f'{self.mne.bad_epochs}')
         # write bad channels back to instance (don't do this for proj;
         # proj checkboxes are for viz only and shouldn't modify the instance)
         if self.mne.instance_type in ('raw', 'epochs'):
             self.mne.inst.info['bads'] = self.mne.info['bads']
             logger.info(
-                f"Channels marked as bad: {self.mne.info['bads'] or 'none'}")
+                f"Channels marked as bad:\n"
+                f"{self.mne.info['bads'] or 'none'}")
         # ICA excludes
         elif self.mne.instance_type == 'ica':
             self.mne.ica.exclude = [self.mne.ica._ica_names.index(ch)
@@ -410,6 +424,7 @@ class BrowserBase(ABC):
         # Clean up child figures (don't pop(), child figs remove themselves)
         while len(self.mne.child_figs):
             fig = self.mne.child_figs[-1]
+            close(fig)
             self._close_event(fig)
 
     # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -499,15 +514,6 @@ class BrowserBase(ABC):
 
         return fig
 
-    def _toggle_epoch_histogram(self):
-        """Show or hide peak-to-peak histogram of channel amplitudes."""
-        if self.mne.instance_type == 'epochs':
-            if self.mne.fig_histogram is None:
-                self._create_epoch_histogram()
-            else:
-                from matplotlib.pyplot import close
-                close(self.mne.fig_histogram)
-
     def _create_epoch_histogram(self):
         """Create peak-to-peak histogram of channel amplitudes."""
         epochs = self.mne.inst
@@ -541,19 +547,34 @@ class BrowserBase(ABC):
                 ax.plot((reject, reject), (0, ax.get_ylim()[1]), color='r')
         # finalize
         fig.suptitle(title, y=0.99)
-        kwargs = dict(bottom=fig._inch_to_rel(0.5, horiz=False),
-                      top=1 - fig._inch_to_rel(0.5, horiz=False),
-                      left=fig._inch_to_rel(0.75),
-                      right=1 - fig._inch_to_rel(0.25))
+        if hasattr(fig, '_inch_to_rel'):
+            kwargs = dict(bottom=fig._inch_to_rel(0.5, horiz=False),
+                          top=1 - fig._inch_to_rel(0.5, horiz=False),
+                          left=fig._inch_to_rel(0.75),
+                          right=1 - fig._inch_to_rel(0.25))
+        else:
+            kwargs = dict()
         fig.subplots_adjust(hspace=0.7, **kwargs)
         self.mne.fig_histogram = fig
 
         return fig
 
     def _close_event(self, fig):
-        # This method is a fix for mpl issue #18609, which still seems to
-        # be a problem with matplotlib==3.4.
+        """Look at _close_event in mne.fixes.py for why this exists."""
         pass
+
+    def fake_keypress(self, key, fig=None):  # noqa: D400
+        """Pass a fake keypress to the figure.
+
+        Parameters
+        ----------
+        key : str
+            The key to fake (e.g., ``'a'``).
+        fig : instance of Figure
+            The figure to pass the keypress to.
+        """
+        return self._fake_keypress(key, fig=fig)
+
     # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
     # TEST METHODS
     # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -600,23 +621,53 @@ def _load_backend(backend_name):
     return backend
 
 
-def _get_browser(**kwargs):
+def _get_browser(show, block, **kwargs):
     """Instantiate a new MNE browse-style figure."""
     from .utils import _get_figsize_from_config
     figsize = kwargs.setdefault('figsize', _get_figsize_from_config())
     if figsize is None or np.any(np.array(figsize) < 8):
         kwargs['figsize'] = (8, 8)
+    kwargs['splash'] = True if show else False
+    if kwargs.get('theme', None) is None:
+        kwargs['theme'] = get_config('MNE_BROWSER_THEME', 'auto')
+    if kwargs.get('overview_mode', None) is None:
+        kwargs['overview_mode'] = get_config(
+            'MNE_BROWSER_OVERVIEW_MODE', 'channels')
+
     # Initialize browser backend
-    _init_browser_backend()
+    backend_name = get_browser_backend()
+    # Check mne-qt-browser compatibility
+    if backend_name == 'qt':
+        import mne_qt_browser
+        from .. import BaseEpochs
+        from ..fixes import _compare_version
+        is_ica = kwargs.get('ica', False)
+        is_epochs = isinstance(kwargs.get('inst', False), BaseEpochs)
+        not_compat = _compare_version(mne_qt_browser.__version__, '<', '0.2.0')
+        inst_str = 'ICA' if is_ica else 'Epochs'
+        if not_compat and (is_ica or is_epochs):
+            logger.info(f'You set the browser-backend to "qt" but your'
+                        f' current version {mne_qt_browser.__version__}'
+                        f' of mne-qt-browser is too low for {inst_str}.'
+                        f'Update with pip or conda.'
+                        f'Defaults to matplotlib.')
+            with use_browser_backend('matplotlib'):
+                # Initialize Browser
+                fig = backend._init_browser(**kwargs)
+                _show_browser(show=show, block=block, fig=fig)
+                return fig
 
     # Initialize Browser
-    browser = backend._init_browser(**kwargs)
+    fig = backend._init_browser(**kwargs)
+    _show_browser(show=show, block=block, fig=fig)
 
-    return browser
+    return fig
 
 
 def _check_browser_backend_name(backend_name):
     _validate_type(backend_name, str, 'backend_name')
+    backend_name = backend_name.lower()
+    backend_name = 'qt' if backend_name == 'pyqtgraph' else backend_name
     _check_option('backend_name', backend_name, VALID_BROWSE_BACKENDS)
     return backend_name
 
@@ -632,7 +683,9 @@ def set_browser_backend(backend_name, verbose=None):
     ----------
     backend_name : str
         The 2D browser backend to select. See Notes for the capabilities
-        of each backend (``'matplotlib'``, ``'pyqtgraph'``).
+        of each backend (``'qt'``, ``'matplotlib'``). The ``'qt'`` browser
+        requires `mne-qt-browser
+        <https://github.com/mne-tools/mne-qt-browser>`__.
     %(verbose)s
 
     Returns
@@ -648,54 +701,54 @@ def set_browser_backend(backend_name, verbose=None):
     .. table::
        :widths: auto
 
-       +--------------------------------------+------------+-----------+
-       | **2D browser function:**             | matplotlib | pyqtgraph |
-       +======================================+============+===========+
-       | :func:`plot_raw`                     | ✓          | ✓         |
-       +--------------------------------------+------------+-----------+
-       | :func:`plot_epochs`                  | ✓          |           |
-       +--------------------------------------+------------+-----------+
-       | :func:`plot_ica_sources`             | ✓          |           |
-       +--------------------------------------+------------+-----------+
-       +--------------------------------------+------------+-----------+
-       | **Feature:**                                                  |
-       +--------------------------------------+------------+-----------+
-       | Show Events                          | ✓          | ✓         |
-       +--------------------------------------+------------+-----------+
-       | Add/Edit/Remove Annotations          | ✓          | ✓         |
-       +--------------------------------------+------------+-----------+
-       | Toggle Projections                   | ✓          | ✓         |
-       +--------------------------------------+------------+-----------+
-       | Butterfly Mode                       | ✓          | ✓         |
-       +--------------------------------------+------------+-----------+
-       | Selection Mode                       | ✓          | ✓         |
-       +--------------------------------------+------------+-----------+
-       | Smooth Scrolling                     |            | ✓         |
-       +--------------------------------------+------------+-----------+
-       | Overview-Bar (with Z-Score-Mode)     |            | ✓         |
-       +--------------------------------------+------------+-----------+
+       +--------------------------------------+------------+----+
+       | **2D browser function:**             | matplotlib | qt |
+       +======================================+============+====+
+       | :func:`plot_raw`                     | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | :func:`plot_epochs`                  | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | :func:`plot_ica_sources`             | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       +--------------------------------------+------------+----+
+       | **Feature:**                                           |
+       +--------------------------------------+------------+----+
+       | Show Events                          | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | Add/Edit/Remove Annotations          | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | Toggle Projections                   | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | Butterfly Mode                       | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | Selection Mode                       | ✓          | ✓  |
+       +--------------------------------------+------------+----+
+       | Smooth Scrolling                     |            | ✓  |
+       +--------------------------------------+------------+----+
+       | Overview-Bar (with Z-Score-Mode)     |            | ✓  |
+       +--------------------------------------+------------+----+
 
     .. versionadded:: 0.24
     """
-    global MNE_BROWSE_BACKEND
-    old_backend_name = MNE_BROWSE_BACKEND
+    global MNE_BROWSER_BACKEND
+    old_backend_name = MNE_BROWSER_BACKEND
     backend_name = _check_browser_backend_name(backend_name)
-    if MNE_BROWSE_BACKEND != backend_name:
+    if MNE_BROWSER_BACKEND != backend_name:
         _load_backend(backend_name)
-        MNE_BROWSE_BACKEND = backend_name
+        MNE_BROWSER_BACKEND = backend_name
 
     return old_backend_name
 
 
 def _init_browser_backend():
-    global MNE_BROWSE_BACKEND
+    global MNE_BROWSER_BACKEND
 
-    # check if MNE_BROWSE_BACKEND is not None and valid or get it from config
-    loaded_backend = (MNE_BROWSE_BACKEND or
-                      get_config(key='MNE_BROWSE_BACKEND', default=None))
+    # check if MNE_BROWSER_BACKEND is not None and valid or get it from config
+    loaded_backend = (MNE_BROWSER_BACKEND or
+                      get_config(key='MNE_BROWSER_BACKEND', default=None))
     if loaded_backend is not None:
         set_browser_backend(loaded_backend)
-        return MNE_BROWSE_BACKEND
+        return MNE_BROWSER_BACKEND
     else:
         errors = dict()
         # Try import of valid browser backends
@@ -705,14 +758,14 @@ def _init_browser_backend():
             except ImportError as exc:
                 errors[name] = str(exc)
             else:
-                MNE_BROWSE_BACKEND = name
+                MNE_BROWSER_BACKEND = name
                 break
         else:
             raise RuntimeError(
                 'Could not load any valid 2D backend:\n' +
                 '\n'.join(f'{key}: {val}' for key, val in errors.items()))
 
-        return MNE_BROWSE_BACKEND
+        return MNE_BROWSER_BACKEND
 
 
 def get_browser_backend():
@@ -741,7 +794,7 @@ def use_browser_backend(backend_name):
 
     Parameters
     ----------
-    backend_name : {'matplotlib', 'pyqtgraph'}
+    backend_name : {'qt', 'matplotlib'}
         The 2D browser backend to use in the context.
     """
     old_backend = set_browser_backend(backend_name)

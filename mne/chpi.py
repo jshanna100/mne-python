@@ -26,6 +26,7 @@ import itertools
 
 from .event import find_events
 from .io.base import BaseRaw
+from .channels.channels import _get_meg_system
 from .io.kit.constants import KIT
 from .io.kit.kit import RawKIT as _RawKIT
 from .io.meas_info import _simplify_info, Info
@@ -46,7 +47,7 @@ from .transforms import (apply_trans, invert_transform, _angle_between_quats,
                          _quat_to_affine, als_ras_trans)
 from .utils import (verbose, logger, use_log_level, _check_fname, warn,
                     _validate_type, ProgressBar, _check_option, _pl,
-                    _on_missing)
+                    _on_missing, _verbose_safe_false)
 
 # Eventually we should add:
 #   hpicons
@@ -242,12 +243,13 @@ def extract_chpi_locs_kit(raw, stim_channel='MISC 064', *, verbose=None):
     _validate_type(stim_channel, str, 'stim_channel')
     _check_option('stim_channel', stim_channel, stim_chs)
     idx = raw.ch_names.index(stim_channel)
+    safe_false = _verbose_safe_false()
     events_on = find_events(
         raw, stim_channel=raw.ch_names[idx], output='onset',
-        verbose=False)[:, 0]
+        verbose=safe_false)[:, 0]
     events_off = find_events(
         raw, stim_channel=raw.ch_names[idx], output='offset',
-        verbose=False)[:, 0]
+        verbose=safe_false)[:, 0]
     bad = False
     if len(events_on) == 0 or len(events_off) == 0:
         bad = True
@@ -304,7 +306,7 @@ def get_chpi_info(info, on_missing='raise', verbose=None):
     Parameters
     ----------
     %(info_not_none)s
-    %(chpi_on_missing)s
+    %(on_missing_chpi)s
     %(verbose)s
 
     Returns
@@ -647,7 +649,7 @@ def _setup_ext_proj(info, ext_order):
     with info._unlock():
         info['projs'] = [proj]
     proj_op, _ = setup_proj(
-        info, add_eeg_ref=False, activate=False, verbose=False)
+        info, add_eeg_ref=False, activate=False, verbose=_verbose_safe_false())
     assert proj_op.shape == (len(meg_picks),) * 2
     return proj, proj_op, meg_picks
 
@@ -805,7 +807,7 @@ def compute_head_pos(info, chpi_locs, dist_limit=0.005, gof_limit=0.98,
         Minimum distance (m) to accept for coil position fitting.
     gof_limit : float
         Minimum goodness of fit to accept for each coil.
-    %(chpi_adjust_dig)s
+    %(adjust_dig_chpi)s
     %(verbose)s
 
     Returns
@@ -964,10 +966,10 @@ def compute_chpi_snr(raw, t_step_min=0.01, t_window='auto', ext_order=1,
         Raw data with cHPI information.
     t_step_min : float
         Minimum time step to use.
-    %(chpi_t_window)s
-    %(chpi_ext_order)s
-    %(raw_tmin)s
-    %(raw_tmax)s
+    %(t_window_chpi_t)s
+    %(ext_order_chpi)s
+    %(tmin_raw)s
+    %(tmax_raw)s
     %(verbose)s
 
     Returns
@@ -1001,10 +1003,10 @@ def compute_chpi_amplitudes(raw, t_step_min=0.01, t_window='auto',
         Raw data with cHPI information.
     t_step_min : float
         Minimum time step to use.
-    %(chpi_t_window)s
-    %(chpi_ext_order)s
-    %(raw_tmin)s
-    %(raw_tmax)s
+    %(t_window_chpi_t)s
+    %(ext_order_chpi)s
+    %(tmin_raw)s
+    %(tmax_raw)s
     %(verbose)s
 
     Returns
@@ -1129,7 +1131,7 @@ def compute_chpi_locs(info, chpi_amplitudes, t_step_max=1., too_close='raise',
     too_close : str
         How to handle HPI positions too close to the sensors,
         can be 'raise' (default), 'warning', or 'info'.
-    %(chpi_adjust_dig)s
+    %(adjust_dig_chpi)s
     %(verbose)s
 
     Returns
@@ -1176,13 +1178,14 @@ def compute_chpi_locs(info, chpi_amplitudes, t_step_max=1., too_close='raise',
     meg_coils = _concatenate_coils(_create_meg_coils(info['chs'], 'accurate'))
 
     # Set up external model for interference suppression
-    cov = make_ad_hoc_cov(info, verbose=False)
-    whitener, _ = compute_whitener(cov, info, verbose=False)
+    safe_false = _verbose_safe_false()
+    cov = make_ad_hoc_cov(info, verbose=safe_false)
+    whitener, _ = compute_whitener(cov, info, verbose=safe_false)
 
     # Make some location guesses (1 cm grid)
     R = np.linalg.norm(meg_coils[0], axis=1).min()
     guesses = _make_guesses(dict(R=R, r0=np.zeros(3)), 0.01, 0., 0.005,
-                            verbose=False)[0]['rr']
+                            verbose=safe_false)[0]['rr']
     logger.info('Computing %d HPI location guesses (1 cm grid in a %0.1f cm '
                 'sphere)' % (len(guesses), R * 100))
     fwd = _magnetic_dipole_field_vec(guesses, meg_coils, too_close)
@@ -1275,8 +1278,8 @@ def filter_chpi(raw, include_line=True, t_step=0.01, t_window='auto',
         If True, also filter line noise.
     t_step : float
         Time step to use for estimation, default is 0.01 (10 ms).
-    %(chpi_t_window)s
-    %(chpi_ext_order)s
+    %(t_window_chpi_t)s
+    %(ext_order_chpi)s
     allow_line_only : bool
         If True, allow filtering line noise only. The default is False,
         which only allows the function to run when cHPI information is present.
@@ -1310,7 +1313,7 @@ def filter_chpi(raw, include_line=True, t_step=0.01, t_window='auto',
                            'None, consider setting it to the line frequency')
     hpi = _setup_hpi_amplitude_fitting(
         raw.info, t_window, remove_aliased=True, ext_order=ext_order,
-        allow_empty=allow_line_only, verbose=False)
+        allow_empty=allow_line_only, verbose=_verbose_safe_false())
 
     fit_idxs = np.arange(0, len(raw.times) + hpi['n_window'] // 2, n_step)
     n_freqs = len(hpi['freqs'])
@@ -1383,3 +1386,42 @@ def _compute_good_distances(hpi_coil_dists, new_pos, dist_limit=0.005):
             exclude_coils = np.where(use_mask)[0][np.argmax(badness)]
             use_mask[exclude_coils] = False
     return use_mask, these_dists
+
+
+@verbose
+def get_active_chpi(raw, *, on_missing='raise', verbose=None):
+    """Determine how many HPI coils were active for a time point.
+
+    Parameters
+    ----------
+    raw : instance of Raw
+        Raw data with cHPI information.
+    %(on_missing_chpi)s
+    %(verbose)s
+
+    Returns
+    -------
+    n_active : array, shape (n_times)
+        The number of active cHPIs for every timepoint in raw.
+
+    Notes
+    -----
+    .. versionadded:: 1.2
+    """
+    # get meg system
+    system, _ = _get_meg_system(raw.info)
+
+    # check whether we have a neuromag system
+    if system not in ['122m', '306m']:
+        raise NotImplementedError(('Identifying active HPI channels'
+                                   ' is not implemented for other systems'
+                                   ' than neuromag.'))
+    # extract hpi info
+    chpi_info = get_chpi_info(raw.info, on_missing=on_missing)
+    if len(chpi_info[2]) == 0:
+        return np.zeros_like(raw.times)
+
+    # extract hpi time series and infer which one was on
+    chpi_ts = raw[chpi_info[1]][0].astype(int)
+    chpi_active = (chpi_ts & chpi_info[2][:, np.newaxis]).astype(bool)
+    return chpi_active.sum(axis=0)

@@ -10,7 +10,8 @@ from .constants import FIFF
 from .meas_info import _check_ch_keys
 from .proj import _has_eeg_average_ref_proj, make_eeg_average_ref_proj
 from .proj import setup_proj
-from .pick import pick_types, pick_channels, pick_channels_forward
+from .pick import (pick_types, pick_channels, pick_channels_forward,
+                   _ELECTRODE_CH_TYPES)
 from .base import BaseRaw
 from ..evoked import Evoked
 from ..epochs import BaseEpochs
@@ -181,7 +182,7 @@ def add_reference_channels(inst, ref_channels, copy=True):
             raise ValueError("Channel %s already specified in inst." % ch)
 
     # Once CAR is applied (active), don't allow adding channels
-    if _has_eeg_average_ref_proj(inst.info['projs'], check_active=True):
+    if _has_eeg_average_ref_proj(inst.info, check_active=True):
         raise RuntimeError('Average reference already applied to data.')
 
     if copy:
@@ -241,12 +242,16 @@ def add_reference_channels(inst, ref_channels, copy=True):
                      'loc': ref_dig_array}
         inst.info['chs'].append(chan_info)
         inst.info._update_redundant()
+    range_ = np.arange(1, len(ref_channels) + 1)
     if isinstance(inst, BaseRaw):
         inst._cals = np.hstack((inst._cals, [1] * len(ref_channels)))
-        range_ = np.arange(1, len(ref_channels) + 1)
         for pi, picks in enumerate(inst._read_picks):
             inst._read_picks[pi] = np.concatenate(
                 [picks, np.max(picks) + range_])
+    elif isinstance(inst, BaseEpochs):
+        picks = inst.picks
+        inst.picks = np.concatenate(
+            [picks, np.max(picks) + range_])
     inst.info._check_consistency()
     set_eeg_reference(inst, ref_channels=ref_channels, copy=False,
                       verbose=False)
@@ -272,7 +277,7 @@ def _check_can_reref(inst):
 @verbose
 def set_eeg_reference(inst, ref_channels='average', copy=True,
                       projection=False, ch_type='auto', forward=None,
-                      verbose=None):
+                      *, joint=False, verbose=None):
     """Specify which reference to use for EEG data.
 
     Use this function to explicitly specify the desired reference for EEG.
@@ -280,17 +285,22 @@ def set_eeg_reference(inst, ref_channels='average', copy=True,
     This function will re-reference the data according to the desired
     reference.
 
+    Note that it is also possible to re-reference the signal using a
+    Laplacian (LAP) "reference-free" transformation using the
+    :func:`.compute_current_source_density` function.
+
     Parameters
     ----------
     inst : instance of Raw | Epochs | Evoked
         Instance of Raw or Epochs with EEG channels and reference channel(s).
-    %(set_eeg_reference_ref_channels)s
+    %(ref_channels_set_eeg_reference)s
     copy : bool
         Specifies whether the data will be copied (True) or modified in-place
         (False). Defaults to True.
-    %(set_eeg_reference_projection)s
-    %(set_eeg_reference_ch_type)s
-    %(set_eeg_reference_forward)s
+    %(projection_set_eeg_reference)s
+    %(ch_type_set_eeg_reference)s
+    %(forward_set_eeg_reference)s
+    %(joint_set_eeg_reference)s
     %(verbose)s
 
     Returns
@@ -307,24 +317,37 @@ def set_eeg_reference(inst, ref_channels='average', copy=True,
     from ..forward import Forward
     _check_can_reref(inst)
 
+    ch_type = _get_ch_type(inst, ch_type)
+
     if projection:  # average reference projector
         if ref_channels != 'average':
             raise ValueError('Setting projection=True is only supported for '
                              'ref_channels="average", got %r.'
                              % (ref_channels,))
-        if _has_eeg_average_ref_proj(inst.info['projs']):
+        # We need verbose='error' here in case we add projs sequentially
+        if _has_eeg_average_ref_proj(
+                inst.info, ch_type=ch_type, verbose='error'):
             warn('An average reference projection was already added. The data '
                  'has been left untouched.')
         else:
             # Creating an average reference may fail. In this case, make
             # sure that the custom_ref_applied flag is left untouched.
             custom_ref_applied = inst.info['custom_ref_applied']
+
             try:
                 with inst.info._unlock():
                     inst.info['custom_ref_applied'] = \
                         FIFF.FIFFV_MNE_CUSTOM_REF_OFF
-                inst.add_proj(make_eeg_average_ref_proj(inst.info,
-                                                        activate=False))
+                if joint:
+                    inst.add_proj(
+                        make_eeg_average_ref_proj(
+                            inst.info, ch_type=ch_type, activate=False))
+                else:
+                    for this_ch_type in ch_type:
+                        inst.add_proj(
+                            make_eeg_average_ref_proj(
+                                inst.info, ch_type=this_ch_type,
+                                activate=False))
             except Exception:
                 with inst.info._unlock():
                     inst.info['custom_ref_applied'] = custom_ref_applied
@@ -339,7 +362,6 @@ def set_eeg_reference(inst, ref_channels='average', copy=True,
     del projection  # not used anymore
 
     inst = inst.copy() if copy else inst
-    ch_type = _get_ch_type(inst, ch_type)
     ch_dict = {**{type_: True for type_ in ch_type},
                'meg': False, 'ref_meg': False}
     ch_sel = [inst.ch_names[i] for i in pick_types(inst.info, **ch_dict)]
@@ -367,7 +389,7 @@ def set_eeg_reference(inst, ref_channels='average', copy=True,
 
 def _get_ch_type(inst, ch_type):
     _validate_type(ch_type, (str, list, tuple), 'ch_type')
-    valid_ch_types = ('auto', 'eeg', 'ecog', 'seeg', 'dbs')
+    valid_ch_types = ('auto',) + _ELECTRODE_CH_TYPES
     if isinstance(ch_type, str):
         _check_option('ch_type', ch_type, valid_ch_types)
         if ch_type != 'auto':
@@ -381,7 +403,7 @@ def _get_ch_type(inst, ch_type):
     # if ch_type is 'auto', search through list to find first reasonable
     # reference-able channel type.
     if ch_type == 'auto':
-        for type_ in ['eeg', 'ecog', 'seeg', 'dbs']:
+        for type_ in _ELECTRODE_CH_TYPES:
             if type_ in inst:
                 ch_type = [type_]
                 logger.info('%s channel type selected for '

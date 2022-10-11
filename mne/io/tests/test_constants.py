@@ -8,6 +8,7 @@ import shutil
 import zipfile
 
 import numpy as np
+import pooch
 import pytest
 
 from mne.io.constants import (FIFF, FWD, _coord_frame_named, _ch_kind_named,
@@ -16,15 +17,11 @@ from mne.io.constants import (FIFF, FWD, _coord_frame_named, _ch_kind_named,
                               _dig_cardinal_named)
 from mne.forward._make_forward import _read_coil_defs
 from mne.utils import requires_good_network
-from mne.utils.check import _soft_import
-
-# import pooch library for handling the dataset downloading
-pooch = _soft_import('pooch', 'dataset downloading', strict=True)
 
 
 # https://github.com/mne-tools/fiff-constants/commits/master
 REPO = 'mne-tools'
-COMMIT = 'aae5960007ee8a67dfc07535ea37d421d37dfe1b'
+COMMIT = '6d9ca9ce7fb44c63d429c2986a953500743dfb22'
 
 # These are oddities that we won't address:
 iod_dups = (355, 359)  # these are in both MEGIN and MNE files

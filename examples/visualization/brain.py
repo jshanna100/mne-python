@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 .. _ex-brain:
 
@@ -12,15 +13,16 @@ In this example, we'll show how to use :class:`mne.viz.Brain`.
 # License: BSD-3-Clause
 
 # %%
-# Plot a brain
-# ------------
+# Load data
+# ---------
 #
 # In this example we use the ``sample`` data which is data from a subject
 # being presented auditory and visual stimuli to display the functionality
 # of :class:`mne.viz.Brain` for plotting data on a brain.
 
-import os.path as op
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 
 import mne
 from mne.datasets import sample
@@ -28,8 +30,8 @@ from mne.datasets import sample
 print(__doc__)
 
 data_path = sample.data_path()
-subjects_dir = op.join(data_path, 'subjects')
-sample_dir = op.join(data_path, 'MEG', 'sample')
+subjects_dir = data_path / 'subjects'
+sample_dir = data_path / 'MEG' / 'sample'
 
 # %%
 # Add source information
@@ -40,7 +42,7 @@ sample_dir = op.join(data_path, 'MEG', 'sample')
 brain_kwargs = dict(alpha=0.1, background='white', cortex='low_contrast')
 brain = mne.viz.Brain('sample', subjects_dir=subjects_dir, **brain_kwargs)
 
-stc = mne.read_source_estimate(op.join(sample_dir, 'sample_audvis-meg'))
+stc = mne.read_source_estimate(sample_dir / 'sample_audvis-meg')
 stc.crop(0.09, 0.1)
 
 kwargs = dict(fmin=stc.data.min(), fmax=stc.data.max(), alpha=0.25,
@@ -93,21 +95,37 @@ brain.add_head(alpha=0.5)
 # the sensor positions can be displayed as well.
 
 brain = mne.viz.Brain('sample', subjects_dir=subjects_dir, **brain_kwargs)
-evoked = mne.read_evokeds(op.join(sample_dir, 'sample_audvis-ave.fif'))[0]
-trans = mne.read_trans(op.join(sample_dir, 'sample_audvis_raw-trans.fif'))
+evoked = mne.read_evokeds(sample_dir / 'sample_audvis-ave.fif')[0]
+trans = mne.read_trans(sample_dir / 'sample_audvis_raw-trans.fif')
 brain.add_sensors(evoked.info, trans)
 brain.show_view(distance=500)  # move back to show sensors
 
 # %%
-# Create a screenshot for exporting the brain image
-# -------------------------------------------------
+# Add current dipoles
+# -------------------
 #
-# For publication you may wish to take a static image of the brain,
-# for this use ``screenshot``.
+# Dipole modeling as in :ref:`tut-dipole-orientations` can be plotted on the
+# brain as well.
 
 brain = mne.viz.Brain('sample', subjects_dir=subjects_dir, **brain_kwargs)
-img = brain.screenshot()
+dip = mne.read_dipole(sample_dir / 'sample_audvis_set1.dip')
+cmap = plt.colormaps['YlOrRd']
+colors = [cmap(gof / dip.gof.max()) for gof in dip.gof]
+brain.add_dipole(dip, trans, colors=colors, scales=list(dip.amplitude * 1e8))
+brain.show_view(azimuth=-20, elevation=60, distance=300)
+img = brain.screenshot()  # for next section
+
+# %%
+# Create a screenshot for exporting the brain image
+# -------------------------------------------------
+# Also, we can a static image of the brain using ``screenshot`` (above),
+# which will allow us to add a colorbar. This is useful for figures in
+# publications.
+
 fig, ax = plt.subplots()
 ax.imshow(img)
 ax.axis('off')
-fig.suptitle('Brain')
+cax = fig.add_axes([0.9, 0.1, 0.05, 0.8])
+norm = Normalize(vmin=0, vmax=dip.gof.max())
+fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax)
+fig.suptitle('Dipole Fits Scaled by Amplitude and Colored by GOF')

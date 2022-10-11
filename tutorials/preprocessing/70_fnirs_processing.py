@@ -1,6 +1,8 @@
+# -*- coding: utf-8 -*-
 """
 .. _tut-fnirs-processing:
 
+================================================================
 Preprocessing functional near-infrared spectroscopy (fNIRS) data
 ================================================================
 
@@ -135,7 +137,7 @@ raw_od.info['bads'] = list(compress(raw_od.ch_names, sci < 0.5))
 # Next we convert the optical density data to haemoglobin concentration using
 # the modified Beer-Lambert law.
 
-raw_haemo = mne.preprocessing.nirs.beer_lambert_law(raw_od, ppf=6)
+raw_haemo = mne.preprocessing.nirs.beer_lambert_law(raw_od, ppf=0.1)
 raw_haemo.plot(n_channels=len(raw_haemo.ch_names),
                duration=500, show_scrollbars=False)
 
@@ -295,32 +297,27 @@ epochs['Tapping/Right'].average(picks='hbr').plot_topomap(
 
 fig, axes = plt.subplots(nrows=2, ncols=4, figsize=(9, 5),
                          gridspec_kw=dict(width_ratios=[1, 1, 1, 0.1]))
-vmin, vmax, ts = -8, 8, 9.0
+vlim = (-8, 8)
+ts = 9.0
 
 evoked_left = epochs['Tapping/Left'].average()
 evoked_right = epochs['Tapping/Right'].average()
 
 evoked_left.plot_topomap(ch_type='hbo', times=ts, axes=axes[0, 0],
-                         vmin=vmin, vmax=vmax, colorbar=False,
-                         **topomap_args)
+                         vlim=vlim, colorbar=False, **topomap_args)
 evoked_left.plot_topomap(ch_type='hbr', times=ts, axes=axes[1, 0],
-                         vmin=vmin, vmax=vmax, colorbar=False,
-                         **topomap_args)
+                         vlim=vlim, colorbar=False, **topomap_args)
 evoked_right.plot_topomap(ch_type='hbo', times=ts, axes=axes[0, 1],
-                          vmin=vmin, vmax=vmax, colorbar=False,
-                          **topomap_args)
+                          vlim=vlim, colorbar=False, **topomap_args)
 evoked_right.plot_topomap(ch_type='hbr', times=ts, axes=axes[1, 1],
-                          vmin=vmin, vmax=vmax, colorbar=False,
-                          **topomap_args)
+                          vlim=vlim, colorbar=False, **topomap_args)
 
 evoked_diff = mne.combine_evoked([evoked_left, evoked_right], weights=[1, -1])
 
 evoked_diff.plot_topomap(ch_type='hbo', times=ts, axes=axes[0, 2:],
-                         vmin=vmin, vmax=vmax, colorbar=True,
-                         **topomap_args)
+                         vlim=vlim, colorbar=True, **topomap_args)
 evoked_diff.plot_topomap(ch_type='hbr', times=ts, axes=axes[1, 2:],
-                         vmin=vmin, vmax=vmax, colorbar=True,
-                         **topomap_args)
+                         vlim=vlim, colorbar=True, **topomap_args)
 
 for column, condition in enumerate(
         ['Tapping Left', 'Tapping Right', 'Left-Right']):
@@ -338,7 +335,7 @@ mne.viz.plot_evoked_topo(epochs['Left'].average(picks='hbo'), color='b',
 mne.viz.plot_evoked_topo(epochs['Right'].average(picks='hbo'), color='r',
                          axes=axes, legend=False)
 
-# Tidy the legend.
+# Tidy the legend:
 leg_lines = [line for line in axes.lines if line.get_c() == 'b'][:1]
 leg_lines.append([line for line in axes.lines if line.get_c() == 'r'][0])
 fig.legend(leg_lines, ['Left', 'Right'], loc='lower right')

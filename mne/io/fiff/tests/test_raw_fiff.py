@@ -31,7 +31,7 @@ from mne import (concatenate_events, find_events, equalize_channels,
                  compute_proj_raw, pick_types, pick_channels, create_info,
                  pick_info)
 from mne.utils import (requires_pandas, assert_object_equal, _dt_to_stamp,
-                       requires_mne, run_subprocess,
+                       requires_mne, run_subprocess, _record_warnings,
                        assert_and_remove_boundary_annot)
 from mne.annotations import Annotations
 
@@ -98,7 +98,7 @@ def test_acq_skip(tmp_path):
     assert_allclose(raw_read[:][0], raw[:][0], atol=1e-17)
     # Saving with a bad buffer length emits warning
     raw.pick_channels(raw.ch_names[:2])
-    with pytest.warns(None) as w:
+    with _record_warnings() as w:
         raw.save(fname, buffer_size_sec=0.5, overwrite=True)
     assert len(w) == 0
     with pytest.warns(RuntimeWarning, match='did not fit evenly'):
@@ -107,10 +107,14 @@ def test_acq_skip(tmp_path):
 
 def test_fix_types():
     """Test fixing of channel types."""
-    for fname, change in ((hp_fif_fname, True), (test_fif_fname, False),
-                          (ctf_fname, False)):
+    for fname, change, bads in (
+        (hp_fif_fname, True, ["MEG0111"]),
+        (test_fif_fname, False, []),
+        (ctf_fname, False, [])
+    ):
         raw = read_raw_fif(fname)
-        mag_picks = pick_types(raw.info, meg='mag')
+        raw.info["bads"] = bads
+        mag_picks = pick_types(raw.info, meg='mag', exclude=[])
         other_picks = np.setdiff1d(np.arange(len(raw.ch_names)), mag_picks)
         # we don't actually have any files suffering from this problem, so
         # fake it
@@ -575,7 +579,8 @@ def test_load_bad_channels(tmp_path):
     # Test forcing the bad case
     with pytest.warns(RuntimeWarning, match='1 bad channel'):
         raw.load_bad_channels(bad_file_wrong, force=True)
-        # write it out, read it in, and check
+
+    # write it out, read it in, and check
     raw.save(tmp_path / 'foo_raw.fif', overwrite=True)
     raw_new = read_raw_fif(tmp_path / 'foo_raw.fif')
     assert correct_bads == raw_new.info['bads']
@@ -1044,7 +1049,8 @@ def test_crop():
     tmaxs /= sfreq
     tmins /= sfreq
 
-    # going in revere order so the last fname is the first file (need it later)
+    # going in reverse order so the last fname is the first file (need it
+    # later)
     raws = [None] * len(tmins)
     for ri, (tmin, tmax) in enumerate(zip(tmins, tmaxs)):
         raws[ri] = raw.copy().crop(tmin, tmax)
@@ -1068,6 +1074,19 @@ def test_crop():
     # degenerate
     with pytest.raises(ValueError, match='No samples.*when include_tmax=Fals'):
         raw.crop(0, 0, include_tmax=False)
+
+    # edge cases cropping to exact duration +/- 1 sample
+    data = np.zeros((1, 100))
+    info = create_info(1, 100)
+    raw = RawArray(data, info)
+    with pytest.raises(ValueError, match='tmax \\(1\\) must be less than or '):
+        raw.copy().crop(tmax=1, include_tmax=True)
+    raw1 = raw.copy().crop(tmax=1 - 1 / raw.info['sfreq'], include_tmax=True)
+    assert raw.n_times == raw1.n_times
+    raw2 = raw.copy().crop(tmax=1, include_tmax=False)
+    assert raw.n_times == raw2.n_times
+    raw3 = raw.copy().crop(tmax=1 - 1 / raw.info['sfreq'], include_tmax=False)
+    assert raw.n_times - 1 == raw3.n_times
 
 
 @testing.requires_testing_data
@@ -1105,7 +1124,7 @@ def test_resample(tmp_path, preload, n, npad):
     assert raw_resamp.get_data().shape[1] == raw_resamp.n_times
     assert raw.get_data().shape[0] == raw_resamp._data.shape[0]
     # test non-parallel on downsample
-    raw_resamp.resample(sfreq, n_jobs=1, npad=npad)
+    raw_resamp.resample(sfreq, n_jobs=None, npad=npad)
     assert raw_resamp.info['sfreq'] == sfreq
     assert raw.get_data().shape == raw_resamp._data.shape
     assert raw.first_samp == raw_resamp.first_samp
@@ -1279,17 +1298,15 @@ def test_to_data_frame():
     """Test raw Pandas exporter."""
     from pandas import Timedelta
     raw = read_raw_fif(test_fif_fname).crop(0, 1).load_data()
-    _, times = raw[0, :10]
     df = raw.to_data_frame(index='time')
     assert ((df.columns == raw.ch_names).all())
-    assert_array_equal(np.round(times * 1e3), df.index.values[:10])
     df = raw.to_data_frame(index=None)
     assert ('time' in df.columns)
     assert_array_equal(df.values[:, 1], raw._data[0] * 1e13)
     assert_array_equal(df.values[:, 3], raw._data[2] * 1e15)
     # test long format
     df_long = raw.to_data_frame(long_format=True)
-    assert(len(df_long) == raw.get_data().size)
+    assert len(df_long) == raw.get_data().size
     expected = ('time', 'channel', 'ch_type', 'value')
     assert set(expected) == set(df_long.columns)
     # test bad time format
@@ -1306,24 +1323,39 @@ def test_to_data_frame():
 @pytest.mark.parametrize('time_format', (None, 'ms', 'timedelta', 'datetime'))
 def test_to_data_frame_time_format(time_format):
     """Test time conversion in epochs Pandas exporter."""
-    from pandas import Timedelta, Timestamp
+    from pandas import Timedelta, Timestamp, to_timedelta
     raw = read_raw_fif(test_fif_fname, preload=True)
     # test time_format
     df = raw.to_data_frame(time_format=time_format)
     dtypes = {None: np.float64, 'ms': np.int64, 'timedelta': Timedelta,
               'datetime': Timestamp}
     assert isinstance(df['time'].iloc[0], dtypes[time_format])
+    # test values
+    _, times = raw[0, :10]
+    offset = 0.
+    if time_format == 'datetime':
+        times += raw.first_time
+        offset = raw.info['meas_date']
+    elif time_format == 'timedelta':
+        offset = Timedelta(0.)
+    funcs = {None: lambda x: x,
+             'ms': lambda x: np.rint(x * 1e3).astype(int),  # s → ms
+             'timedelta': partial(to_timedelta, unit='s'),
+             'datetime': partial(to_timedelta, unit='s')
+             }
+    assert_array_equal(funcs[time_format](times) + offset, df['time'][:10])
 
 
 def test_add_channels():
     """Test raw splitting / re-appending channel types."""
     rng = np.random.RandomState(0)
     raw = read_raw_fif(test_fif_fname).crop(0, 1).load_data()
+    assert raw._orig_units == {}
     raw_nopre = read_raw_fif(test_fif_fname, preload=False)
     raw_eeg_meg = raw.copy().pick_types(meg=True, eeg=True)
-    raw_eeg = raw.copy().pick_types(meg=False, eeg=True)
-    raw_meg = raw.copy().pick_types(meg=True, eeg=False)
-    raw_stim = raw.copy().pick_types(meg=False, eeg=False, stim=True)
+    raw_eeg = raw.copy().pick_types(eeg=True)
+    raw_meg = raw.copy().pick_types(meg=True)
+    raw_stim = raw.copy().pick_types(stim=True)
     raw_new = raw_meg.copy().add_channels([raw_eeg, raw_stim])
     assert (
         all(ch in raw_new.ch_names
@@ -1369,7 +1401,7 @@ def test_add_channels():
 
     pytest.raises(RuntimeError, raw_meg.add_channels, [raw_nopre])
     pytest.raises(RuntimeError, raw_meg.add_channels, [raw_badsf])
-    pytest.raises(AssertionError, raw_meg.add_channels, [raw_eeg])
+    pytest.raises(ValueError, raw_meg.add_channels, [raw_eeg])
     pytest.raises(ValueError, raw_meg.add_channels, [raw_meg])
     pytest.raises(TypeError, raw_meg.add_channels, raw_badsf)
 
@@ -1592,13 +1624,20 @@ def test_drop_channels_mixin():
 
     # Test that dropping all channels a projector applies to will lead to the
     # removal of said projector.
-    raw = read_raw_fif(fif_fname)
+    raw = read_raw_fif(fif_fname).crop(0, 1)
     n_projs = len(raw.info['projs'])
     eeg_names = raw.info['projs'][-1]['data']['col_names']
     with pytest.raises(RuntimeError, match='loaded'):
         raw.copy().apply_proj().drop_channels(eeg_names)
     raw.load_data().drop_channels(eeg_names)  # EEG proj
     assert len(raw.info['projs']) == n_projs - 1
+
+    # Dropping EEG channels with custom ref removes info['custom_ref_applied']
+    raw = read_raw_fif(fif_fname).crop(0, 1).load_data()
+    raw.set_eeg_reference()
+    assert raw.info['custom_ref_applied']
+    raw.drop_channels(eeg_names)
+    assert not raw.info['custom_ref_applied']
 
 
 @testing.requires_testing_data

@@ -1,27 +1,31 @@
+# -*- coding: utf-8 -*-
 """
 .. _tut-report:
 
-Getting started with :class:`mne.Report`
-========================================
+===============================
+Getting started with mne.Report
+===============================
 
-`mne.Report` is a way to create interactive HTML summaries of your data. These
-reports can show many different visualizations of one or multiple subject's
-data. A common use case is creating diagnostic summaries to check data quality
-at different stages in the processing pipeline. The report can show things like
-plots of data before and after each preprocessing step, epoch rejection
-statistics, MRI slices with overlaid BEM shells, all the way up to plots of
-estimated cortical activity.
+:class:`mne.Report` is a way to create interactive HTML summaries of your data.
+These reports can show many different visualizations for one or multiple
+participants. A common use case is creating diagnostic summaries to check data
+quality at different stages in the processing pipeline. The report can show
+things like plots of data before and after each preprocessing step, epoch
+rejection statistics, MRI slices with overlaid BEM shells, all the way up to
+plots of estimated cortical activity.
 
-Compared to a Jupyter notebook, `mne.Report` is easier to deploy (the HTML
-pages it generates are self-contained and do not require a running Python
+Compared to a Jupyter notebook, :class:`mne.Report` is easier to deploy (the
+HTML pages it generates are self-contained and do not require a running Python
 environment) but less flexible (you can't change code and re-run something
 directly within the browser). This tutorial covers the basics of building a
-`~mne.Report`. As usual, we'll start by importing the modules and data we need:
+:class:`~mne.Report`. As usual, we'll start by importing the modules and data
+we need:
 """
 
 # %%
 
 from pathlib import Path
+import tempfile
 import numpy as np
 import scipy.ndimage
 import matplotlib.pyplot as plt
@@ -78,13 +82,18 @@ subjects_dir = data_path / 'subjects'
 # operate with a path to a raw file and `~mne.io.Raw` objects, and will
 # produce – among other output – a slider that allows you to scrub through 10
 # equally-spaced 1-second segments of the data:
+#
+# .. warning::
+#    In the following example, we crop the raw data to 60 seconds merely to
+#    speed up processing; this is not usually recommended!
 
 raw_path = sample_dir / 'sample_audvis_filt-0-40_raw.fif'
 raw = mne.io.read_raw(raw_path)
+raw.pick_types(eeg=True, eog=True, stim=True).crop(tmax=60).load_data()
 
 report = mne.Report(title='Raw example')
-report.add_raw(raw=raw_path, title='Raw from Path')
-report.add_raw(raw=raw, title='Raw from "raw"', psd=False)  # omit PSD plot
+# This method also accepts a path, e.g., raw=raw_path
+report.add_raw(raw=raw, title='Raw', psd=False)  # omit PSD plot
 report.save('report_raw.html', overwrite=True)
 
 # %%
@@ -92,10 +101,11 @@ report.save('report_raw.html', overwrite=True)
 # ^^^^^^^^^^^^^
 #
 # Events can be added via :meth:`mne.Report.add_events`. You also need to
-# supply the sampling frequency used during the recording.
+# supply the sampling frequency used during the recording; this information
+# is used to generate a meaningful time axis.
 
 events_path = sample_dir / 'sample_audvis_filt-0-40_raw-eve.fif'
-events = mne.read_events(events_path)
+events = mne.find_events(raw=raw)
 sfreq = raw.info['sfreq']
 
 report = mne.Report(title='Events example')
@@ -104,14 +114,29 @@ report.add_events(events=events, title='Events from "events"', sfreq=sfreq)
 report.save('report_events.html', overwrite=True)
 
 # %%
-# Adding `~mne.Epochs`
-# ^^^^^^^^^^^^^^^^^^^^
+# Adding :class:`~mne.Epochs`
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 #
 # Epochs can be added via :meth:`mne.Report.add_epochs`. Note that although
 # this method accepts a path to an epochs file too, in the following example
-# we only add epochs that we create on the fly from raw data.
+# we only add epochs that we create on the fly from raw data. To demonstrate
+# the representation of epochs metadata, we'll add some of that too.
 
-epochs = mne.Epochs(raw=raw, events=events)
+event_id = {
+    'auditory/left': 1, 'auditory/right': 2, 'visual/left': 3,
+    'visual/right': 4, 'face': 5, 'buttonpress': 32
+}
+
+metadata, _, _ = mne.epochs.make_metadata(
+    events=events,
+    event_id=event_id,
+    tmin=-0.2,
+    tmax=0.5,
+    sfreq=raw.info['sfreq']
+)
+epochs = mne.Epochs(
+    raw=raw, events=events, event_id=event_id, metadata=metadata
+)
 
 report = mne.Report(title='Epochs example')
 report.add_epochs(epochs=epochs, title='Epochs from "epochs"')
@@ -140,6 +165,8 @@ cov_path = sample_dir / 'sample_audvis-cov.fif'
 
 evokeds = mne.read_evokeds(evoked_path, baseline=(None, 0))
 evokeds_subset = evokeds[:2]  # The first two
+for evoked in evokeds_subset:
+    evoked.pick('eeg')  # just for speed of plotting
 
 report = mne.Report(title='Evoked example')
 report.add_evokeds(
@@ -220,29 +247,22 @@ report.save('report_projs.html', overwrite=True)
 # the properties plots by enabling parallel execution.
 #
 # .. warning::
-#    In the following example, we crop the raw data, only fit ICA on EEG
-#    channels, request a small number of ICA components to estimate, set the
-#    threshold for assuming ICA convergence to a very liberal value, and only
-#    visualize 2 of the components. All of this is done to largely reduce the
-#    processing time of this tutorial, and is usually **not** recommended for
-#    an actual data analysis.
-
-raw_eeg_cropped = (raw
-                   .copy()
-                   .pick_types(meg=False, eeg=True, eog=True)
-                   .crop(tmax=60)  # only keep 60 seconds
-                   .load_data())
+#    In the following example, we request a small number of ICA components
+#    to estimate, set the threshold for assuming ICA convergence to a very
+#    liberal value, and only visualize 2 of the components. All of this is
+#    done to largely reduce the processing time of this tutorial, and is
+#    usually **not** recommended for an actual data analysis.
 
 ica = mne.preprocessing.ICA(
     n_components=5,  # fit 5 ICA components
     fit_params=dict(tol=0.01)  # assume very early on that ICA has converged
 )
 
-ica.fit(inst=raw_eeg_cropped)
+ica.fit(inst=raw)
 
 # create epochs based on EOG events, find EOG artifacts in the data via pattern
 # matching, and exclude the EOG-related ICA components
-eog_epochs = mne.preprocessing.create_eog_epochs(raw=raw_eeg_cropped)
+eog_epochs = mne.preprocessing.create_eog_epochs(raw=raw)
 eog_components, eog_scores = ica.find_bads_eog(
     inst=eog_epochs,
     ch_name='EEG 001',  # a channel close to the eye
@@ -255,10 +275,10 @@ report.add_ica(
     ica=ica,
     title='ICA cleaning',
     picks=[0, 1],  # only plot the first two components
-    inst=raw_eeg_cropped,
+    inst=raw,
     eog_evoked=eog_epochs.average(),
     eog_scores=eog_scores,
-    n_jobs=4
+    n_jobs=None  # could be increased!
 )
 report.save('report_ica.html', overwrite=True)
 
@@ -270,12 +290,14 @@ report.save('report_ica.html', overwrite=True)
 # surfaces can be added via :meth:`mne.Report.add_bem`. All you need to pass is
 # the FreeSurfer subject name and subjects directory, and a title. To reduce
 # the resulting file size, you may pass the ``decim`` parameter to only include
-# every n-th volume slice.
+# every n-th volume slice, and ``width`` to specify the width of the resulting
+# figures in pixels.
 
 report = mne.Report(title='BEM example')
 report.add_bem(
     subject='sample', subjects_dir=subjects_dir, title='MRI & BEM',
-    decim=10
+    decim=20,
+    width=256
 )
 report.save('report_mri_and_bem.html', overwrite=True)
 
@@ -283,18 +305,19 @@ report.save('report_mri_and_bem.html', overwrite=True)
 # Adding coregistration
 # ^^^^^^^^^^^^^^^^^^^^^
 #
-# The ``head -> mri`` transformation (obtained by "coregistration") can be
-# visualized via :meth:`mne.Report.add_trans`. The method expects the
-# transformation either as a `~mne.transforms.Transform` object or as a path to
-# a ``trans.fif`` file, the FreeSurfer subject name and subjects directory, and
-# a title.
+# The sensor alignment (``head -> mri`` transformation obtained by
+# "coregistration") can be visualized via :meth:`mne.Report.add_trans`. The
+# method expects the transformation either as a `~mne.transforms.Transform`
+# object or as a path to a ``trans.fif`` file, the FreeSurfer subject name and
+# subjects directory, and a title. The ``alpha`` parameter can be used to
+# control the transparency of the head, where a value of 1 means fully opaque.
 
 trans_path = sample_dir / 'sample_audvis_raw-trans.fif'
 
 report = mne.Report(title='Coregistration example')
 report.add_trans(
     trans=trans_path, info=raw_path, subject='sample',
-    subjects_dir=subjects_dir, title='Coregistration'
+    subjects_dir=subjects_dir, alpha=1.0, title='Coregistration'
 )
 report.save('report_coregistration.html', overwrite=True)
 
@@ -344,7 +367,7 @@ stc_path = sample_dir / 'sample_audvis-meg'
 report = mne.Report(title='Source estimate example')
 report.add_stc(
     stc=stc_path, subject='sample', subjects_dir=subjects_dir,
-    title='Source estimate', n_time_points=5
+    title='Source estimate', n_time_points=2  # few for speed
 )
 report.save('report_inverse_sol.html', overwrite=True)
 
@@ -404,12 +427,42 @@ report.add_figure(
     image_format='PNG'
 )
 report.save('report_custom_figure.html', overwrite=True)
+plt.close(fig)
 
 # %%
-# The :meth:`mne.Report.add_figure` method can add multiple figures at once. In
-# this case, a slider will appear, allowing users to intuitively browse the
-# figures. To make this work, you need to provide a collection of figures,
-# a title, and optionally a collection of captions.
+# Multiple figures can be grouped into a single section via the ``section``
+# parameter.
+
+fig_1, ax_1 = plt.subplots()
+ax_1.plot([1, 2, 3])
+
+fig_2, ax_2 = plt.subplots()
+ax_2.plot([3, 2, 1])
+
+section = 'Section example'
+
+report = mne.Report(title='Figure section example')
+report.add_figure(
+    fig=fig_1,
+    title='Figure 1',
+    section=section,
+    tags='fig-1'
+)
+report.add_figure(
+    fig=fig_2,
+    title='Figure 2',
+    section=section,
+    tags='fig-2'
+)
+report.save('report_custom_figure_sections.html', overwrite=True)
+plt.close(fig_1)
+plt.close(fig_2)
+
+# %%
+# The :meth:`mne.Report.add_figure` method can also add multiple figures at
+# once. In this case, a slider will appear, allowing users to intuitively
+# browse the figures. To make this work, you need to provide a collection o
+# figures, a title, and optionally a collection of captions.
 #
 # In the following example, we will read the MNE logo as a Matplotlib figure
 # and rotate it with different angles. Each rotated figure and its respective
@@ -435,9 +488,17 @@ for angle in rotation_angles:
     figs.append(fig)
     captions.append(f'Rotation angle: {round(angle, 1)}°')
 
+# can also be a MNEQtBrowser instance
+figs.append(raw.plot())
+captions.append('... plus a raw data plot')
+
 report = mne.Report(title='Multiple figures example')
 report.add_figure(fig=figs, title='Fun with figures! 🥳', caption=captions)
 report.save('report_custom_figures.html', overwrite=True)
+for fig in figs[:-1]:
+    plt.close(fig)
+figs[-1].close()
+del figs
 
 # %%
 # Adding image files
@@ -592,18 +653,22 @@ report.save('report_parse_folder_mri_bem.html', overwrite=True)
 # requires us to specify the path to a covariance matrix file via the
 # ``cov_fname`` parameter of `~mne.Report`.
 #
-# Now, let's put all of this together!
+# Now, let's put all of this together! Here we use a temporary directory
+# for speed so we can render a single Evoked instance, using just EEG
+# channels.
 
 baseline = (None, 0)
 cov_fname = sample_dir / 'sample_audvis-cov.fif'
 pattern = 'sample_audvis-no-filter-ave.fif'
-
+evoked = mne.read_evokeds(sample_dir / pattern)[0]
 report = mne.Report(
     title='parse_folder example 4', baseline=baseline, cov_fname=cov_fname
 )
-report.parse_folder(
-    data_path, pattern=pattern, render_bem=False, n_time_points_evokeds=5
-)
+with tempfile.TemporaryDirectory() as path:
+    evoked.save(Path(path) / pattern)
+    report.parse_folder(
+        path, pattern=pattern, render_bem=False, n_time_points_evokeds=5
+    )
 report.save('report_parse_folder_evoked.html', overwrite=True)
 
 # %%
@@ -621,3 +686,29 @@ report.parse_folder(
     data_path, pattern=pattern, render_bem=False, n_time_points_evokeds=5
 )
 report.save('report_parse_folder_cov.html', overwrite=True)
+
+# %%
+#
+# Adding custom HTML (e.g., a description text)
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#
+# The :meth:`~mne.Report.add_html` method allows you to add custom HTML to
+# your report. This feature can be very convenient to add short descriptions,
+# lists, or reminders to your report (among many other things you can think
+# of encoding in HTML).
+
+report = mne.Report(title='Report on hypothesis 1')
+
+my_html = """
+<p>We have the following hypothesis:</p>
+<ol>
+<li>There is a difference between images showing man-made vs. natural
+environments</li>
+<li>This difference manifests itself most strongly in the amplitude of the
+N1 ERP component</li>
+</ol>
+<p>Below we show several plots and tests of the data.</p>
+"""
+
+report.add_html(title='Hypothesis', html=my_html)
+report.save('report_add_html.html', overwrite=True)

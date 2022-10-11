@@ -7,12 +7,11 @@
 #
 # License: Simplified BSD
 
-import sys
-import os
 from contextlib import contextmanager
 import importlib
 
 from ._utils import VALID_3D_BACKENDS
+from .._3d import _get_3d_option
 from ...utils import (logger, verbose, get_config, _check_option, fill_doc,
                       _validate_type)
 
@@ -33,6 +32,11 @@ def _reload_backend(backend_name):
     backend = importlib.import_module(name=_backend_name_map[backend_name],
                                       package='mne.viz.backends')
     logger.info('Using %s 3d backend.\n' % backend_name)
+
+
+def _get_backend():
+    _get_3d_backend()
+    return backend
 
 
 def _get_renderer(*args, **kwargs):
@@ -93,8 +97,6 @@ def set_3d_backend(backend_name, verbose=None):
        +--------------------------------------+-----------+----------+
        | :func:`plot_evoked_field`            | ✓         | ✓        |
        +--------------------------------------+-----------+----------+
-       | :func:`plot_sensors_connectivity`    | ✓         | ✓        |
-       +--------------------------------------+-----------+----------+
        | :func:`snapshot_brain_montage`       | ✓         | ✓        |
        +--------------------------------------+-----------+----------+
        | :func:`link_brains`                  | ✓         |          |
@@ -127,10 +129,6 @@ def set_3d_backend(backend_name, verbose=None):
     if MNE_3D_BACKEND != backend_name:
         _reload_backend(backend_name)
         MNE_3D_BACKEND = backend_name
-
-    # Qt5 macOS 11 compatibility
-    if sys.platform == 'darwin' and 'QT_MAC_WANTS_LAYER' not in os.environ:
-        os.environ['QT_MAC_WANTS_LAYER'] = '1'
     return old_backend_name
 
 
@@ -171,9 +169,18 @@ def _get_3d_backend():
                     MNE_3D_BACKEND = name
                     break
             else:
+
                 raise RuntimeError(
-                    'Could not load any valid 3D backend:\n' +
-                    "\n".join(f'{key}: {val}' for key, val in errors.items()))
+                    'Could not load any valid 3D backend\n' +
+                    "\n".join(f'{key}: {val}' for key, val in errors.items()) +
+                    "\n".join(('\n\n install pyvistaqt, using pip or conda:',
+                               "'pip install pyvistaqt'",
+                               "'conda install -c conda-forge pyvistaqt'",
+                               '\n or install ipywidgets, ' +
+                               'if using a notebook backend',
+                               "'pip install ipywidgets'",
+                               "'conda install -c conda-forge ipywidgets'")))
+
         else:
             MNE_3D_BACKEND = _check_3d_backend_name(MNE_3D_BACKEND)
             _reload_backend(MNE_3D_BACKEND)
@@ -271,8 +278,8 @@ def set_3d_title(figure, title, size=40):
     backend._set_3d_title(figure=figure, title=title, size=size)
 
 
-def create_3d_figure(size, bgcolor=(0, 0, 0), smooth_shading=True,
-                     handle=None, scene=True):
+def create_3d_figure(size, bgcolor=(0, 0, 0), smooth_shading=None,
+                     handle=None, *, scene=True, show=False):
     """Return an empty figure based on the current 3d backend.
 
     .. warning:: Proceed with caution when the renderer object is
@@ -286,25 +293,34 @@ def create_3d_figure(size, bgcolor=(0, 0, 0), smooth_shading=True,
         The dimensions of the 3d figure (width, height).
     bgcolor : tuple
         The color of the background.
-    smooth_shading : bool
-        If True, smooth shading is enabled. Defaults to True.
+    smooth_shading : bool | None
+        Whether to enable smooth shading. If ``None``, uses the config value
+        ``MNE_3D_OPTION_SMOOTH_SHADING``. Defaults to ``None``.
     handle : int | None
         The figure identifier.
     scene : bool
-        Specify if the returned object is the scene. If False,
-        the renderer object is returned. Defaults to True.
+        If True (default), the returned object is the Figure3D. If False,
+        an advanced, undocumented Renderer object is returned (the API is not
+        stable or documented, so this is not recommended).
+    show : bool
+        If True, show the renderer immediately.
+
+        .. versionadded:: 1.0
 
     Returns
     -------
-    figure : object
-        The requested empty scene or the renderer object if
-        ``scene=False``.
+    figure : instance of Figure3D or ``Renderer``
+        The requested empty figure or renderer, depending on ``scene``.
     """
+    _validate_type(smooth_shading, (bool, None), 'smooth_shading')
+    if smooth_shading is None:
+        smooth_shading = _get_3d_option('smooth_shading')
     renderer = _get_renderer(
         fig=handle,
         size=size,
         bgcolor=bgcolor,
         smooth_shading=smooth_shading,
+        show=show,
     )
     if scene:
         return renderer.scene()

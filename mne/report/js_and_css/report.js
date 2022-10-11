@@ -5,7 +5,6 @@ const refreshScrollSpy = () =>{
     bootstrap.ScrollSpy.getInstance(dataSpyEl)
     .refresh()
   })
-  console.log('scrollspy refreshed!');  // TODO remove debugging output
 }
 
 /* Show or hide elements based on their tag */
@@ -58,7 +57,6 @@ const toggleTagVisibility = (tagName) => {
 
   refreshScrollSpy();
 }
-
 
 /* Gather all available tags and expose them in the global namespace */
 let tags = [];  // array of objects
@@ -149,6 +147,8 @@ const addFilterByTagsCheckboxEventHandlers = () => {
   });
 }
 
+/* Avoid top of content getting hidden behind navbar after clicking on a TOC
+   link */
 const _handleTocLinkClick = (e) => {
     e.preventDefault();
 
@@ -186,6 +186,7 @@ const addSliderEventHandlers = () => {
   })
 }
 
+/* Avoid top of content gets hidden behind the top navbar */
 const fixTopMargin = () => {
   const topBarHeight = document.querySelector('#top-bar').scrollHeight
   const margin = 30 + topBarHeight;
@@ -194,24 +195,8 @@ const fixTopMargin = () => {
   document.getElementById('toc').style.marginTop = `${margin}px`;
 }
 
-
-$(document).ready(() => {
-  gatherTags();
-  updateTagCountBadges();
-  addFilterByTagsCheckboxEventHandlers();
-  addSliderEventHandlers();
-  fixTopMargin();
-  fixScrollingForTocLinks();
-  hljs.highlightAll();   // enable highlight.js
-});
-
-window.onresize = () => {
-  fixTopMargin();
-  refreshScrollSpy();
-};
-
 /* Show / hide all tags on keypress */
-window.onkeydown = (e) => {
+const _globalKeyHandler = (e) => {
   if (e.code === "KeyT") {
     const selectAllTagsCheckbox = document
       .querySelector('#selectAllTagsCheckboxLabel > input');
@@ -222,3 +207,37 @@ window.onkeydown = (e) => {
     selectAllTagsCheckbox.dispatchEvent(changeEvent);
   }
 }
+
+const enableGlobalKeyHandler = () => {
+  window.onkeydown = (e) => _globalKeyHandler(e);
+}
+
+const disableGlobalKeyHandler = () => {
+  window.onkeydown = null;
+}
+
+/* Disable processing global key events when a search box is active */
+const disableGlobalKeysInSearchBox = () => {
+  const searchBoxElements = document.querySelectorAll('input.search-input');
+  searchBoxElements.forEach((el) => {
+    el.addEventListener('focus', () => disableGlobalKeyHandler());
+    el.addEventListener('blur', () => enableGlobalKeyHandler());
+  })
+}
+
+$(document).ready(() => {
+  gatherTags();
+  updateTagCountBadges();
+  addFilterByTagsCheckboxEventHandlers();
+  addSliderEventHandlers();
+  fixTopMargin();
+  fixScrollingForTocLinks();
+  hljs.highlightAll();   // enable highlight.js
+  disableGlobalKeysInSearchBox();
+  enableGlobalKeyHandler();
+});
+
+window.onresize = () => {
+  fixTopMargin();
+  refreshScrollSpy();
+};

@@ -1,4 +1,7 @@
+# -*- coding: utf-8 -*-
 """
+.. _ex-cerebellum-source-space:
+
 ==============================================
 Generate a left cerebellum volume source space
 ==============================================
@@ -6,7 +9,6 @@ Generate a left cerebellum volume source space
 Generate a volume source space of the left cerebellum and plot its vertices
 relative to the left cortical surface source space and the FreeSurfer
 segmentation file.
-
 """
 
 # Author: Alan Leggitt <alan.leggitt@ucsf.edu>
@@ -14,7 +16,6 @@ segmentation file.
 # License: BSD-3-Clause
 
 # %%
-import os.path as op
 
 import mne
 from mne import setup_source_space, setup_volume_source_space
@@ -23,9 +24,9 @@ from mne.datasets import sample
 print(__doc__)
 
 data_path = sample.data_path()
-subjects_dir = op.join(data_path, 'subjects')
+subjects_dir = data_path / 'subjects'
 subject = 'sample'
-aseg_fname = op.join(subjects_dir, 'sample', 'mri', 'aseg.mgz')
+aseg_fname = subjects_dir / 'sample' / 'mri' / 'aseg.mgz'
 
 # %%
 # Setup the source spaces
@@ -52,7 +53,6 @@ fig = mne.viz.plot_alignment(subject=subject, subjects_dir=subjects_dir,
                              src=src)
 mne.viz.set_3d_view(fig, azimuth=180, elevation=90,
                     distance=0.30, focalpoint=(-0.03, -0.01, 0.03))
-
 
 # %%
 # You can export source positions to a NIfTI file::

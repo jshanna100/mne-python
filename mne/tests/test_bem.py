@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_equal, assert_allclose
 
+import mne
 from mne import (make_bem_model, read_bem_surfaces, write_bem_surfaces,
                  make_bem_solution, read_bem_solution, write_bem_solution,
                  make_sphere_model, Transform, Info, write_surface,
@@ -20,11 +21,12 @@ from mne.preprocessing.maxfilter import fit_sphere_to_headshape
 from mne.io.constants import FIFF
 from mne.transforms import translation
 from mne.datasets import testing
-from mne.utils import catch_logging, requires_h5py
+from mne.utils import catch_logging, check_version
 from mne.bem import (_ico_downsample, _get_ico_map, _order_surfaces,
                      _assert_complete_surface, _assert_inside,
-                     _check_surface_size, _bem_find_surface)
-from mne.surface import read_surface
+                     _check_surface_size, _bem_find_surface,
+                     make_scalp_surfaces, distance_to_bem)
+from mne.surface import read_surface, _get_ico_surface
 from mne.io import read_info
 
 fname_raw = op.join(op.dirname(__file__), '..', 'io', 'tests', 'data',
@@ -61,19 +63,24 @@ def _compare_bem_solutions(sol_a, sol_b):
     # compare the actual solutions
     names = ['bem_method', 'field_mult', 'gamma', 'is_sphere',
              'nsol', 'sigma', 'source_mult', 'solution']
-    assert_equal(set(sol_a.keys()), set(sol_b.keys()))
-    assert_equal(set(names + ['surfs']), set(sol_b.keys()))
-    for key in names:
+    assert set(sol_a.keys()) == set(sol_b.keys())
+    assert set(names + ['solver', 'surfs']) == set(sol_b.keys())
+    assert sol_a['solver'] == sol_b['solver']
+    for key in names[:-1]:
         assert_allclose(sol_a[key], sol_b[key], rtol=1e-3, atol=1e-5,
                         err_msg='Mismatch: %s' % key)
 
 
+h5py_mark = pytest.mark.skipif(not check_version('h5py'), reason='Needs h5py')
+
+
 @testing.requires_testing_data
-@requires_h5py
-@pytest.mark.parametrize('ext', ('fif', 'h5'))
+@pytest.mark.parametrize('ext', [
+    'fif',
+    pytest.param('h5', marks=h5py_mark),
+])
 def test_io_bem(tmp_path, ext):
     """Test reading and writing of bem surfaces and solutions."""
-    import h5py
     temp_bem = op.join(str(tmp_path), f'temp-bem.{ext}')
     # model
     with pytest.raises(ValueError, match='BEM data not found'):
@@ -87,6 +94,7 @@ def test_io_bem(tmp_path, ext):
         write_bem_surfaces(temp_bem, surf[0])
     write_bem_surfaces(temp_bem, surf[0], overwrite=True)
     if ext == 'h5':
+        import h5py
         with h5py.File(temp_bem, 'r'):  # make sure it's valid
             pass
     surf_read = read_bem_surfaces(temp_bem, patch_stats=False)
@@ -194,28 +202,36 @@ def test_bem_model_topology(tmp_path):
     [(0.3, 0.006, 0.3), fname_bem_sol_3],
 ])
 def test_bem_solution(tmp_path, cond, fname):
-    """Test making a BEM solution from Python with I/O."""
+    """Test making a BEM solution from Python and OpenMEEG with I/O."""
     # test degenerate conditions
     surf = read_bem_surfaces(fname_bem_1)[0]
-    pytest.raises(RuntimeError, _ico_downsample, surf, 10)  # bad dec grade
+    with pytest.raises(RuntimeError, match='2 or less'):
+        _ico_downsample(surf, 10)
     s_bad = dict(tris=surf['tris'][1:], ntri=surf['ntri'] - 1, rr=surf['rr'])
-    pytest.raises(RuntimeError, _ico_downsample, s_bad, 1)  # not isomorphic
+    with pytest.raises(RuntimeError, match='Cannot decimate.*isomorphic'):
+        _ico_downsample(s_bad, 1)
     s_bad = dict(tris=surf['tris'].copy(), ntri=surf['ntri'],
                  rr=surf['rr'])  # bad triangulation
     s_bad['tris'][0] = [0, 0, 0]
-    pytest.raises(RuntimeError, _ico_downsample, s_bad, 1)
+    with pytest.raises(RuntimeError, match='ordering is wrong'):
+        _ico_downsample(s_bad, 1)
     s_bad['id'] = 1
-    pytest.raises(RuntimeError, _assert_complete_surface, s_bad)
+    with pytest.raises(RuntimeError, match='is not complete'):
+        _assert_complete_surface(s_bad)
     s_bad = dict(tris=surf['tris'], ntri=surf['ntri'], rr=surf['rr'].copy())
     s_bad['rr'][0] = 0.
-    pytest.raises(RuntimeError, _get_ico_map, surf, s_bad)
+    with pytest.raises(RuntimeError, match='No matching vertex'):
+        _get_ico_map(surf, s_bad)
 
     surfs = read_bem_surfaces(fname_bem_3)
-    pytest.raises(RuntimeError, _assert_inside, surfs[0], surfs[1])  # outside
+    with pytest.raises(RuntimeError, match='is not completely inside'):
+        _assert_inside(surfs[0], surfs[1])  # outside
     surfs[0]['id'] = 100  # bad surfs
-    pytest.raises(RuntimeError, _order_surfaces, surfs)
+    with pytest.raises(RuntimeError, match='bad surface id'):
+        _order_surfaces(surfs)
     surfs[1]['rr'] /= 1000.
-    pytest.raises(RuntimeError, _check_surface_size, surfs[1])
+    with pytest.raises(RuntimeError, match='seem too small'):
+        _check_surface_size(surfs[1])
 
     # actually test functionality
     fname_temp = op.join(str(tmp_path), 'temp-bem-sol.fif')
@@ -227,12 +243,28 @@ def test_bem_solution(tmp_path, cond, fname):
         else:
             model = fname_bem_1 if len(cond) == 1 else fname_bem_3
     solution = make_bem_solution(model, verbose=True)
+    assert solution['solver'] == 'mne'
     solution_c = read_bem_solution(fname)
+    assert solution_c['solver'] == 'mne'
     _compare_bem_solutions(solution, solution_c)
     write_bem_solution(fname_temp, solution)
     solution_read = read_bem_solution(fname_temp)
+    assert solution['solver'] == solution_c['solver'] == 'mne'
+    assert solution_read['solver'] == 'mne'
     _compare_bem_solutions(solution, solution_c)
     _compare_bem_solutions(solution_read, solution_c)
+    # OpenMEEG
+    pytest.importorskip(
+        'openmeeg', '2.5', reason='OpenMEEG required to fully test BEM '
+        'solution computation')
+    with catch_logging() as log:
+        solution = make_bem_solution(model, solver='openmeeg', verbose=True)
+    log = log.getvalue()
+    assert 'OpenMEEG' in log
+    write_bem_solution(fname_temp, solution, overwrite=True)
+    solution_read = read_bem_solution(fname_temp)
+    assert solution['solver'] == solution_read['solver'] == 'openmeeg'
+    _compare_bem_solutions(solution_read, solution)
 
 
 def test_fit_sphere_to_headshape():
@@ -306,9 +338,12 @@ def test_fit_sphere_to_headshape():
                   dig_kinds=(FIFF.FIFFV_POINT_HPI,))
     pytest.raises(ValueError, fit_sphere_to_headshape, info,
                   dig_kinds='foo', units='m')
-    info['dig'][0]['coord_frame'] = FIFF.FIFFV_COORD_DEVICE
-    pytest.raises(RuntimeError, fit_sphere_to_headshape, info, units='m')
-    info['dig'][0]['coord_frame'] = FIFF.FIFFV_COORD_HEAD
+    for d in info['dig']:
+        d['coord_frame'] = FIFF.FIFFV_COORD_DEVICE
+    with pytest.raises(RuntimeError, match='not in head coordinates'):
+        fit_sphere_to_headshape(info)
+    for d in info['dig']:
+        d['coord_frame'] = FIFF.FIFFV_COORD_HEAD
 
     #  # Test with 4 points that match a perfect sphere
     dig_kinds = (FIFF.FIFFV_POINT_CARDINAL, FIFF.FIFFV_POINT_EXTRA)
@@ -414,3 +449,98 @@ def test_io_head_bem(tmp_path):
     assert head['id'] == head_defect['id'] == FIFF.FIFFV_BEM_SURF_ID_HEAD
     assert np.allclose(head['rr'], head_defect['rr'])
     assert np.allclose(head['tris'], head_defect['tris'])
+
+
+@pytest.mark.slowtest  # ~4 sec locally
+def test_make_scalp_surfaces_topology(tmp_path, monkeypatch):
+    """Test topology checks for make_scalp_surfaces."""
+    pytest.importorskip('pyvista')
+    subjects_dir = tmp_path
+    subject = 'test'
+    surf_dir = subjects_dir / subject / 'surf'
+    makedirs(surf_dir)
+    surf = _get_ico_surface(2)
+    surf['rr'] *= 100  # mm
+    write_surface(surf_dir / 'lh.seghead', surf['rr'], surf['tris'])
+
+    # make it so that decimation really messes up the mesh just by deleting
+    # the last N tris
+    def _decimate_surface(points, triangles, n_triangles):
+        assert len(triangles) >= n_triangles
+        return points, triangles[:n_triangles]
+
+    monkeypatch.setattr(mne.bem, 'decimate_surface', _decimate_surface)
+    # TODO: These two errors should probably have the same class...
+
+    # Not enough neighbors
+    monkeypatch.setattr(mne.bem, '_tri_levels', dict(sparse=315))
+    with pytest.raises(ValueError, match='.*have fewer than three.*'):
+        make_scalp_surfaces(subject, subjects_dir, force=False, verbose=True)
+    monkeypatch.setattr(mne.bem, '_tri_levels', dict(sparse=319))
+    # Incomplete surface (sum of solid angles)
+    with pytest.raises(RuntimeError, match='.*is not complete.*'):
+        make_scalp_surfaces(
+            subject, subjects_dir, force=False, verbose=True, overwrite=True)
+    bem_dir = subjects_dir / subject / 'bem'
+    sparse_path = (bem_dir / f'{subject}-head-sparse.fif')
+    assert not sparse_path.is_file()
+
+    # These are ignorable
+    monkeypatch.setattr(mne.bem, '_tri_levels', dict(sparse=315))
+    with pytest.warns(RuntimeWarning, match='.*have fewer than three.*'):
+        make_scalp_surfaces(
+            subject, subjects_dir, force=True, overwrite=True)
+    surf, = read_bem_surfaces(sparse_path, on_defects='ignore')
+    assert len(surf['tris']) == 315
+    monkeypatch.setattr(mne.bem, '_tri_levels', dict(sparse=319))
+    with pytest.warns(RuntimeWarning, match='.*is not complete.*'):
+        make_scalp_surfaces(
+            subject, subjects_dir, force=True, overwrite=True)
+    surf, = read_bem_surfaces(sparse_path, on_defects='ignore')
+    assert len(surf['tris']) == 319
+
+
+@pytest.mark.parametrize("bem_type", ["bem", "sphere"])
+@pytest.mark.parametrize("n_pos", [1, 10])
+@testing.requires_testing_data
+def test_distance_to_bem(bem_type, n_pos):
+    """Test distance_to_bem."""
+    # Test spherical ConductorModels
+    if bem_type == "sphere":
+        bem = make_sphere_model(r0=np.array([0, 0, 0]), verbose=0)
+        r = bem['layers'][0]['rad']
+        true_dist = np.array([r, 0., 0., 0., 0., 0., 0., 0., 0., 0.])
+    else:
+        bem = read_bem_solution(fname_bem_sol_1)
+        r = 0.05
+        true_dist = np.array([
+            0.01708097, 0.00256595, 0.01022884, 0.02306622, 0.02927288,
+            0.04491787, 0.00990493, 0.02244751, 0.04819345, 0.01928304
+        ])
+
+    pos = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [r, 0.0, 0.0],
+            [-r, 0.0, 0.0],
+            [0.0, r, 0.0],
+            [0.0, -r, 0.0],
+            [0.0, 0.0, r],
+            [-r / np.sqrt(2.), r / np.sqrt(2.), 0.0],
+            [-r / np.sqrt(2.), -r / np.sqrt(2.), 0.0],
+            [0, -r / np.sqrt(2.), r / np.sqrt(2.)],
+            [r / np.sqrt(3.), r / np.sqrt(3.), r / np.sqrt(3.)]
+        ]
+    )
+
+    if n_pos == 1:
+        pos = pos[0, :]
+        true_dist = true_dist[0]
+
+    dist = distance_to_bem(pos, bem)
+    if n_pos == 1:
+        assert isinstance(dist, float)
+    else:
+        assert isinstance(dist, np.ndarray)
+
+    assert_allclose(dist, true_dist, rtol=1e-6, atol=1e-6)

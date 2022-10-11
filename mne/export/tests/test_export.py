@@ -4,6 +4,7 @@
 #
 # License: BSD-3-Clause
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from mne.io import RawArray
 from mne.io.meas_info import create_info
@@ -19,26 +20,70 @@ from mne import (read_epochs_eeglab, Epochs, read_evokeds, read_evokeds_mff,
                  Annotations)
 from mne.datasets import testing, misc
 from mne.export import export_evokeds, export_evokeds_mff
-from mne.io import read_raw_fif, read_raw_eeglab, read_raw_edf
+from mne.fixes import _compare_version
+from mne.io import (read_raw_fif, read_raw_eeglab, read_raw_edf,
+                    read_raw_brainvision)
 from mne.utils import (_check_eeglabio_installed, requires_version,
-                       object_diff, _check_edflib_installed, _resource_path)
+                       object_diff, _check_edflib_installed, _resource_path,
+                       _check_pybv_installed, _record_warnings)
 from mne.tests.test_epochs import _get_data
 
-base_dir = op.join(op.dirname(__file__), '..', '..', 'io', 'tests', 'data')
-fname_evoked = op.join(base_dir, 'test-ave.fif')
+fname_evoked = _resource_path('mne.io.tests.data', 'test-ave.fif')
+fname_raw = _resource_path('mne.io.tests.data', 'test_raw.fif')
 
 data_path = testing.data_path(download=False)
 egi_evoked_fname = op.join(data_path, 'EGI', 'test_egi_evoked.mff')
+misc_path = misc.data_path(download=False)
 
 
+@pytest.mark.skipif(not _check_pybv_installed(strict=False),
+                    reason='pybv not installed')
+@pytest.mark.parametrize(
+    ['meas_date', 'orig_time', 'ext'], [
+        [None, None, '.vhdr'],
+        [datetime(2022, 12, 3, 19, 1, 10, 720100, tzinfo=timezone.utc),
+         None,
+         '.eeg'],
+    ])
+def test_export_raw_pybv(tmp_path, meas_date, orig_time, ext):
+    """Test saving a Raw instance to BrainVision format via pybv."""
+    raw = read_raw_fif(fname_raw, preload=True)
+    raw.apply_proj()
+
+    raw.set_meas_date(meas_date)
+
+    # add some annotations
+    annots = Annotations(
+        onset=[3, 6, 9, 12, 14],  # seconds
+        duration=[1, 1, 0.5, 0.25, 9],  # seconds
+        description=[
+            "Stimulus/S  1",
+            "Stimulus/S2.50",
+            "Response/R101",
+            "Look at this",
+            "Comment/And at this",
+        ],
+        ch_names=[(), (), (), ("EEG 001",), ("EEG 001", "EEG 002")],
+        orig_time=orig_time,
+    )
+    raw.set_annotations(annots)
+
+    temp_fname = tmp_path / ('test' + ext)
+    with pytest.warns(RuntimeWarning, match="'short' format. Converting"):
+        raw.export(temp_fname)
+    raw_read = read_raw_brainvision(str(temp_fname).replace('.eeg', '.vhdr'))
+    assert raw.ch_names == raw_read.ch_names
+    assert_allclose(raw.times, raw_read.times)
+    assert_allclose(raw.get_data(), raw_read.get_data())
+
+
+@requires_version('pymatreader')
 @pytest.mark.skipif(not _check_eeglabio_installed(strict=False),
                     reason='eeglabio not installed')
 def test_export_raw_eeglab(tmp_path):
     """Test saving a Raw instance to EEGLAB's set format."""
-    fname = (Path(__file__).parent.parent.parent /
-             "io" / "tests" / "data" / "test_raw.fif")
-    raw = read_raw_fif(fname)
-    raw.load_data()
+    raw = read_raw_fif(fname_raw, preload=True)
+    raw.apply_proj()
     temp_fname = op.join(str(tmp_path), 'test.set')
     raw.export(temp_fname)
     raw.drop_channels([ch for ch in ['epoc']
@@ -51,6 +96,20 @@ def test_export_raw_eeglab(tmp_path):
     assert_allclose(raw.times, raw_read.times)
     assert_allclose(raw.get_data(), raw_read.get_data())
 
+    # test overwrite
+    with pytest.raises(FileExistsError, match='Destination file exists'):
+        raw.export(temp_fname, overwrite=False)
+    raw.export(temp_fname, overwrite=True)
+
+    # test pathlib.Path files
+    raw.export(Path(temp_fname), overwrite=True)
+
+    # test warning with unapplied projectors
+    raw = read_raw_fif(fname_raw, preload=True)
+    with pytest.warns(RuntimeWarning,
+                      match='Raw instance has unapplied projectors.'):
+        raw.export(temp_fname, overwrite=True)
+
 
 @pytest.mark.skipif(not _check_edflib_installed(strict=False),
                     reason='edflib-python not installed')
@@ -58,28 +117,25 @@ def test_double_export_edf(tmp_path):
     """Test exporting an EDF file multiple times."""
     rng = np.random.RandomState(123456)
     format = 'edf'
-    ch_types = ['eeg', 'eeg', 'stim', 'ecog', 'ecog', 'seeg',
-                'eog', 'ecg', 'emg', 'dbs', 'bio']
-    ch_names = np.arange(len(ch_types)).astype(str).tolist()
-    info = create_info(ch_names, sfreq=1000,
-                       ch_types=ch_types)
-    data = rng.random(size=(len(ch_names), 1000)) * 1.e-5
+    ch_types = ['eeg', 'eeg', 'stim', 'ecog', 'ecog', 'seeg', 'eog', 'ecg',
+                'emg', 'dbs', 'bio']
+    info = create_info(len(ch_types), sfreq=1000, ch_types=ch_types)
+    data = rng.random(size=(len(ch_types), 1000)) * 1e-5
 
     # include subject info and measurement date
-    subject_info = dict(first_name='mne', last_name='python',
-                        birthday=(1992, 1, 20), sex=1, hand=3)
-    info['subject_info'] = subject_info
+    info['subject_info'] = dict(first_name='mne', last_name='python',
+                                birthday=(1992, 1, 20), sex=1, hand=3)
     raw = RawArray(data, info)
 
     # export once
-    temp_fname = op.join(str(tmp_path), f'test.{format}')
+    temp_fname = tmp_path / f'test.{format}'
     raw.export(temp_fname, add_ch_type=True)
-    raw_read = read_raw_edf(temp_fname, preload=True)
+    raw_read = read_raw_edf(temp_fname, infer_types=True, preload=True)
 
     # export again
     raw_read.load_data()
-    raw_read.export(temp_fname, add_ch_type=True)
-    raw_read = read_raw_edf(temp_fname, preload=True)
+    raw_read.export(temp_fname, add_ch_type=True, overwrite=True)
+    raw_read = read_raw_edf(temp_fname, infer_types=True, preload=True)
 
     # stim channel should be dropped
     raw.drop_channels('2')
@@ -156,7 +212,7 @@ def test_rawarray_edf(tmp_path):
     temp_fname = op.join(str(tmp_path), f'test.{format}')
 
     raw.export(temp_fname, add_ch_type=True)
-    raw_read = read_raw_edf(temp_fname, preload=True)
+    raw_read = read_raw_edf(temp_fname, infer_types=True, preload=True)
 
     # stim channel should be dropped
     raw.drop_channels('2')
@@ -180,28 +236,28 @@ def test_rawarray_edf(tmp_path):
     raw_bad.rename_channels({'1': 'abcdefghijklmnopqrstuvwxyz'})
     with pytest.raises(RuntimeError, match='Signal label'), \
             pytest.warns(RuntimeWarning, match='Data has a non-integer'):
-        raw_bad.export(temp_fname)
+        raw_bad.export(temp_fname, overwrite=True)
 
     # include bad birthday that is non-EDF compliant
     bad_info = info.copy()
     bad_info['subject_info']['birthday'] = (1700, 1, 20)
     raw = RawArray(data, bad_info)
     with pytest.raises(RuntimeError, match='Setting patient birth date'):
-        raw.export(temp_fname)
+        raw.export(temp_fname, overwrite=True)
 
     # include bad measurement date that is non-EDF compliant
     raw = RawArray(data, info)
     meas_date = datetime(year=1984, month=1, day=1, tzinfo=timezone.utc)
     raw.set_meas_date(meas_date)
     with pytest.raises(RuntimeError, match='Setting start date time'):
-        raw.export(temp_fname)
+        raw.export(temp_fname, overwrite=True)
 
     # test that warning is raised if there are non-voltage based channels
     raw = RawArray(data, info)
     with pytest.warns(RuntimeWarning, match='The unit'):
         raw.set_channel_types({'9': 'hbr'})
     with pytest.warns(RuntimeWarning, match='Non-voltage channels'):
-        raw.export(temp_fname)
+        raw.export(temp_fname, overwrite=True)
 
     # data should match up to the non-accepted channel
     raw_read = read_raw_edf(temp_fname, preload=True)
@@ -228,20 +284,19 @@ def test_rawarray_edf(tmp_path):
 @pytest.mark.parametrize(
     ['dataset', 'format'], [
         ['test', 'edf'],
-        pytest.param('misc', 'edf', marks=pytest.mark.slowtest),
+        pytest.param('misc', 'edf', marks=[pytest.mark.slowtest,
+                                           misc._pytest_mark()]),
     ])
 def test_export_raw_edf(tmp_path, dataset, format):
     """Test saving a Raw instance to EDF format."""
     if dataset == 'test':
-        fname = _resource_path('mne.io.tests.data', 'test_raw.fif')
-        raw = read_raw_fif(fname)
+        raw = read_raw_fif(fname_raw)
     elif dataset == 'misc':
-        fname = op.join(misc.data_path(), 'ecog', 'sample_ecog_ieeg.fif')
+        fname = op.join(misc_path, 'ecog', 'sample_ecog_ieeg.fif')
         raw = read_raw_fif(fname)
 
     # only test with EEG channels
-    raw.pick_types(eeg=True, ecog=True, seeg=True,
-                   eog=True, ecg=True, emg=True)
+    raw.pick_types(eeg=True, ecog=True, seeg=True)
     raw.load_data()
     orig_ch_names = raw.ch_names
     temp_fname = op.join(str(tmp_path), f'test.{format}')
@@ -255,9 +310,8 @@ def test_export_raw_edf(tmp_path, dataset, format):
         raw.export(temp_fname, physical_range=(0, 1e6))
 
     if dataset == 'test':
-        orig_ch_names = [ch.split(' ')[1] for ch in raw.ch_names]
         with pytest.warns(RuntimeWarning, match='Data has a non-integer'):
-            raw.export(temp_fname, add_ch_type=False)
+            raw.export(temp_fname)
     elif dataset == 'misc':
         with pytest.warns(RuntimeWarning, match='EDF format requires'):
             raw.export(temp_fname)
@@ -288,16 +342,25 @@ def test_export_raw_edf(tmp_path, dataset, format):
         raw.times, raw_read.times[:orig_raw_len], rtol=0, atol=1e-5)
 
 
+@pytest.mark.xfail(reason='eeglabio (usage?) bugs that should be fixed')
+@requires_version('pymatreader')
 @pytest.mark.skipif(not _check_eeglabio_installed(strict=False),
                     reason='eeglabio not installed')
 @pytest.mark.parametrize('preload', (True, False))
 def test_export_epochs_eeglab(tmp_path, preload):
     """Test saving an Epochs instance to EEGLAB's set format."""
+    import eeglabio
     raw, events = _get_data()[:2]
     raw.load_data()
     epochs = Epochs(raw, events, preload=preload)
     temp_fname = op.join(str(tmp_path), 'test.set')
-    epochs.export(temp_fname)
+    # TODO: eeglabio 0.2 warns about invalid events
+    if _compare_version(eeglabio.__version__, '==', '0.0.2-1'):
+        ctx = _record_warnings
+    else:
+        ctx = nullcontext
+    with ctx():
+        epochs.export(temp_fname)
     epochs.drop_channels([ch for ch in ['epoc', 'STI 014']
                           if ch in epochs.ch_names])
     epochs_read = read_epochs_eeglab(temp_fname)
@@ -313,7 +376,24 @@ def test_export_epochs_eeglab(tmp_path, preload):
     assert_allclose(epochs.times, epochs_read.times)
     assert_allclose(epochs.get_data(), epochs_read.get_data())
 
+    # test overwrite
+    with pytest.raises(FileExistsError, match='Destination file exists'):
+        epochs.export(temp_fname, overwrite=False)
+    with ctx():
+        epochs.export(temp_fname, overwrite=True)
 
+    # test pathlib.Path files
+    with ctx():
+        epochs.export(Path(temp_fname), overwrite=True)
+
+    # test warning with unapplied projectors
+    epochs = Epochs(raw, events, preload=preload, proj=False)
+    with pytest.warns(RuntimeWarning,
+                      match='Epochs instance has unapplied projectors.'):
+        epochs.export(Path(temp_fname), overwrite=True)
+
+
+@pytest.mark.filterwarnings('ignore::FutureWarning')
 @requires_version('mffpy', '0.5.7')
 @testing.requires_testing_data
 @pytest.mark.parametrize('fmt', ('auto', 'mff'))
@@ -339,7 +419,7 @@ def test_export_evokeds_to_mff(tmp_path, fmt, do_history):
     if do_history:
         export_evokeds_mff(export_fname, evoked, history=history)
     else:
-        export_evokeds(export_fname, evoked)
+        export_evokeds(export_fname, evoked, fmt=fmt)
     # Drop non-EEG channels
     evoked = [ave.drop_channels(['ECG', 'EMG']) for ave in evoked]
     evoked_exported = read_evokeds_mff(export_fname)
@@ -355,7 +435,25 @@ def test_export_evokeds_to_mff(tmp_path, fmt, do_history):
         assert ave_exported.comment == ave.comment
         assert_allclose(ave_exported.times, ave.times)
 
+    # test overwrite
+    with pytest.raises(FileExistsError, match='Destination file exists'):
+        if do_history:
+            export_evokeds_mff(export_fname, evoked, history=history,
+                               overwrite=False)
+        else:
+            export_evokeds(export_fname, evoked, overwrite=False)
 
+    if do_history:
+        export_evokeds_mff(export_fname, evoked, history=history,
+                           overwrite=True)
+    else:
+        export_evokeds(export_fname, evoked, overwrite=True)
+
+    # test export from evoked directly
+    evoked[0].export(export_fname, overwrite=True)
+
+
+@pytest.mark.filterwarnings('ignore::FutureWarning')
 @requires_version('mffpy', '0.5.7')
 @testing.requires_testing_data
 def test_export_to_mff_no_device():
@@ -366,6 +464,7 @@ def test_export_to_mff_no_device():
         export_evokeds('output.mff', evoked)
 
 
+@pytest.mark.filterwarnings('ignore::FutureWarning')
 @requires_version('mffpy', '0.5.7')
 def test_export_to_mff_incompatible_sfreq():
     """Test non-whole number sampling frequency throws ValueError."""
@@ -377,10 +476,12 @@ def test_export_to_mff_incompatible_sfreq():
 @pytest.mark.parametrize('fmt,ext', [
     ('EEGLAB', 'set'),
     ('EDF', 'edf'),
-    ('BrainVision', 'eeg')
+    ('BrainVision', 'vhdr'),
+    ('auto', 'vhdr')
 ])
 def test_export_evokeds_unsupported_format(fmt, ext):
     """Test exporting evoked dataset to non-supported formats."""
     evoked = read_evokeds(fname_evoked)
-    with pytest.raises(NotImplementedError, match=f'Export to {fmt} not imp'):
-        export_evokeds(f'output.{ext}', evoked)
+    errstr = fmt.lower() if fmt != "auto" else "vhdr"
+    with pytest.raises(ValueError, match=f"Format '{errstr}' is not .*"):
+        export_evokeds(f'output.{ext}', evoked, fmt=fmt)

@@ -6,16 +6,17 @@
 #
 # License: BSD-3-Clause
 
-from inspect import isfunction
+from inspect import isfunction, signature, Parameter
 from collections import namedtuple
+from collections.abc import Sequence
 from copy import deepcopy
 from numbers import Integral
 from time import time
 from dataclasses import dataclass
 from typing import Optional, List
+import warnings
 
 import math
-import os
 import json
 
 import numpy as np
@@ -27,6 +28,8 @@ from .infomax_ import infomax
 
 from ..cov import compute_whitener
 from .. import Covariance, Evoked
+from ..defaults import (_BORDER_DEFAULT, _EXTRAPOLATE_DEFAULT,
+                        _INTERPOLATION_DEFAULT)
 from ..io.pick import (pick_types, pick_channels, pick_info,
                        _picks_to_idx, _get_channel_types, _DATA_CH_TYPES_SPLIT)
 from ..io.proj import make_projector
@@ -36,7 +39,7 @@ from ..io.write import (write_double_matrix, write_string,
 from ..io.tree import dir_tree_find
 from ..io.open import fiff_open
 from ..io.tag import read_tag
-from ..io.meas_info import write_meas_info, read_meas_info
+from ..io.meas_info import write_meas_info, read_meas_info, ContainsMixin
 from ..io.constants import FIFF
 from ..io.base import BaseRaw
 from ..io.eeglab.eeglab import _get_info, _check_load_mat
@@ -47,22 +50,24 @@ from ..viz import (plot_ica_components, plot_ica_scores,
 from ..viz.ica import plot_ica_properties
 from ..viz.topomap import _plot_corrmap
 
-from ..channels.channels import _contains_ch_type, ContainsMixin
-from ..io.write import start_file, end_file, write_id
-from ..utils import (check_version, logger, check_fname, verbose,
+from ..channels.channels import _contains_ch_type
+from ..channels.layout import _find_topomap_coords
+from ..io.write import start_and_end_file, write_id
+from ..utils import (logger, check_fname, _check_fname, verbose,
                      _reject_data_segments, check_random_state, _validate_type,
-                     compute_corr, _get_inst_data, _ensure_int,
+                     compute_corr, _get_inst_data, _ensure_int, repr_html,
                      copy_function_doc_to_method_doc, _pl, warn, Bunch,
                      _check_preload, _check_compensation_grade, fill_doc,
-                     _check_option, _PCA, int_like,
-                     _check_all_same_channel_names)
+                     _check_option, _PCA, int_like, _require_version,
+                     _check_all_same_channel_names, _check_on_missing,
+                     _on_missing)
 
-from ..fixes import _get_args, _safe_svd
+from ..fixes import _safe_svd
 from ..filter import filter_data
 from .bads import _find_outliers
 from .ctps_ import ctps
 from ..io.pick import pick_channels_regexp, _picks_by_type
-from ..data.html_templates import ica_template
+
 
 __all__ = ('ICA', 'ica_find_ecg_events', 'ica_find_eog_events',
            'get_score_funcs', 'read_ica', 'read_ica_eeglab')
@@ -107,10 +112,16 @@ def get_score_funcs():
                           n not in _BLOCKLIST]
     score_funcs.update({n: _make_xy_sfunc(f)
                         for n, f in xy_arg_dist_funcs
-                        if _get_args(f) == ['u', 'v']})
-    score_funcs.update({n: _make_xy_sfunc(f, ndim_output=True)
-                        for n, f in xy_arg_stats_funcs
-                        if _get_args(f) == ['x', 'y']})
+                        if signature(f).parameters == ['u', 'v']})
+    # In SciPy 1.9+, pearsonr has (x, y, *, alternative='two-sided'), so we
+    # should just look at the positional_only and positional_or_keyword entries
+    for n, f in xy_arg_stats_funcs:
+        params = [name for name, param in signature(f).parameters.items()
+                  if param.kind in
+                  (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)]
+        if params == ['x', 'y']:
+            score_funcs.update({n: _make_xy_sfunc(f, ndim_output=True)})
+    assert 'pearsonr' in score_funcs
     return score_funcs
 
 
@@ -211,9 +222,8 @@ class ICA(ContainsMixin):
 
     Attributes
     ----------
-    current_fit : str
-        Flag informing about which data type (raw or epochs) was used for the
-        fit.
+    current_fit : 'unfitted' | 'raw' | 'epochs'
+        Which data type was used for the fit.
     ch_names : list-like
         Channel names resulting from initial picking.
     n_components_ : int
@@ -383,12 +393,6 @@ class ICA(ContainsMixin):
 
         if method != 'imported_eeglab':  # internal use only
             _check_option('method', method, _KNOWN_ICA_METHODS)
-        if method == 'fastica' and not check_version('sklearn'):
-            raise ImportError(
-                'The scikit-learn package is required for method="fastica".')
-        if method == 'picard' and not check_version('picard'):
-            raise ImportError(
-                'The python-picard package is required for method="picard".')
 
         self.noise_cov = noise_cov
 
@@ -403,7 +407,6 @@ class ICA(ContainsMixin):
                     'supported')
 
         self.current_fit = 'unfitted'
-        self.verbose = verbose
         self.n_components = n_components
         # In newer ICAs this should always be None, but keep it for
         # backward compat with older versions of MNE that used it
@@ -455,7 +458,6 @@ class ICA(ContainsMixin):
             fit_n_samples: Optional[int]
             fit_n_components: Optional[int]
             fit_n_pca_components: Optional[int]
-            fit_explained_variance: Optional[float]
             ch_types: List[str]
             excludes: List[str]
 
@@ -473,11 +475,6 @@ class ICA(ContainsMixin):
         fit_n_pca_components = getattr(self, 'pca_components_', None)
         if fit_n_pca_components is not None:
             fit_n_pca_components = len(self.pca_components_)
-        fit_explained_variance = getattr(self, 'pca_explained_variance_', None)
-        if fit_explained_variance is not None:
-            abs_vars = self.pca_explained_variance_
-            rel_vars = abs_vars / abs_vars.sum()
-            fit_explained_variance = rel_vars[:fit_n_components].sum()
 
         if self.info is not None:
             ch_types = [c for c in _DATA_CH_TYPES_SPLIT if c in self]
@@ -496,7 +493,6 @@ class ICA(ContainsMixin):
             fit_n_samples=fit_n_samples,
             fit_n_components=fit_n_components,
             fit_n_pca_components=fit_n_pca_components,
-            fit_explained_variance=fit_explained_variance,
             ch_types=ch_types,
             excludes=excludes
         )
@@ -514,8 +510,6 @@ class ICA(ContainsMixin):
                 f' (fit in {infos.fit_n_iter} iterations on '
                 f'{infos.fit_n_samples} samples), '
                 f'{infos.fit_n_components} ICA components '
-                f'explaining {round(infos.fit_explained_variance * 100, 1)} % '
-                f'of variance '
                 f'({infos.fit_n_pca_components} PCA components available), '
                 f'channel types: {", ".join(infos.ch_types)}, '
                 f'{len(infos.excludes) or "no"} sources marked for exclusion'
@@ -523,16 +517,18 @@ class ICA(ContainsMixin):
 
         return f'<ICA | {s}>'
 
+    @repr_html
     def _repr_html_(self):
+        from ..html_templates import repr_templates_env
         infos = self._get_infos_for_repr()
-        html = ica_template.substitute(
+        t = repr_templates_env.get_template('ica.html.jinja')
+        html = t.render(
             fit_on=infos.fit_on,
             method=infos.fit_method,
             n_iter=infos.fit_n_iter,
             n_samples=infos.fit_n_samples,
             n_components=infos.fit_n_components,
             n_pca_components=infos.fit_n_pca_components,
-            explained_variance=infos.fit_explained_variance,
             ch_types=infos.ch_types,
             excludes=infos.excludes
         )
@@ -565,9 +561,6 @@ class ICA(ContainsMixin):
         decim : int | None
             Increment for selecting only each n-th sampling point. If ``None``,
             all samples  between ``start`` and ``stop`` (inclusive) are used.
-
-            .. note:: This parameter only has an effect if ``inst`` is
-                      `~mne.io.Raw` data.
         reject, flat : dict | None
             Rejection parameters based on peak-to-peak amplitude (PTP)
             in the continuous data. Signal periods exceeding the thresholds
@@ -598,13 +591,18 @@ class ICA(ContainsMixin):
         %(reject_by_annotation_raw)s
 
             .. versionadded:: 0.14.0
-        %(verbose_meth)s
+        %(verbose)s
 
         Returns
         -------
         self : instance of ICA
             Returns the modified instance.
         """
+        req_map = dict(fastica='sklearn', picard='picard')
+        for method, mod in req_map.items():
+            if self.method == method:
+                _require_version(mod, f'use method={repr(method)}')
+
         _validate_type(inst, (BaseRaw, BaseEpochs), 'inst', 'Raw or Epochs')
 
         if np.isclose(inst.info['highpass'], 0.):
@@ -620,8 +618,8 @@ class ICA(ContainsMixin):
         if not isinstance(inst, BaseRaw):
             ignored_params = [
                 param_name for param_name, param_val in zip(
-                    ('start', 'stop', 'decim', 'reject', 'flat'),
-                    (start, stop, decim, reject, flat)
+                    ('start', 'stop', 'reject', 'flat'),
+                    (start, stop, reject, flat)
                 )
                 if param_val is not None
             ]
@@ -680,6 +678,7 @@ class ICA(ContainsMixin):
                     'pca_mean_', 'n_iter_', 'drop_inds_', 'reject_'):
             if hasattr(self, key):
                 delattr(self, key)
+        self.current_fit = 'unfitted'
 
     def _fit_raw(self, raw, picks, start, stop, decim, reject, flat, tstep,
                  reject_by_annotation, verbose):
@@ -960,6 +959,141 @@ class ICA(ContainsMixin):
         return np.dot(self.mixing_matrix_[:, :self.n_components_].T,
                       self.pca_components_[:self.n_components_]).T
 
+    def get_explained_variance_ratio(
+        self, inst, *, components=None, ch_type=None
+    ):
+        """Get the proportion of data variance explained by ICA components.
+
+        Parameters
+        ----------
+        inst : mne.io.BaseRaw | mne.BaseEpochs | mne.Evoked
+            The uncleaned data.
+        components : array-like of int | int | None
+            The component(s) for which to do the calculation. If more than one
+            component is specified, explained variance will be calculated
+            jointly across all supplied components. If ``None`` (default), uses
+            all available components.
+        ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg' | array-like of str | None
+            The channel type(s) to include in the calculation. If ``None``, all
+            available channel types will be used.
+
+        Returns
+        -------
+        dict (str, float)
+            The fraction of variance in ``inst`` that can be explained by the
+            ICA components, calculated separately for each channel type.
+            Dictionary keys are the channel types, and corresponding explained
+            variance ratios are the values.
+
+        Notes
+        -----
+        A value similar to EEGLAB's ``pvaf`` (percent variance accounted for)
+        will be calculated for the specified component(s).
+
+        Since ICA components cannot be assumed to be aligned orthogonally, the
+        sum of the proportion of variance explained by all components may not
+        be equal to 1. In certain situations, the proportion of variance
+        explained by a component may even be negative.
+
+        .. versionadded:: 1.2
+        """  # noqa: E501
+        if self.current_fit == 'unfitted':
+            raise ValueError('ICA must be fitted first.')
+
+        _validate_type(
+            item=inst, types=(BaseRaw, BaseEpochs, Evoked),
+            item_name='inst'
+        )
+        _validate_type(
+            item=components, types=(None, 'int-like', Sequence, np.ndarray),
+            item_name='components', type_name='int, array-like of int, or None'
+        )
+        if isinstance(components, (Sequence, np.ndarray)):
+            for item in components:
+                _validate_type(
+                    item=item, types='int-like',
+                    item_name='Elements of "components"'
+                )
+
+        _validate_type(
+            item=ch_type, types=(Sequence, np.ndarray, str, None),
+            item_name='ch_type', type_name='str, array-like of str, or None'
+        )
+        if isinstance(ch_type, str):
+            ch_types = [ch_type]
+        elif ch_type is None:
+            ch_types = inst.get_channel_types(unique=True, only_data_chs=True)
+        else:
+            assert isinstance(ch_type, (Sequence, np.ndarray))
+            ch_types = ch_type
+
+        assert len(ch_types) >= 1
+        allowed_ch_types = ('mag', 'grad', 'planar1', 'planar2', 'eeg')
+        for ch_type in ch_types:
+            if ch_type not in allowed_ch_types:
+                raise ValueError(
+                    f'You requested operation on the channel type '
+                    f'"{ch_type}", but only the following channel types are '
+                    f'supported: {", ".join(allowed_ch_types)}'
+                )
+        del ch_type
+
+        # Input data validation ends here
+        if components is None:
+            components = range(self.n_components_)
+
+        explained_var_ratios = [
+            self._get_explained_variance_ratio_one_ch_type(
+                inst=inst, components=components, ch_type=ch_type
+            ) for ch_type in ch_types
+        ]
+        result = dict(zip(ch_types, explained_var_ratios))
+        return result
+
+    def _get_explained_variance_ratio_one_ch_type(
+        self, *, inst, components, ch_type
+    ):
+        # The algorithm implemented below should be equivalent to
+        # https://sccn.ucsd.edu/pipermail/eeglablist/2014/009134.html
+        #
+        # Reconstruct ("back-project") the data using only the specified ICA
+        # components. Don't make use of potential "spare" PCA components in
+        # this process – we're only interested in the contribution of the ICA
+        # components!
+        kwargs = dict(
+            inst=inst.copy(),
+            include=[components],
+            exclude=[],
+            n_pca_components=0,
+            verbose=False,
+        )
+        if (
+            isinstance(inst, (BaseEpochs, Evoked)) and
+            inst.baseline is not None
+        ):
+            # Don't warn if data was baseline-corrected.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    action='ignore',
+                    message='The data.*was baseline-corrected',
+                    category=RuntimeWarning
+                )
+                inst_recon = self.apply(**kwargs)
+        else:
+            inst_recon = self.apply(**kwargs)
+
+        data_recon = inst_recon.get_data(picks=ch_type)
+        data_orig = inst.get_data(picks=ch_type)
+        data_diff = data_orig - data_recon
+
+        # To estimate the data variance, we first compute the variance across
+        # channels at each time point, and then we average these variances.
+        mean_var_diff = data_diff.var(axis=0).mean()
+        mean_var_orig = data_orig.var(axis=0).mean()
+
+        var_explained_ratio = 1 - mean_var_diff / mean_var_orig
+        return var_explained_ratio
+
     def get_sources(self, inst, add_channels=None, start=None, stop=None):
         """Estimate sources given the unmixing matrix.
 
@@ -1012,13 +1146,23 @@ class ICA(ContainsMixin):
         start, stop = _check_start_stop(raw, start, stop)
         data_ = self._transform_raw(raw, start=start, stop=stop)
         assert data_.shape[1] == stop - start
-        if raw.preload:  # get data and temporarily delete
-            data = raw._data
-            del raw._data
 
-        out = raw.copy()  # copy and reappend
+        preloaded = raw.preload
         if raw.preload:
-            raw._data = data
+            # get data and temporarily delete
+            data = raw._data
+            raw.preload = False
+            del raw._data
+        # copy and crop here so that things like annotations are adjusted
+        try:
+            out = raw.copy().crop(
+                start / raw.info['sfreq'],
+                (stop - 1) / raw.info['sfreq'])
+        finally:
+            # put the data back (always)
+            if preloaded:
+                raw.preload = True
+                raw._data = data
 
         # populate copied raw.
         if add_channels is not None and len(add_channels):
@@ -1026,10 +1170,10 @@ class ICA(ContainsMixin):
             data_ = np.concatenate([
                 data_, raw.get_data(picks, start=start, stop=stop)])
         out._data = data_
+        out._first_samps = [out.first_samp]
+        out._last_samps = [out.last_samp]
         out._filenames = [None]
         out.preload = True
-        out._first_samps[:] = [out.first_samp + start]
-        out._last_samps[:] = [out.first_samp + data_.shape[1] - 1]
         out._projector = None
         self._export_info(out.info, raw, add_channels)
 
@@ -1136,7 +1280,7 @@ class ICA(ContainsMixin):
         %(reject_by_annotation_all)s
 
             .. versionadded:: 0.14.0
-        %(verbose_meth)s
+        %(verbose)s
 
         Returns
         -------
@@ -1333,7 +1477,7 @@ class ICA(ContainsMixin):
 
             .. versionadded:: 0.14.0
         %(measure)s
-        %(verbose_meth)s
+        %(verbose)s
 
         Returns
         -------
@@ -1345,7 +1489,7 @@ class ICA(ContainsMixin):
 
         See Also
         --------
-        find_bads_eog, find_bads_ref
+        find_bads_eog, find_bads_ref, find_bads_muscle
 
         Notes
         -----
@@ -1469,7 +1613,7 @@ class ICA(ContainsMixin):
 
             .. versionadded:: 0.21
         %(measure)s
-        %(verbose_meth)s
+        %(verbose)s
 
         Returns
         -------
@@ -1480,7 +1624,7 @@ class ICA(ContainsMixin):
 
         See Also
         --------
-        find_bads_ecg, find_bads_eog
+        find_bads_ecg, find_bads_eog, find_bads_muscle
 
         Notes
         -----
@@ -1569,11 +1713,110 @@ class ICA(ContainsMixin):
             normrats = np.linalg.norm(weights[ref_picks], axis=0) \
                 / np.linalg.norm(weights[meg_picks], axis=0)
             scores = np.log(normrats)
-            self.labels_['ref_meg'] = list(_find_outliers(scores,
-                                           threshold=threshold,
-                                           tail=1))
+            self.labels_['ref_meg'] = list(_find_outliers(
+                scores, threshold=threshold, tail=1))
 
         return self.labels_['ref_meg'], scores
+
+    @verbose
+    def find_bads_muscle(self, inst, threshold=0.5, start=None,
+                         stop=None, l_freq=7, h_freq=45, sphere=None,
+                         verbose=None):
+        """Detect muscle related components.
+
+        Detection is based on :footcite:`DharmapraniEtAl2016` which uses
+        data from a subject who has been temporarily paralyzed
+        :footcite:`WhithamEtAl2007`. The criteria are threefold:
+        1) Positive log-log spectral slope from 7 to 45 Hz
+        2) Peripheral component power (farthest away from the vertex)
+        3) A single focal point measured by low spatial smoothness
+
+        The threshold is relative to the slope, focal point and smoothness
+        of a typical muscle-related ICA component. Note the high frequency
+        of the power spectral density slope was 75 Hz in the reference but
+        has been modified to 45 Hz as a default based on the criteria being
+        more accurate in practice.
+
+        Parameters
+        ----------
+        inst : instance of Raw, Epochs or Evoked
+            Object to compute sources from.
+        threshold : float | str
+            Value above which a component should be marked as muscle-related,
+            relative to a typical muscle component.
+        start : int | float | None
+            First sample to include. If float, data will be interpreted as
+            time in seconds. If None, data will be used from the first sample.
+        stop : int | float | None
+            Last sample to not include. If float, data will be interpreted as
+            time in seconds. If None, data will be used to the last sample.
+        l_freq : float
+            Low frequency for muscle-related power.
+        h_freq : float
+            High frequency for msucle related power.
+        %(sphere_topomap_auto)s
+        %(verbose)s
+
+        Returns
+        -------
+        muscle_idx : list of int
+            The indices of EOG related components, sorted by score.
+        scores : np.ndarray of float, shape (``n_components_``) | list of array
+            The correlation scores.
+
+        See Also
+        --------
+        find_bads_ecg, find_bads_eog, find_bads_ref
+
+        Notes
+        -----
+        .. versionadded:: 1.1
+        """
+        from scipy.spatial.distance import pdist, squareform
+        _validate_type(threshold, 'numeric', 'threshold')
+
+        sources = self.get_sources(inst, start=start, stop=stop)
+        components = self.get_components()
+
+        # compute metric #1: slope of the log-log psd
+        spectrum = sources.compute_psd(fmin=l_freq, fmax=h_freq, picks='misc')
+        psds, freqs = spectrum.get_data(return_freqs=True)
+        if psds.ndim > 2:
+            psds = psds.mean(axis=0)
+        slopes = np.polyfit(np.log10(freqs), np.log10(psds).T, 1)[0]
+
+        # compute metric #2: distance from the vertex of focus
+        components_norm = abs(components) / np.max(abs(components), axis=0)
+        pos = _find_topomap_coords(inst.info, picks='data', sphere=sphere)
+        assert pos.shape[0] == components.shape[0]  # pos for each sensor
+        pos -= pos.mean(axis=0)  # center
+        dists = np.linalg.norm(pos, axis=1)
+        dists /= dists.max()
+        focus_dists = np.dot(dists, components_norm)
+
+        # compute metric #3: smoothness
+        smoothnesses = np.zeros((components.shape[1],))
+        dists = squareform(pdist(pos))
+        dists = 1 - (dists / dists.max())  # invert
+        for idx, comp in enumerate(components.T):
+            comp_dists = squareform(pdist(comp[:, np.newaxis]))
+            comp_dists /= comp_dists.max()
+            smoothnesses[idx] = np.multiply(dists, comp_dists).sum()
+
+        # typical muscle slope is ~0.15, non-muscle components negative
+        # so logistic with shift -0.5 and slope 0.25 so -0.5 -> 0.5 and 0->1
+        # focus distance is ~65% of max electrode distance with 10% slope
+        # (assumes typical head size)
+        # smoothnessness is around 150 for muscle and 450 otherwise
+        # so use reversed logistic centered at 300 with 100 slope
+        # multiply so that all three components must be present
+        scores = (1 / (1 + np.exp(-(slopes + 0.5) / 0.25))) * \
+            (1 / (1 + np.exp(-(focus_dists - 0.65) / 0.1))) * \
+            (1 - (1 / (1 + np.exp(-(smoothnesses - 300) / 100))))
+        # scale the threshold by the use of three metrics
+        self.labels_['muscle'] = [idx for idx, score in enumerate(scores)
+                                  if score > threshold**3]
+        return self.labels_['muscle'], scores
 
     @verbose
     def find_bads_eog(self, inst, ch_name=None, threshold=3.0, start=None,
@@ -1619,7 +1862,7 @@ class ICA(ContainsMixin):
 
             .. versionadded:: 0.14.0
         %(measure)s
-        %(verbose_meth)s
+        %(verbose)s
 
         Returns
         -------
@@ -1654,7 +1897,7 @@ class ICA(ContainsMixin):
 
     @verbose
     def apply(self, inst, include=None, exclude=None, n_pca_components=None,
-              start=None, stop=None, verbose=None):
+              start=None, stop=None, *, on_baseline='warn', verbose=None):
         """Remove selected components from the signal.
 
         Given the unmixing matrix, transform the data,
@@ -1669,10 +1912,15 @@ class ICA(ContainsMixin):
             in-place.
         include : array_like of int
             The indices referring to columns in the ummixing matrix. The
-            components to be kept.
+            components to be kept. If ``None`` (default), all components
+            will be included (minus those defined in ``ica.exclude``
+            and the ``exclude`` parameter, see below).
         exclude : array_like of int
             The indices referring to columns in the ummixing matrix. The
-            components to be zeroed out.
+            components to be zeroed out. If ``None`` (default) or an
+            empty list, only components from ``ica.exclude`` will be
+            excluded. Else, the union of ``exclude`` and ``ica.exclude``
+            will be excluded.
         %(n_pca_components_apply)s
         start : int | float | None
             First sample to include. If float, data will be interpreted as
@@ -1680,7 +1928,8 @@ class ICA(ContainsMixin):
         stop : int | float | None
             Last sample to not include. If float, data will be interpreted as
             time in seconds. If None, data will be used to the last sample.
-        %(verbose_meth)s
+        %(on_baseline_ica)s
+        %(verbose)s
 
         Returns
         -------
@@ -1716,15 +1965,26 @@ class ICA(ContainsMixin):
         _check_compensation_grade(self.info, inst.info, 'ICA', kind,
                                   ch_names=self.ch_names)
 
+        _check_on_missing(on_baseline, 'on_baseline', extras=('reapply',))
+        reapply_baseline = False
         if isinstance(inst, (BaseEpochs, Evoked)):
             if getattr(inst, 'baseline', None) is not None:
-                warn('The data you passed to ICA.apply() was '
-                     'baseline-corrected. Please note that ICA can introduce '
-                     'DC shifts, therefore you may wish to consider '
-                     'baseline-correcting the cleaned data again.')
+                if on_baseline == 'reapply':
+                    reapply_baseline = True
+                else:
+                    msg = (
+                        'The data you passed to ICA.apply() was '
+                        'baseline-corrected. Please note that ICA can '
+                        'introduce DC shifts, therefore you may wish to '
+                        'consider baseline-correcting the cleaned data again.'
+                    )
+                    _on_missing(on_baseline, msg, 'on_baseline')
 
         logger.info(f'Applying ICA to {kind} instance')
-        return meth(**kwargs)
+        out = meth(**kwargs)
+        if reapply_baseline:
+            out.apply_baseline(inst.baseline)
+        return out
 
     def _check_exclude(self, exclude):
         if exclude is None:
@@ -1869,7 +2129,7 @@ class ICA(ContainsMixin):
         return data
 
     @verbose
-    def save(self, fname, verbose=None):
+    def save(self, fname, *, overwrite=False, verbose=None):
         """Store ICA solution into a fiff file.
 
         Parameters
@@ -1877,7 +2137,10 @@ class ICA(ContainsMixin):
         fname : str
             The absolute path of the file name to save the ICA solution into.
             The file name should end with -ica.fif or -ica.fif.gz.
-        %(verbose_meth)s
+        %(overwrite)s
+
+            .. versionadded:: 1.0
+        %(verbose)s
 
         Returns
         -------
@@ -1893,18 +2156,11 @@ class ICA(ContainsMixin):
 
         check_fname(fname, 'ICA', ('-ica.fif', '-ica.fif.gz',
                                    '_ica.fif', '_ica.fif.gz'))
+        fname = _check_fname(fname, overwrite=overwrite)
 
         logger.info('Writing ICA solution to %s...' % fname)
-        fid = start_file(fname)
-
-        try:
+        with start_and_end_file(fname) as fid:
             _write_ica(fid, self)
-            end_file(fid)
-        except Exception:
-            end_file(fid)
-            os.remove(fname)
-            raise
-
         return self
 
     def copy(self):
@@ -1921,10 +2177,10 @@ class ICA(ContainsMixin):
     def plot_components(self, picks=None, ch_type=None, res=64,
                         vmin=None, vmax=None, cmap='RdBu_r', sensors=True,
                         colorbar=False, title=None, show=True, outlines='head',
-                        contours=6, image_interp='bilinear',
-                        inst=None, plot_std=True, topomap_args=None,
-                        image_args=None, psd_args=None, reject='auto',
-                        sphere=None, verbose=None):
+                        contours=6, image_interp=_INTERPOLATION_DEFAULT,
+                        inst=None, plot_std=True,
+                        topomap_args=None, image_args=None, psd_args=None,
+                        reject='auto', sphere=None, verbose=None):
         return plot_ica_components(self, picks=picks, ch_type=ch_type,
                                    res=res, vmin=vmin,
                                    vmax=vmax, cmap=cmap, sensors=sensors,
@@ -1939,11 +2195,13 @@ class ICA(ContainsMixin):
 
     @copy_function_doc_to_method_doc(plot_ica_properties)
     def plot_properties(self, inst, picks=None, axes=None, dB=True,
-                        plot_std=True, topomap_args=None, image_args=None,
-                        psd_args=None, figsize=None, show=True, reject='auto',
-                        reject_by_annotation=True, *, verbose=None):
+                        plot_std=True, log_scale=False, topomap_args=None,
+                        image_args=None, psd_args=None, figsize=None,
+                        show=True, reject='auto', reject_by_annotation=True,
+                        *, verbose=None):
         return plot_ica_properties(self, inst, picks=picks, axes=axes,
                                    dB=dB, plot_std=plot_std,
+                                   log_scale=log_scale,
                                    topomap_args=topomap_args,
                                    image_args=image_args, psd_args=psd_args,
                                    figsize=figsize, show=show, reject=reject,
@@ -1954,12 +2212,15 @@ class ICA(ContainsMixin):
     def plot_sources(self, inst, picks=None, start=None,
                      stop=None, title=None, show=True, block=False,
                      show_first_samp=False, show_scrollbars=True,
-                     time_format='float'):
+                     time_format='float', precompute=None,
+                     use_opengl=None, *, theme=None, overview_mode=None):
         return plot_ica_sources(self, inst=inst, picks=picks,
                                 start=start, stop=stop, title=title, show=show,
                                 block=block, show_first_samp=show_first_samp,
                                 show_scrollbars=show_scrollbars,
-                                time_format=time_format)
+                                time_format=time_format,
+                                precompute=precompute, use_opengl=use_opengl,
+                                theme=theme, overview_mode=overview_mode)
 
     @copy_function_doc_to_method_doc(plot_ica_scores)
     def plot_scores(self, scores, exclude=None, labels=None, axhline=None,
@@ -1972,10 +2233,12 @@ class ICA(ContainsMixin):
 
     @copy_function_doc_to_method_doc(plot_ica_overlay)
     def plot_overlay(self, inst, exclude=None, picks=None, start=None,
-                     stop=None, title=None, show=True, n_pca_components=None):
+                     stop=None, title=None, show=True, n_pca_components=None,
+                     *, on_baseline='warn', verbose=None):
         return plot_ica_overlay(self, inst=inst, exclude=exclude, picks=picks,
                                 start=start, stop=stop, title=title, show=show,
-                                n_pca_components=n_pca_components)
+                                n_pca_components=n_pca_components,
+                                on_baseline=on_baseline, verbose=verbose)
 
     @verbose
     def _check_n_pca_components(self, _n_pca_comp, verbose=None):
@@ -2131,6 +2394,8 @@ def _find_sources(sources, target, score_func):
 
 def _ica_explained_variance(ica, inst, normalize=False):
     """Check variance accounted for by each component in supplied data.
+
+    This function is only used for sorting the components.
 
     Parameters
     ----------
@@ -2386,7 +2651,7 @@ def read_ica(fname, verbose=None):
         return x.astype(np.float64)
 
     ica_init = {k: v for k, v in ica_init.items()
-                if k in _get_args(ICA.__init__)}
+                if k in signature(ICA.__init__).parameters}
     ica = ICA(**ica_init)
     ica.current_fit = current_fit
     ica.ch_names = ch_names.split(':')
@@ -2487,12 +2752,14 @@ def _find_max_corrs(all_maps, target, threshold):
 
 
 @verbose
-def corrmap(icas, template, threshold="auto", label=None, ch_type="eeg",
-            plot=True, show=True, outlines='head',
-            sensors=True, contours=6, cmap=None, sphere=None, verbose=None):
+def corrmap(icas, template, threshold="auto", label=None, ch_type="eeg", *,
+            sensors=True, show_names=False, contours=6, outlines='head',
+            sphere=None, image_interp=_INTERPOLATION_DEFAULT,
+            extrapolate=_EXTRAPOLATE_DEFAULT, border=_BORDER_DEFAULT,
+            cmap=None, plot=True, show=True, verbose=None):
     """Find similar Independent Components across subjects by map similarity.
 
-    Corrmap (Viola et al. 2009 Clin Neurophysiol) identifies the best group
+    Corrmap :footcite:p:`CamposViolaEtAl2009` identifies the best group
     match to a supplied template. Typically, feed it a list of fitted ICAs and
     a template IC, for example, the blink for the first subject, to identify
     specific ICs across subjects.
@@ -2541,26 +2808,25 @@ def corrmap(icas, template, threshold="auto", label=None, ch_type="eeg",
         and the supplied ICs are not changed.
     ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg'
         The channel type to plot. Defaults to 'eeg'.
+    %(sensors_topomap)s
+    %(show_names_topomap)s
+    %(contours_topomap)s
+    %(outlines_topomap)s
+    %(sphere_topomap_auto)s
+    %(image_interp_topomap)s
+
+        .. versionadded:: 1.2
+    %(extrapolate_topomap)s
+
+        .. versionadded:: 1.2
+    %(border_topomap)s
+
+        .. versionadded:: 1.2
+    %(cmap_topomap_simple)s
     plot : bool
         Should constructed template and selected maps be plotted? Defaults
         to True.
-    show : bool
-        Show figures if True.
-    %(topomap_outlines)s
-    sensors : bool | str
-        Add markers for sensor locations to the plot. Accepts matplotlib plot
-        format string (e.g., 'r+' for red plusses). If True, a circle will be
-        used (via .add_artist). Defaults to True.
-    contours : int | array of float
-        The number of contour lines to draw. If 0, no contours will be drawn.
-        When an integer, matplotlib ticker locator is used to find suitable
-        values for the contour thresholds (may sometimes be inaccurate, use
-        array for accuracy). If an array, the values represent the levels for
-        the contours. Defaults to 6.
-    cmap : None | matplotlib colormap
-        Colormap for the plot. If ``None``, defaults to 'Reds_r' for norm data,
-        otherwise to 'RdBu_r'.
-    %(topomap_sphere_auto)s
+    %(show)s
     %(verbose)s
 
     Returns
@@ -2569,6 +2835,10 @@ def corrmap(icas, template, threshold="auto", label=None, ch_type="eeg",
         Figure showing the template.
     labelled_ics : Figure
         Figure showing the labelled ICs in all ICA decompositions.
+
+    References
+    ----------
+    .. footbibliography::
     """
     if not isinstance(plot, bool):
         raise ValueError("`plot` must be of type `bool`")
@@ -2607,12 +2877,11 @@ def corrmap(icas, template, threshold="auto", label=None, ch_type="eeg",
                 outlines=outlines, cmap=cmap, contours=contours,
                 show=show, topomap_args=dict(sphere=sphere))
         else:  # plotting an array
-            template_fig = _plot_corrmap([template], [0], [0], ch_type,
-                                         icas[0].copy(), "Template",
-                                         outlines=outlines, cmap=cmap,
-                                         contours=contours,
-                                         show=show, template=True,
-                                         sphere=sphere)
+            template_fig = _plot_corrmap(
+                [template], [0], [0], ch_type, icas[0].copy(), "Template",
+                outlines=outlines, cmap=cmap, contours=contours,
+                image_interp=image_interp, extrapolate=extrapolate,
+                border=border, show=show, template=True, sphere=sphere)
         template_fig.subplots_adjust(top=0.8)
         template_fig.canvas.draw()
 
@@ -2661,15 +2930,15 @@ def corrmap(icas, template, threshold="auto", label=None, ch_type="eeg",
     if len(nones) == 0:
         logger.info('At least 1 IC detected for each subject.')
     else:
-        logger.info('No maps selected for subject%s %s, '
-                    'consider a more liberal threshold.'
-                    % (_pl(nones), nones))
+        logger.info(f'No maps selected for subject{_pl(nones)} {nones}, '
+                    'consider a more liberal threshold.')
 
     if plot is True:
-        labelled_ics = _plot_corrmap(allmaps, subjs, indices, ch_type, ica,
-                                     label, outlines=outlines, cmap=cmap,
-                                     contours=contours,
-                                     show=show, sphere=sphere)
+        labelled_ics = _plot_corrmap(
+            allmaps, subjs, indices, ch_type, ica, label, outlines=outlines,
+            cmap=cmap, sensors=sensors, contours=contours, sphere=sphere,
+            image_interp=image_interp, extrapolate=extrapolate,
+            border=border, show=show, show_names=show_names)
         return template_fig, labelled_ics
     else:
         return None

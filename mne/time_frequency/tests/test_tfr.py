@@ -11,14 +11,14 @@ import mne
 from mne import (Epochs, read_events, pick_types, create_info, EpochsArray,
                  Info, Transform)
 from mne.io import read_raw_fif
-from mne.utils import (requires_h5py, requires_pandas, grand_average,
+from mne.utils import (requires_version, requires_pandas, grand_average,
                        catch_logging)
 from mne.time_frequency.tfr import (morlet, tfr_morlet, _make_dpss,
                                     tfr_multitaper, AverageTFR, read_tfrs,
                                     write_tfrs, combine_tfr, cwt, _compute_tfr,
                                     EpochsTFR)
 from mne.time_frequency import tfr_array_multitaper, tfr_array_morlet
-from mne.viz.utils import _fake_click
+from mne.viz.utils import _fake_click, _fake_keypress, _fake_scroll
 from mne.tests.test_epochs import assert_metadata_equal
 
 data_path = op.join(op.dirname(__file__), '..', '..', 'io', 'tests', 'data')
@@ -112,17 +112,19 @@ def test_time_frequency():
     # the other is average of the squared magnitudes (epochs PSD)
     # so values shouldn't match, but shapes should
     assert_array_equal(power.data.shape, power_evoked.data.shape)
-    pytest.raises(AssertionError, assert_allclose,
-                  power.data, power_evoked.data)
+    with pytest.raises(AssertionError, match='Not equal to tolerance'):
+        assert_allclose(power.data, power_evoked.data)
 
     # complex output
-    pytest.raises(ValueError, tfr_morlet, epochs, freqs, n_cycles,
-                  return_itc=False, average=True, output="complex")
-    pytest.raises(ValueError, tfr_morlet, epochs, freqs, n_cycles,
-                  output="complex", average=False, return_itc=True)
-    epochs_power_complex = tfr_morlet(epochs, freqs, n_cycles,
-                                      output="complex", average=False,
-                                      return_itc=False)
+    with pytest.raises(ValueError, match='must be "power" if average=True'):
+        tfr_morlet(epochs, freqs, n_cycles, return_itc=False, average=True,
+                   output='complex')
+    with pytest.raises(ValueError, match='Inter-trial coher.*average=False'):
+        tfr_morlet(epochs, freqs, n_cycles, return_itc=True, average=False,
+                   output='complex')
+    epochs_power_complex = tfr_morlet(
+        epochs, freqs, n_cycles, return_itc=False, average=False,
+        output='complex')
     epochs_amplitude_2 = abs(epochs_power_complex)
     epochs_amplitude_3 = epochs_amplitude_2.copy()
     epochs_amplitude_3.data[:] = np.inf  # test that it's actually copied
@@ -130,6 +132,21 @@ def test_time_frequency():
     # test that the power computed via `complex` is equivalent to power
     # computed within the method.
     assert_allclose(epochs_amplitude_2.data**2, epochs_power_picks.data)
+
+    # test that averaging power across tapers when multitaper with
+    # output='complex' gives the same as output='power'
+    epoch_data = epochs.get_data()
+    multitaper_power = tfr_array_multitaper(
+        epoch_data, epochs.info['sfreq'], freqs, n_cycles,
+        output="power")
+    multitaper_complex = tfr_array_multitaper(
+        epoch_data, epochs.info['sfreq'], freqs, n_cycles,
+        output="complex")
+
+    taper_dim = 2
+    power_from_complex = (multitaper_complex * multitaper_complex.conj()
+                          ).real.mean(axis=taper_dim)
+    assert_allclose(power_from_complex, multitaper_power)
 
     print(itc)  # test repr
     print(itc.ch_names)  # test property
@@ -139,6 +156,7 @@ def test_time_frequency():
     itc = ret / 23  # test dic
 
     power = power.apply_baseline(baseline=(-0.1, 0), mode='logratio')
+    assert power.baseline == (-0.1, 0)
 
     assert 'meg' in power
     assert 'grad' in power
@@ -404,7 +422,22 @@ def test_crop():
     assert tfr.data.shape[-2] == 2
 
 
-@requires_h5py
+def test_decim():
+    """Test TFR decimation."""
+    data = np.zeros((3, 3, 3, 1000))
+    times = np.linspace(0, 1, 1000)
+    freqs = np.array([.10, .20, .30])
+    info = mne.create_info(['MEG 001', 'MEG 002', 'MEG 003'], 1000.,
+                           ['mag', 'mag', 'mag'])
+    with info._unlock():
+        info['lowpass'] = 100
+    tfr = EpochsTFR(info, data=data, times=times, freqs=freqs)
+    tfr.decimate(3)
+    assert tfr.times.size == 1000 // 3 + 1
+    assert tfr.data.shape == ((3, 3, 3, 1000 // 3 + 1))
+
+
+@requires_version('h5io')
 @requires_pandas
 def test_io(tmp_path):
     """Test TFR IO capacities."""
@@ -518,7 +551,30 @@ def test_init_EpochsTFR():
     freqs_x = freqs[:-1]
     with pytest.raises(ValueError, match="frequencies and data size don't"):
         tfr = EpochsTFR(info, data=data, times=times_x, freqs=freqs_x)
-        del(tfr)
+        del tfr
+
+
+def test_dB_computation():
+    """Test dB computation in plot methods (gh 11091)."""
+    ampl = 2.
+    data = np.full((3, 2, 3), ampl ** 2)  # already power
+    complex_data = np.full((3, 2, 3), ampl + 0j)  # ampl → power when plotting
+    times = np.array([.1, .2, .3])
+    freqs = np.array([.10, .20])
+    info = mne.create_info(['MEG 001', 'MEG 002', 'MEG 003'], 1000.,
+                           ['mag', 'mag', 'mag'])
+    kwargs = dict(times=times, freqs=freqs, nave=20, comment='test',
+                  method='crazy-tfr')
+    tfr = AverageTFR(info, data=data, **kwargs)
+    complex_tfr = AverageTFR(info, data=complex_data, **kwargs)
+    plot_kwargs = dict(dB=True, combine='mean', vmin=0, vmax=7)
+    fig1 = tfr.plot(**plot_kwargs)[0]
+    fig2 = complex_tfr.plot(**plot_kwargs)[0]
+    # since we're fixing vmin/vmax, equal colors should mean ~equal input data
+    quadmesh1 = fig1.axes[0].collections[0]
+    quadmesh2 = fig2.axes[0].collections[0]
+    if hasattr(quadmesh1, '_mapped_colors'):  # fails on compat/old
+        assert_array_equal(quadmesh1._mapped_colors, quadmesh2._mapped_colors)
 
 
 def test_plot():
@@ -579,17 +635,17 @@ def test_plot():
 
     # interactive mode on by default
     fig = tfr.plot(picks=[1], cmap='RdBu_r')[0]
-    fig.canvas.key_press_event('up')
-    fig.canvas.key_press_event(' ')
-    fig.canvas.key_press_event('down')
-    fig.canvas.key_press_event(' ')
-    fig.canvas.key_press_event('+')
-    fig.canvas.key_press_event(' ')
-    fig.canvas.key_press_event('-')
-    fig.canvas.key_press_event(' ')
-    fig.canvas.key_press_event('pageup')
-    fig.canvas.key_press_event(' ')
-    fig.canvas.key_press_event('pagedown')
+    _fake_keypress(fig, 'up')
+    _fake_keypress(fig, ' ')
+    _fake_keypress(fig, 'down')
+    _fake_keypress(fig, ' ')
+    _fake_keypress(fig, '+')
+    _fake_keypress(fig, ' ')
+    _fake_keypress(fig, '-')
+    _fake_keypress(fig, ' ')
+    _fake_keypress(fig, 'pageup')
+    _fake_keypress(fig, ' ')
+    _fake_keypress(fig, 'pagedown')
 
     cbar = fig.get_axes()[0].CB  # Fake dragging with mouse.
     ax = cbar.cbar.ax
@@ -601,8 +657,8 @@ def test_plot():
     _fake_click(fig, ax, (0.1, 0.2), button=3, kind='motion')
     _fake_click(fig, ax, (0.1, 0.3), kind='release')
 
-    fig.canvas.scroll_event(0.5, 0.5, -0.5)  # scroll down
-    fig.canvas.scroll_event(0.5, 0.5, 0.5)  # scroll up
+    _fake_scroll(fig, 0.5, 0.5, -0.5)  # scroll down
+    _fake_scroll(fig, 0.5, 0.5, 0.5)  # scroll up
 
     plt.close('all')
 
@@ -685,10 +741,10 @@ def test_add_channels():
     tfr_badsf = tfr_eeg.copy()
     with tfr_badsf.info._unlock():
         tfr_badsf.info['sfreq'] = 3.1415927
-    tfr_eeg = tfr_eeg.crop(-.1, .1)
+    tfr_eeg = tfr_eeg.crop(.1, .1)
 
     pytest.raises(RuntimeError, tfr_meg.add_channels, [tfr_badsf])
-    pytest.raises(AssertionError, tfr_meg.add_channels, [tfr_eeg])
+    pytest.raises(ValueError, tfr_meg.add_channels, [tfr_eeg])
     pytest.raises(ValueError, tfr_meg.add_channels, [tfr_meg])
     pytest.raises(TypeError, tfr_meg.add_channels, tfr_badsf)
 
@@ -721,17 +777,16 @@ def test_compute_tfr():
         (tfr_array_multitaper, tfr_array_morlet), (False, True), (False, True),
         ('complex', 'power', 'phase',
          'avg_power_itc', 'avg_power', 'itc')):
-        # Check exception
-        if (func == tfr_array_multitaper) and (output == 'phase'):
-            pytest.raises(NotImplementedError, func, data, sfreq=sfreq,
-                          freqs=freqs, output=output)
-            continue
 
         # Check runs
         out = func(data, sfreq=sfreq, freqs=freqs, use_fft=use_fft,
                    zero_mean=zero_mean, n_cycles=2., output=output)
         # Check shapes
-        shape = np.r_[data.shape[:2], len(freqs), data.shape[2]]
+        if func == tfr_array_multitaper and output in ['complex', 'phase']:
+            n_tapers = 3
+            shape = np.r_[data.shape[:2], n_tapers, len(freqs), data.shape[2]]
+        else:
+            shape = np.r_[data.shape[:2], len(freqs), data.shape[2]]
         if ('avg' in output) or ('itc' in output):
             assert_array_equal(shape[1:], out.shape)
         else:
@@ -762,9 +817,6 @@ def test_compute_tfr():
     # No time_bandwidth param in morlet
     pytest.raises(ValueError, _compute_tfr, data, freqs, sfreq,
                   method='morlet', time_bandwidth=1)
-    # No phase in multitaper XXX Check ?
-    pytest.raises(NotImplementedError, _compute_tfr, data, freqs, sfreq,
-                  method='multitaper', output='phase')
 
     # Inter-trial coherence tests
     out = _compute_tfr(data, freqs, sfreq, output='itc', n_cycles=2.)
@@ -780,10 +832,11 @@ def test_compute_tfr():
         _decim = slice(None, None, decim) if isinstance(decim, int) else decim
         n_time = len(np.arange(data.shape[2])[_decim])
         shape = np.r_[data.shape[:2], len(freqs), n_time]
+
         for method in ('multitaper', 'morlet'):
             # Single trials
             out = _compute_tfr(data, freqs, sfreq, method=method, decim=decim,
-                               n_cycles=2.)
+                               output='power', n_cycles=2.)
             assert_array_equal(shape, out.shape)
             # Averages
             out = _compute_tfr(data, freqs, sfreq, method=method, decim=decim,
@@ -798,14 +851,17 @@ def test_compute_tfr_correct(method, decim):
     sfreq = 1000.
     t = np.arange(1000) / sfreq
     f = 50.
-    data = np.sin(2 * np.pi * 50. * t)
+    data = np.sin(2 * np.pi * f * t)
     data *= np.hanning(data.size)
     data = data[np.newaxis, np.newaxis]
-    freqs = np.arange(10, 111, 10)
+    freqs = np.arange(10, 111, 4)
     assert f in freqs
+
+    # previous n_cycles=2 gives weird results for multitaper
+    n_cycles = freqs * 0.25
     tfr = _compute_tfr(data, freqs, sfreq, method=method, decim=decim,
-                       n_cycles=2)[0, 0]
-    assert freqs[np.argmax(np.abs(tfr).mean(-1))] == f
+                       n_cycles=n_cycles, output='power')[0, 0]
+    assert freqs[np.argmax(tfr.mean(-1))] == f
 
 
 def test_averaging_epochsTFR():
@@ -949,7 +1005,7 @@ def test_getitem_epochsTFR():
         # With 0.5 s time windows, this gives 8 Hz smoothing
         kwargs = dict(freqs=freqs, n_cycles=n_cycles, use_fft=True,
                       time_bandwidth=time_bandwidth, return_itc=False,
-                      average=False, n_jobs=1)
+                      average=False, n_jobs=None)
         power = tfr_multitaper(epochs, **kwargs)
 
         # Check that power and epochs metadata is the same
@@ -1037,7 +1093,7 @@ def test_to_data_frame():
                 'value')
     assert set(expected) == set(df_long.columns)
     assert set(tfr.ch_names) == set(df_long['channel'])
-    assert(len(df_long) == tfr.data.size)
+    assert len(df_long) == tfr.data.size
     # test long format w/ index
     df_long = tfr.to_data_frame(long_format=True, index=['freq'])
     del df_wide, df_long
@@ -1047,8 +1103,8 @@ def test_to_data_frame():
     assert_array_equal(df.values[:, 0],
                        data[:, 0, :, :].reshape(1, -1).squeeze())
     # compare arbitrary observation:
-    assert df.loc[('he', slice(None), freqs[1], times[2] * srate),
-                  ch_names[3]].iloc[0] == data[1, 3, 1, 2]
+    assert (df.loc[('he', slice(None), freqs[1], times[2]), ch_names[3]].iat[0]
+            == data[1, 3, 1, 2])
 
     # Check also for AverageTFR:
     tfr = tfr.average()
@@ -1067,7 +1123,7 @@ def test_to_data_frame():
     expected = ('freq', 'time', 'channel', 'ch_type', 'value')
     assert set(expected) == set(df_long.columns)
     assert set(tfr.ch_names) == set(df_long['channel'])
-    assert(len(df_long) == tfr.data.size)
+    assert len(df_long) == tfr.data.size
     # test long format w/ index
     df_long = tfr.to_data_frame(long_format=True, index=['freq'])
     del df_wide, df_long
@@ -1077,8 +1133,7 @@ def test_to_data_frame():
     assert_array_equal(df.values[:, 0],
                        data[0, :, :].reshape(1, -1).squeeze())
     # compare arbitrary observation:
-    assert df.loc[(freqs[1], times[2] * srate), ch_names[3]] == \
-        data[3, 1, 2]
+    assert df.loc[(freqs[1], times[2]), ch_names[3]] == data[3, 1, 2]
 
 
 @requires_pandas

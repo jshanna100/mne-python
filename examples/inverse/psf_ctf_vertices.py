@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """
+.. _ex-psd-ctf:
+
+==================================================================
 Plot point-spread functions (PSFs) and cross-talk functions (CTFs)
 ==================================================================
 
@@ -20,10 +23,11 @@ from mne.minimum_norm import (make_inverse_resolution_matrix, get_cross_talk,
 print(__doc__)
 
 data_path = sample.data_path()
-subjects_dir = data_path + '/subjects/'
-fname_fwd = data_path + '/MEG/sample/sample_audvis-meg-eeg-oct-6-fwd.fif'
-fname_cov = data_path + '/MEG/sample/sample_audvis-cov.fif'
-fname_evo = data_path + '/MEG/sample/sample_audvis-ave.fif'
+subjects_dir = data_path / 'subjects'
+meg_path = data_path / 'MEG' / 'sample'
+fname_fwd = meg_path / 'sample_audvis-meg-eeg-oct-6-fwd.fif'
+fname_cov = meg_path / 'sample_audvis-cov.fif'
+fname_evo = meg_path / 'sample_audvis-ave.fif'
 
 # read forward solution
 forward = mne.read_forward_solution(fname_fwd)
@@ -46,7 +50,6 @@ inverse_operator = mne.minimum_norm.make_inverse_operator(
 # regularisation parameter
 snr = 3.0
 lambda2 = 1.0 / snr ** 2
-method = 'MNE'  # can be 'MNE' or 'sLORETA'
 
 # compute resolution matrix for sLORETA
 rm_lor = make_inverse_resolution_matrix(forward, inverse_operator,

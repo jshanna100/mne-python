@@ -106,7 +106,7 @@ class ReceptiveField(BaseEstimator):
     @verbose
     def __init__(self, tmin, tmax, sfreq, feature_names=None, estimator=None,
                  fit_intercept=None, scoring='r2', patterns=False,
-                 n_jobs=1, edge_correction=True, verbose=None):
+                 n_jobs=None, edge_correction=True, verbose=None):
         self.feature_names = feature_names
         self.sfreq = float(sfreq)
         self.tmin = tmin
@@ -117,7 +117,6 @@ class ReceptiveField(BaseEstimator):
         self.patterns = patterns
         self.n_jobs = n_jobs
         self.edge_correction = edge_correction
-        self.verbose = verbose
 
     def __repr__(self):  # noqa: D105
         s = "tmin, tmax : (%.3f, %.3f), " % (self.tmin, self.tmax)
@@ -151,7 +150,6 @@ class ReceptiveField(BaseEstimator):
                 y = y.reshape(-1, y.shape[-1], order='F')
         return X, y
 
-    @verbose
     def fit(self, X, y):
         """Fit a receptive field model.
 

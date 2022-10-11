@@ -7,6 +7,8 @@ import os.path as op
 import itertools as itt
 import sys
 
+from inspect import signature
+
 from numpy.testing import (assert_array_almost_equal, assert_array_equal,
                            assert_equal, assert_allclose)
 import pytest
@@ -25,12 +27,12 @@ from mne import (read_cov, write_cov, Epochs, merge_events,
                  make_fixed_length_events, create_info, compute_rank)
 from mne.channels import equalize_channels
 from mne.datasets import testing
-from mne.fixes import _get_args
 from mne.io import read_raw_fif, RawArray, read_raw_ctf, read_info
 from mne.io.pick import _DATA_CH_TYPES_SPLIT, pick_info
 from mne.preprocessing import maxwell_filter
 from mne.rank import _compute_rank_int
-from mne.utils import requires_sklearn, catch_logging, assert_snr
+from mne.utils import (requires_sklearn, catch_logging, assert_snr,
+                       _record_warnings)
 
 base_dir = op.join(op.dirname(__file__), '..', 'io', 'tests', 'data')
 cov_fname = op.join(base_dir, 'test-cov.fif')
@@ -115,7 +117,7 @@ def test_cov_mismatch():
             epochs_2.info['dev_head_t'] = None
         pytest.raises(ValueError, compute_covariance, [epochs, epochs_2])
         compute_covariance([epochs, epochs_2], on_mismatch='ignore')
-        with pytest.raises(RuntimeWarning, match='transform mismatch'):
+        with pytest.warns(RuntimeWarning, match='transform mismatch'):
             compute_covariance([epochs, epochs_2], on_mismatch='warn')
         with pytest.raises(ValueError, match='Invalid value'):
             compute_covariance(epochs, on_mismatch='x')
@@ -204,7 +206,7 @@ def test_ad_hoc_cov(tmp_path):
     assert_array_almost_equal(cov['data'], cov2['data'])
     std = dict(grad=2e-13, mag=10e-15, eeg=0.1e-6)
     cov = make_ad_hoc_cov(evoked.info, std)
-    cov.save(out_fname)
+    cov.save(out_fname, overwrite=True)
     assert 'Covariance' in repr(cov)
     cov2 = read_cov(out_fname)
     assert_array_almost_equal(cov['data'], cov2['data'])
@@ -240,11 +242,11 @@ def test_io_cov(tmp_path):
     cov_sel = pick_channels_cov(cov, exclude=cov['bads'])
     assert cov_sel['dim'] == (len(cov['data']) - len(cov['bads']))
     assert cov_sel['data'].shape == (cov_sel['dim'], cov_sel['dim'])
-    cov_sel.save(tmp_path / 'test-cov.fif')
+    cov_sel.save(tmp_path / 'test-cov.fif', overwrite=True)
 
     cov2 = read_cov(cov_gz_fname)
     assert_array_almost_equal(cov.data, cov2.data)
-    cov2.save(tmp_path / 'test-cov.fif.gz')
+    cov2.save(tmp_path / 'test-cov.fif.gz', overwrite=True)
     cov2 = read_cov(tmp_path / 'test-cov.fif.gz')
     assert_array_almost_equal(cov.data, cov2.data)
 
@@ -256,7 +258,11 @@ def test_io_cov(tmp_path):
         read_cov(cov_badname)
 
 
-@pytest.mark.parametrize('method', (None, 'empirical', 'shrunk'))
+@pytest.mark.parametrize('method', [
+    None,
+    'empirical',
+    pytest.param('shrunk', marks=pytest.mark.slowtest),
+])
 def test_cov_estimation_on_raw(method, tmp_path):
     """Test estimation from raw (typically empty room)."""
     if method == 'shrunk':
@@ -271,7 +277,7 @@ def test_cov_estimation_on_raw(method, tmp_path):
     # The pure-string uses the more efficient numpy-based method, the
     # the list gets triaged to compute_covariance (should be equivalent
     # but use more memory)
-    with pytest.warns(None):  # can warn about EEG ref
+    with _record_warnings():  # can warn about EEG ref
         cov = compute_raw_covariance(
             raw, tstep=None, method=method, rank='full',
             method_params=method_params)
@@ -294,7 +300,7 @@ def test_cov_estimation_on_raw(method, tmp_path):
         assert_snr(cov.data, other.data, 1e6)
 
     # tstep=0.2 (default)
-    with pytest.warns(None):  # can warn about EEG ref
+    with _record_warnings():  # can warn about EEG ref
         cov = compute_raw_covariance(raw, method=method, rank='full',
                                      method_params=method_params)
     assert_equal(cov.nfree, cov_mne.nfree - 120)  # cutoff some samples
@@ -326,7 +332,7 @@ def test_cov_estimation_on_raw(method, tmp_path):
     pytest.raises(ValueError, compute_raw_covariance, raw, tstep=None,
                   method='empirical', reject=dict(eog=200e-6))
     # but this should work
-    with pytest.warns(None):  # sklearn
+    with _record_warnings():  # sklearn
         cov = compute_raw_covariance(
             raw.copy().crop(0, 10.), tstep=None, method=method,
             reject=dict(eog=1000e-6), method_params=method_params,
@@ -462,7 +468,8 @@ def test_regularize_cov():
     assert noise_cov['data'].shape == reg_noise_cov['data'].shape
     assert np.mean(noise_cov['data'] < reg_noise_cov['data']) < 0.08
     # make sure all args are represented
-    assert set(_DATA_CH_TYPES_SPLIT) - set(_get_args(regularize)) == set()
+    assert (set(_DATA_CH_TYPES_SPLIT) - set(signature(regularize).parameters)
+            == set())
 
 
 def test_whiten_evoked():
@@ -568,12 +575,12 @@ def test_compute_covariance_auto_reg(rank):
     covs = compute_covariance(epochs, method='auto',
                               method_params=method_params,
                               return_estimators=True, rank=rank)
-    # make sure regularization produces structured differencess
+    # make sure regularization produces structured differences
     diag_mask = np.eye(len(epochs.ch_names)).astype(bool)
     off_diag_mask = np.invert(diag_mask)
     for cov_a, cov_b in itt.combinations(covs, 2):
         if (cov_a['method'] == 'diagonal_fixed' and
-                # here we have diagnoal or no regularization.
+                # here we have diagonal or no regularization.
                 cov_b['method'] == 'empirical' and rank == 'full'):
 
             assert not np.any(cov_a['data'][diag_mask] ==
@@ -639,7 +646,7 @@ def _cov_rank(cov, info, proj=True):
     # ignore warnings about rank mismatches: sometimes we will intentionally
     # violate the computed/info assumption, such as when using SSS with
     # `rank='full'`
-    with pytest.warns(None):
+    with _record_warnings():
         return _compute_rank_int(cov, info=info, proj=proj)
 
 

@@ -12,11 +12,11 @@ at which the fix is no longer needed.
 #          Lars Buitinck <L.J.Buitinck@uva.nl>
 # License: BSD
 
-import functools
 import inspect
 from math import log
+from pprint import pprint
+from io import StringIO
 import os
-from pathlib import Path
 import warnings
 
 import numpy as np
@@ -47,12 +47,10 @@ def _compare_version(version_a, operator, version_b):
     bool
         The result of the version comparison.
     """
-    try:
-        from pkg_resources import parse_version as parse
-    except ImportError:
-        from distutils.version import LooseVersion as parse
-
-    return eval(f'parse("{version_a}") {operator} parse("{version_b}")')
+    from packaging.version import parse
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter('ignore')
+        return eval(f'parse("{version_a}") {operator} parse("{version_b}")')
 
 
 ###############################################################################
@@ -71,21 +69,6 @@ def _median_complex(data, axis):
     else:
         data = np.median(data, axis=axis)
     return data
-
-
-# helpers to get function arguments
-def _get_args(function, varargs=False):
-    params = inspect.signature(function).parameters
-    args = [key for key, param in params.items()
-            if param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)]
-    if varargs:
-        varargs = [param.name for param in params.values()
-                   if param.kind == param.VAR_POSITIONAL]
-        if len(varargs) == 0:
-            varargs = None
-        return args, varargs
-    else:
-        return args
 
 
 def _safe_svd(A, **kwargs):
@@ -458,10 +441,11 @@ class BaseEstimator(object):
         return self
 
     def __repr__(self):
-        from sklearn.base import _pprint
+        params = StringIO()
+        pprint(self.get_params(deep=False), params)
+        params.seek(0)
         class_name = self.__class__.__name__
-        return '%s(%s)' % (class_name, _pprint(self.get_params(deep=False),
-                                               offset=len(class_name),),)
+        return '%s(%s)' % (class_name, params.read().strip())
 
     # __getstate__ and __setstate__ are omitted because they only contain
     # conditionals that are not satisfied by our objects (e.g.,
@@ -1018,14 +1002,22 @@ else:
 
 
 ###############################################################################
-# workaround: plt.close() doesn't spawn close_event on Agg backend
-# (check MPL github issue #18609; scheduled to be fixed by MPL 3.4)
+# Matplotlib
 
+# workaround: plt.close() doesn't spawn close_event on Agg backend
+# https://github.com/matplotlib/matplotlib/issues/18609
+# scheduled to be fixed by MPL 3.6
 def _close_event(fig):
     """Force calling of the MPL figure close event."""
+    from .utils import logger
+    from matplotlib import backend_bases
     try:
-        fig.canvas.close_event()
+        fig.canvas.callbacks.process(
+            'close_event', backend_bases.CloseEvent(
+                name='close_event', canvas=fig.canvas))
+        logger.debug(f'Called {fig!r}.canvas.close_event()')
     except ValueError:  # old mpl with Qt
+        logger.debug(f'Calling {fig!r}.canvas.close_event() failed')
         pass  # pragma: no cover
 
 
@@ -1035,6 +1027,13 @@ def _is_last_row(ax):
     except AttributeError:
         return ax.is_last_row()
     return ax.get_subplotspec().is_last_row()
+
+
+def _sharex(ax1, ax2):
+    if hasattr(ax1.axes, 'sharex'):
+        ax1.axes.sharex(ax2)
+    else:
+        ax1.get_shared_x_axes().join(ax1, ax2)
 
 
 ###############################################################################

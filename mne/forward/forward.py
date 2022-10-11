@@ -32,7 +32,7 @@ from ..io.pick import (pick_channels_forward, pick_info, pick_channels,
                        pick_types)
 from ..io.write import (write_int, start_block, end_block,
                         write_coord_trans, write_name_list,
-                        write_string, start_file, end_file, write_id)
+                        write_string, start_and_end_file, write_id)
 from ..io.base import BaseRaw
 from ..evoked import Evoked, EvokedArray
 from ..epochs import BaseEpochs
@@ -47,20 +47,84 @@ from ..transforms import (transform_surface_to, invert_transform,
 from ..utils import (_check_fname, get_subjects_dir, has_mne_c, warn,
                      run_subprocess, check_fname, logger, verbose, fill_doc,
                      _validate_type, _check_compensation_grade, _check_option,
-                     _check_stc_units, _stamp_to_dt, _on_missing)
+                     _check_stc_units, _stamp_to_dt, _on_missing, repr_html)
 from ..label import Label
-from ..data.html_templates import forward_template
 
 
 class Forward(dict):
     """Forward class to represent info from forward solution.
 
+    Like :class:`mne.Info`, this data structure behaves like a dictionary.
+    It contains all metadata necessary for a forward solution.
+
+    .. warning::
+        This class should not be modified or created by users.
+        Forward objects should be obtained using
+        :func:`mne.make_forward_solution` or :func:`mne.read_forward_solution`.
+
     Attributes
     ----------
     ch_names : list of str
-        List of channels' names.
+        A convenience wrapper accessible as ``fwd.ch_names`` which wraps
+        ``fwd['info']['ch_names']``.
 
-        .. versionadded:: 0.20.0
+    See Also
+    --------
+    mne.make_forward_solution
+    mne.read_forward_solution
+
+    Notes
+    -----
+    Forward data is accessible via string keys using standard
+    :class:`python:dict` access (e.g., ``fwd['nsource'] == 4096``):
+
+        source_ori : int
+            The source orientation, either ``FIFF.FIFFV_MNE_FIXED_ORI`` or
+            ``FIFF.FIFFV_MNE_FREE_ORI``.
+        coord_frame : int
+            The coordinate frame of the forward solution, usually
+            ``FIFF.FIFFV_COORD_HEAD``.
+        nsource : int
+            The number of source locations.
+        nchan : int
+            The number of channels.
+        sol : dict
+            The forward solution, with entries:
+
+            ``'data'`` : ndarray, shape (n_channels, nsource * n_ori)
+                The forward solution data. The shape will be
+                ``(n_channels, nsource)`` for a fixed-orientation forward and
+                ``(n_channels, nsource * 3)`` for a free-orientation forward.
+            ``'row_names'`` : list of str
+                The channel names.
+        mri_head_t : instance of Transform
+            The mri ↔ head transformation that was used.
+        info : instance of :class:`~mne.Info`
+            The measurement information (with contents reduced compared to that
+            of the original data).
+        src : instance of :class:`~mne.SourceSpaces`
+            The source space used during forward computation. This can differ
+            from the original source space as:
+
+            1. Source points are removed due to proximity to (or existing
+               outside)
+               the inner skull surface.
+            2. The source space will be converted to the ``coord_frame`` of the
+               forward solution, which typically means it gets converted from
+               MRI to head coordinates.
+        source_rr : ndarray, shape (n_sources, 3)
+            The source locations.
+        source_nn : ndarray, shape (n_sources, 3)
+            The source normals. Will be all +Z (``(0, 0, 1.)``) for volume
+            source spaces. For surface source spaces, these are normal to the
+            cortical surface.
+        surf_ori : int
+            Whether ``sol`` is surface-oriented with the surface normal in the
+            Z component (``FIFF.FIFFV_MNE_FIXED_ORI``) or +Z in the given
+            ``coord_frame`` in the Z component (``FIFF.FIFFV_MNE_FREE_ORI``).
+
+    Forward objects also have some attributes that are accessible via ``.``
+    access, like ``fwd.ch_names``.
     """
 
     def copy(self):
@@ -114,10 +178,13 @@ class Forward(dict):
 
         return entr
 
+    @repr_html
     def _repr_html_(self):
+        from ..html_templates import repr_templates_env
         good_chs, bad_chs, _, _, = self['info']._get_chs_for_repr()
         src_descr, src_ori = self._get_src_type_and_ori_for_repr()
-        html = forward_template.substitute(
+        t = repr_templates_env.get_template('forward.html.jinja')
+        html = t.render(
             good_channels=good_chs,
             bad_channels=bad_chs,
             source_space_descr=src_descr,
@@ -181,7 +248,7 @@ def _block_diag(A, n):
         The block size
     Returns
     -------
-    bd : sparse matrix
+    bd : scipy.sparse.spmatrix
         The block diagonal matrix
     """
     from scipy import sparse
@@ -360,39 +427,47 @@ def _subject_from_forward(forward):
     return forward['src']._subject
 
 
+# This sets the forward solution order (and gives human-readable names)
+_FWD_ORDER = dict(
+    meg='MEG',
+    eeg='EEG',
+)
+
+
 @verbose
-def _merge_meg_eeg_fwds(megfwd, eegfwd, verbose=None):
-    """Merge loaded MEG and EEG forward dicts into one dict."""
-    if megfwd is not None and eegfwd is not None:
-        if (megfwd['sol']['data'].shape[1] != eegfwd['sol']['data'].shape[1] or
-                megfwd['source_ori'] != eegfwd['source_ori'] or
-                megfwd['nsource'] != eegfwd['nsource'] or
-                megfwd['coord_frame'] != eegfwd['coord_frame']):
-            raise ValueError('The MEG and EEG forward solutions do not match')
-
-        fwd = megfwd
-        fwd['sol']['data'] = np.r_[fwd['sol']['data'], eegfwd['sol']['data']]
-        fwd['_orig_sol'] = np.r_[fwd['_orig_sol'], eegfwd['_orig_sol']]
-        fwd['sol']['nrow'] = fwd['sol']['nrow'] + eegfwd['sol']['nrow']
-
-        fwd['sol']['row_names'] = (fwd['sol']['row_names'] +
-                                   eegfwd['sol']['row_names'])
-        if fwd['sol_grad'] is not None:
-            fwd['sol_grad']['data'] = np.r_[fwd['sol_grad']['data'],
-                                            eegfwd['sol_grad']['data']]
-            fwd['_orig_sol_grad'] = np.r_[fwd['_orig_sol_grad'],
-                                          eegfwd['_orig_sol_grad']]
-            fwd['sol_grad']['nrow'] = (fwd['sol_grad']['nrow'] +
-                                       eegfwd['sol_grad']['nrow'])
-            fwd['sol_grad']['row_names'] = (fwd['sol_grad']['row_names'] +
-                                            eegfwd['sol_grad']['row_names'])
-
-        fwd['nchan'] = fwd['nchan'] + eegfwd['nchan']
-        logger.info('    MEG and EEG forward solutions combined')
-    elif megfwd is not None:
-        fwd = megfwd
-    else:
-        fwd = eegfwd
+def _merge_fwds(fwds, *, verbose=None):
+    """Merge loaded forward dicts into one dict."""
+    fwd = None
+    first_key = None
+    combined = list()
+    for key in _FWD_ORDER:
+        if key not in fwds:
+            continue
+        if fwd is None:  # assign
+            fwd = fwds[key]
+            first_key = key
+            combined.append(_FWD_ORDER[key])
+            continue
+        a = fwd
+        b = fwds[key]
+        a_kind, b_kind = _FWD_ORDER[first_key], _FWD_ORDER[key]
+        combined.append(b_kind)
+        if (a['sol']['data'].shape[1] != b['sol']['data'].shape[1] or
+                a['source_ori'] != b['source_ori'] or
+                a['nsource'] != b['nsource'] or
+                a['coord_frame'] != b['coord_frame']):
+            raise ValueError(
+                f'The {a_kind} and {b_kind} forward solutions do not match')
+        for k in ('sol', 'sol_grad'):
+            if a[k] is None:
+                continue
+            a[k]['data'] = np.r_[a[k]['data'], b[k]['data']]
+            a[f'_orig_{k}'] = np.r_[a[f'_orig_{k}'], b[f'_orig_{k}']]
+            a[k]['nrow'] = a[k]['nrow'] + b[k]['nrow']
+            a[k]['row_names'] = a[k]['row_names'] + b[k]['row_names']
+        a['nchan'] = a['nchan'] + b['nchan']
+    if len(fwds) > 1:
+        logger.info(f'    Forward solutions combined: {", ".join(combined)}')
     return fwd
 
 
@@ -474,8 +549,10 @@ def read_forward_solution(fname, include=(), exclude=(), verbose=None):
             elif tag.data == FIFF.FIFFV_MNE_EEG:
                 eegnode = fwds[k]
 
+        fwds = dict()
         megfwd = _read_one(fid, megnode)
         if megfwd is not None:
+            fwds['meg'] = megfwd
             if is_fixed_orient(megfwd):
                 ori = 'fixed'
             else:
@@ -483,9 +560,11 @@ def read_forward_solution(fname, include=(), exclude=(), verbose=None):
             logger.info('    Read MEG forward solution (%d sources, '
                         '%d channels, %s orientations)'
                         % (megfwd['nsource'], megfwd['nchan'], ori))
+        del megfwd
 
         eegfwd = _read_one(fid, eegnode)
         if eegfwd is not None:
+            fwds['eeg'] = eegfwd
             if is_fixed_orient(eegfwd):
                 ori = 'fixed'
             else:
@@ -493,8 +572,10 @@ def read_forward_solution(fname, include=(), exclude=(), verbose=None):
             logger.info('    Read EEG forward solution (%d sources, '
                         '%d channels, %s orientations)'
                         % (eegfwd['nsource'], eegfwd['nchan'], ori))
+        del eegfwd
 
-        fwd = _merge_meg_eeg_fwds(megfwd, eegfwd)
+        fwd = _merge_fwds(fwds)
+        del fwds
 
         #   Get the MRI <-> head coordinate transformation
         tag = find_tag(fid, parent_mri, FIFF.FIFF_COORD_TRANS)
@@ -752,7 +833,11 @@ def write_forward_solution(fname, fwd, overwrite=False, verbose=None):
 
     # check for file existence and expand `~` if present
     fname = _check_fname(fname, overwrite)
-    fid = start_file(fname)
+    with start_and_end_file(fname) as fid:
+        _write_forward_solution(fid, fwd)
+
+
+def _write_forward_solution(fid, fwd):
     start_block(fid, FIFF.FIFFB_MNE)
 
     #
@@ -887,7 +972,6 @@ def write_forward_solution(fname, fwd, overwrite=False, verbose=None):
         end_block(fid, FIFF.FIFFB_MNE_FORWARD_SOLUTION)
 
     end_block(fid, FIFF.FIFFB_MNE)
-    end_file(fid)
 
 
 def is_fixed_orient(forward, orig=False):
@@ -1021,10 +1105,10 @@ def _triage_loose(src, loose, fixed='auto'):
     del fixed
 
     for key, this_loose in loose.items():
-        if key != 'surface' and this_loose != 1:
+        if key not in ('surface', 'discrete') and this_loose != 1:
             raise ValueError(
-                'loose parameter has to be 1 or "auto" for non-surface '
-                f'source spaces, got loose["{key}"] = {this_loose}')
+                'loose parameter has to be 1 or "auto" for non-surface/'
+                f'discrete source spaces, got loose["{key}"] = {this_loose}')
         if not 0 <= this_loose <= 1:
             raise ValueError(
                 f'loose ({key}) must be between 0 and 1, got {this_loose}')
@@ -1144,7 +1228,7 @@ def compute_depth_prior(forward, info, exp=0.8, limit=10.0,
         ``limit_depth_chs='whiten'``.
 
         .. versionadded:: 0.18
-    %(rank_None)s
+    %(rank_none)s
 
         .. versionadded:: 0.18
     %(verbose)s
@@ -1252,7 +1336,7 @@ def compute_depth_prior(forward, info, exp=0.8, limit=10.0,
         ws = np.sort(w)
         weight_limit = limit ** 2
         if limit_depth_chs is False:
-            # match old mne-python behavor
+            # match old mne-python behavior
             # we used to do ind = np.argmin(ws), but this is 0 by sort above
             n_limit = 0
             limit = ws[0] * weight_limit
@@ -1441,7 +1525,7 @@ def apply_forward(fwd, stc, info, start=None, stop=None, use_cps=True,
 
     evoked = EvokedArray(data, info, times[0], nave=1)
 
-    evoked.times = times
+    evoked._set_times(times)
     evoked._update_first_last()
 
     return evoked
@@ -1505,11 +1589,7 @@ def apply_forward_raw(fwd, stc, info, start=None, stop=None,
     with info._unlock():
         info['projs'] = []
     # store sensor data in Raw object using the info
-    raw = RawArray(data, info)
-    raw.preload = True
-
-    raw._first_samps = np.array([int(np.round(times[0] * sfreq))])
-    raw._last_samps = np.array([raw.first_samp + raw._data.shape[1] - 1])
+    raw = RawArray(data, info, first_samp=int(np.round(times[0] * sfreq)))
     raw._projector = None
     return raw
 
@@ -1780,15 +1860,13 @@ def _do_forward_solution(subject, meas, fname=None, src=None, spacing=None,
     _validate_type(subject, "str", "subject")
 
     # check for meas to exist as string, or try to make evoked
-    if isinstance(meas, str):
-        if not op.isfile(meas):
-            raise IOError('measurement file "%s" could not be found' % meas)
-    elif isinstance(meas, (BaseRaw, BaseEpochs, Evoked)):
+    _validate_type(meas, ('path-like', BaseRaw, BaseEpochs, Evoked), 'meas')
+    if isinstance(meas, (BaseRaw, BaseEpochs, Evoked)):
         meas_file = op.join(temp_dir, 'info.fif')
         write_info(meas_file, meas.info)
         meas = meas_file
     else:
-        raise ValueError('meas must be string, Raw, Epochs, or Evoked')
+        meas = _check_fname(meas, overwrite='read', must_exist=True)
 
     # deal with trans/mri
     if mri is not None and trans is not None:

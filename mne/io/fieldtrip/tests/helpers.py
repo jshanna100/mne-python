@@ -9,7 +9,6 @@ import os
 import numpy as np
 
 import mne
-from mne.io.constants import FIFF
 from mne.utils import object_diff
 
 
@@ -17,7 +16,8 @@ info_ignored_fields = ('file_id', 'hpi_results', 'hpi_meas', 'meas_id',
                        'meas_date', 'highpass', 'lowpass', 'subject_info',
                        'hpi_subsystem', 'experimenter', 'description',
                        'proj_id', 'proj_name', 'line_freq', 'gantry_angle',
-                       'dev_head_t', 'bads', 'ctf_head_t', 'dev_ctf_t')
+                       'dev_head_t', 'bads', 'ctf_head_t', 'dev_ctf_t',
+                       'dig')
 
 ch_ignore_fields = ('logno', 'cal', 'range', 'scanno', 'coil_type', 'kind',
                     'loc', 'coord_frame', 'unit')
@@ -47,13 +47,7 @@ pandas_not_found_warning_msg = 'The Pandas library is not installed. Not ' \
                                'returning the original trialinfo matrix as ' \
                                'metadata.'
 
-
-def _has_h5py():
-    try:
-        import h5py  # noqa
-        return True
-    except ImportError:
-        return False
+testing_path = mne.datasets.testing.data_path(download=False)
 
 
 def _remove_ignored_ch_fields(info):
@@ -76,31 +70,16 @@ def _remove_ignored_info_fields(info):
             del info[cur_field]
 
     _remove_ignored_ch_fields(info)
-    _remove_bad_dig_fields(info)
-
-
-def _remove_bad_dig_fields(info):
-    # The reference location appears to be lost, so we cannot add it.
-    # Similarly, fiducial locations do not appear to be stored, so we
-    # cannot add those, either. Same with HPI coils.
-    if info['dig'] is not None:
-        with info._unlock():
-            info['dig'] = [d for d in info['dig']
-                           if d['kind'] == FIFF.FIFFV_POINT_EEG and
-                           d['ident'] != 0]  # ref
 
 
 def get_data_paths(system):
     """Return common paths for all tests."""
-    test_data_folder_ft = os.path.join(mne.datasets.testing.data_path(),
-                                       'fieldtrip/ft_test_data', system)
-
-    return test_data_folder_ft
+    return testing_path / 'fieldtrip' / 'ft_test_data' / system
 
 
 def get_cfg_local(system):
     """Return cfg_local field for the system."""
-    from mne.externals.pymatreader import read_mat
+    from pymatreader import read_mat
     cfg_local = read_mat(os.path.join(get_data_paths(system), 'raw_v7.mat'),
                          ['cfg_local'])['cfg_local']
 
@@ -111,8 +90,7 @@ def get_raw_info(system):
     """Return the info dict of the raw data."""
     cfg_local = get_cfg_local(system)
 
-    raw_data_file = os.path.join(mne.datasets.testing.data_path(),
-                                 cfg_local['file_name'])
+    raw_data_file = os.path.join(testing_path, cfg_local['file_name'])
     reader_function = system_to_reader_fn_dict[system]
 
     info = reader_function(raw_data_file, preload=False).info
@@ -125,8 +103,7 @@ def get_raw_data(system, drop_extra_chs=False):
     """Find, load and process the raw data."""
     cfg_local = get_cfg_local(system)
 
-    raw_data_file = os.path.join(mne.datasets.testing.data_path(),
-                                 cfg_local['file_name'])
+    raw_data_file = os.path.join(testing_path, cfg_local['file_name'])
     reader_function = system_to_reader_fn_dict[system]
 
     raw_data = reader_function(raw_data_file, preload=True)
@@ -211,7 +188,7 @@ def check_info_fields(expected, actual, has_raw_info, ignore_long=True):
     # we annoyingly have two ways of representing this, so just always use
     # an empty list here
     for obj in (expected, actual):
-        if obj['dig'] is None:
+        if obj.get('dig', None) is None:
             with obj._unlock():
                 obj['dig'] = []
 

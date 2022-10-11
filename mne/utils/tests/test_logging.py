@@ -225,32 +225,17 @@ def test_verbose_strictness():
     class Okay:
 
         @verbose
-        def meth_1(self):  # allowed because it should just use self.verbose
-            logger.info('meth_1')
-
-        @verbose
         def meth_2(self, verbose=None):
             logger.info('meth_2')
 
     o = Okay()
-    with pytest.raises(RuntimeError, match=r'does not have self\.verbose'):
-        o.meth_1()  # should raise, no verbose attr yet
-    o.verbose = False
     with catch_logging() as log:
-        o.meth_1()
-        o.meth_2()
+        o.meth_2(verbose=False)
     log = log.getvalue()
     assert log == ''
     with catch_logging() as log:
         o.meth_2(verbose=True)
     log = log.getvalue()
-    assert 'meth_2' in log
-    o.verbose = True
-    with catch_logging() as log:
-        o.meth_1()
-        o.meth_2()
-    log = log.getvalue()
-    assert 'meth_1' in log
     assert 'meth_2' in log
     with catch_logging() as log:
         o.meth_2(verbose=False)

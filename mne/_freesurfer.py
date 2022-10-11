@@ -16,7 +16,7 @@ from .transforms import (apply_trans, invert_transform, combine_transforms,
                          _ensure_trans, read_ras_mni_t, Transform)
 from .surface import read_surface, _read_mri_surface
 from .utils import (verbose, _validate_type, _check_fname, _check_option,
-                    get_subjects_dir, _require_version, logger)
+                    get_subjects_dir, _require_version, logger, warn)
 
 
 def _check_subject_dir(subject, subjects_dir):
@@ -100,7 +100,7 @@ def _mri_orientation(orientation):
     Parameters
     ----------
     orientation : str
-        Orientation that you want. Can be "axial", "saggital", or "coronal".
+        Orientation that you want. Can be "axial", "sagittal", or "coronal".
 
     Returns
     -------
@@ -253,12 +253,9 @@ def get_volume_labels_from_aseg(mgz_fname, return_colors=False,
 
 
 @verbose
-def head_to_mri(pos, subject, mri_head_t, subjects_dir=None,
-                verbose=None):
+def head_to_mri(pos, subject, mri_head_t, subjects_dir=None, *,
+                kind=None, unscale=False, verbose=None):
     """Convert pos from head coordinate system to MRI ones.
-
-    This function converts to MRI RAS coordinates and not to surface
-    RAS.
 
     Parameters
     ----------
@@ -268,6 +265,18 @@ def head_to_mri(pos, subject, mri_head_t, subjects_dir=None,
     mri_head_t : instance of Transform
         MRI<->Head coordinate transformation.
     %(subjects_dir)s
+    kind : str
+        The  MRI coordinate frame kind, can be ``'ras'`` (default in 1.2) to
+        use MRI RAS (scanner RAS) or ``'mri'`` (default in 1.3) for
+        FreeSurfer surface RAS.
+
+        .. versionadded:: 1.2
+    unscale : bool
+        For surrogate MRIs (e.g., scaled using ``mne coreg``), if True
+        (default False), use the MRI scaling parameters to obtain points in
+        the original/surrogate subject's MRI space.
+
+        .. versionadded:: 1.2
     %(verbose)s
 
     Returns
@@ -279,12 +288,30 @@ def head_to_mri(pos, subject, mri_head_t, subjects_dir=None,
     -----
     This function requires nibabel.
     """
+    from .coreg import read_mri_cfg
+    if kind is None:
+        warn('kind defaults to "ras" in 1.2 and will change to "mri" in 1.3, '
+             'set it explicitly to avoid this warning', FutureWarning)
+        kind = 'ras'
+    _validate_type(kind, str, 'kind')
+    _check_option('kind', kind, ('ras', 'mri'))
     subjects_dir = get_subjects_dir(subjects_dir, raise_error=True)
     t1_fname = op.join(subjects_dir, subject, 'mri', 'T1.mgz')
     head_mri_t = _ensure_trans(mri_head_t, 'head', 'mri')
-    _, _, mri_ras_t, _, _ = _read_mri_info(t1_fname)
-    head_ras_t = combine_transforms(head_mri_t, mri_ras_t, 'head', 'ras')
-    return 1e3 * apply_trans(head_ras_t, pos)  # mm
+    if kind == 'ras':
+        _, _, mri_ras_t, _, _ = _read_mri_info(t1_fname)
+        head_ras_t = combine_transforms(head_mri_t, mri_ras_t, 'head', 'ras')
+        head_dest_t = head_ras_t
+    else:
+        assert kind == 'mri'
+        head_dest_t = head_mri_t
+    pos_dest = apply_trans(head_dest_t, pos)
+    # unscale if requested
+    if unscale:
+        params = read_mri_cfg(subject, subjects_dir)
+        pos_dest *= params['scale']
+    pos_dest *= 1e3  # mm
+    return pos_dest
 
 
 ##############################################################################
@@ -461,6 +488,28 @@ def _ensure_image_in_surface_RAS(image, subject, subjects_dir):
                            'it is the space where the anatomical '
                            'segmentation and reconstructed surfaces are')
     return image  # returns MGH image for header
+
+
+@verbose
+def read_lta(fname, verbose=None):
+    """Read a Freesurfer linear transform array file.
+
+    Parameters
+    ----------
+    fname : str | None
+        The transform filename.
+    %(verbose)s
+
+    Returns
+    -------
+    affine : ndarray
+        The affine transformation described by the lta file.
+    """
+    _validate_type(fname, ('path-like', None), 'fname')
+    _check_fname(fname, 'read', must_exist=True)
+    with open(fname, 'r') as fid:
+        affine = np.loadtxt(fid.readlines()[5:9])
+    return affine
 
 
 @verbose
@@ -661,9 +710,12 @@ def _get_head_surface(surf, subject, subjects_dir, bem=None, verbose=None):
         try_fnames = [op.join(subject_dir, 'bem', f'{subject}-head-dense.fif'),
                       op.join(subject_dir, 'surf', 'lh.seghead')]
     else:
-        try_fnames = [op.join(subject_dir, 'bem', 'outer_skin.surf'),
-                      op.join(subject_dir, 'bem', 'flash', 'outer_skin.surf'),
-                      op.join(subject_dir, 'bem', f'{subject}-head.fif')]
+        try_fnames = [
+            op.join(subject_dir, 'bem', 'outer_skin.surf'),
+            op.join(subject_dir, 'bem', 'flash', 'outer_skin.surf'),
+            op.join(subject_dir, 'bem', f'{subject}-head-sparse.fif'),
+            op.join(subject_dir, 'bem', f'{subject}-head.fif'),
+        ]
     for fname in try_fnames:
         if op.exists(fname):
             logger.info(f'Using {op.basename(fname)} for head surface.')
@@ -713,3 +765,16 @@ def _get_skull_surface(surf, subject, subjects_dir, bem=None, verbose=None):
                          overwrite='read', must_exist=True,
                          name=f'{surf} skull surface')
     return _read_mri_surface(fname)
+
+
+def _estimate_talxfm_rigid(subject, subjects_dir):
+    from .coreg import fit_matched_points, _trans_from_params
+    xfm = read_talxfm(subject, subjects_dir)
+    # XYZ+origin + halfway
+    pts_tal = np.concatenate([np.eye(4)[:, :3], np.eye(3) * 0.5])
+    pts_subj = apply_trans(invert_transform(xfm), pts_tal)
+    # we fit with scaling enabled, but then discard it (we just need
+    # the rigid-body components)
+    params = fit_matched_points(pts_subj, pts_tal, scale=3, out='params')
+    rigid = _trans_from_params((True, True, False), params[:6])
+    return rigid

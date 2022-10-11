@@ -13,18 +13,20 @@ import pytest
 import numpy as np
 from numpy.testing import assert_array_equal, assert_allclose
 from scipy import sparse
+import string
 
 from mne import (Epochs, read_events, pick_info, pick_types, Annotations,
                  read_evokeds, make_forward_solution, make_sphere_model,
                  setup_volume_source_space, write_forward_solution,
                  read_forward_solution, write_cov, read_cov, read_epochs,
                  compute_covariance)
-from mne.channels import read_polhemus_fastscan
+from mne.channels import (read_polhemus_fastscan, make_standard_montage,
+                          equalize_channels)
 from mne.event import make_fixed_length_events
 from mne.datasets import testing
 from mne.io import (read_fiducials, write_fiducials, _coil_trans_to_loc,
                     _loc_to_coil_trans, read_raw_fif, read_info, write_info,
-                    meas_info, Projection, BaseRaw)
+                    meas_info, Projection, BaseRaw, read_raw_ctf, RawArray)
 from mne.io.constants import FIFF
 from mne.io.write import _generate_meas_id, DATE_NONE
 from mne.io.meas_info import (Info, create_info, _merge_info,
@@ -35,10 +37,8 @@ from mne.io.meas_info import (Info, create_info, _merge_info,
 from mne.minimum_norm import (make_inverse_operator, write_inverse_operator,
                               read_inverse_operator, apply_inverse)
 from mne.io._digitization import _write_dig_points, _make_dig_points, DigPoint
-from mne.io import read_raw_ctf
 from mne.transforms import Transform
-from mne.utils import catch_logging, assert_object_equal
-from mne.channels import make_standard_montage, equalize_channels
+from mne.utils import catch_logging, assert_object_equal, _record_warnings
 
 fiducials_fname = op.join(op.dirname(__file__), '..', '..', 'data',
                           'fsaverage', 'fsaverage-fiducials.fif')
@@ -140,9 +140,16 @@ def test_duplicate_name_correction():
     info = create_info(['A', 'A', 'A'], 1000., verbose='error')
     assert info['ch_names'] == ['A-0', 'A-1', 'A-2']
 
-    # When running number is not possible
-    with pytest.raises(ValueError, match='Adding a running number'):
-        create_info(['A', 'A', 'A-0'], 1000., verbose='error')
+    # When running number is not possible but alpha numeric is
+    info = create_info(['A', 'A', 'A-0'], 1000., verbose='error')
+    assert info['ch_names'] == ['A-a', 'A-1', 'A-0']
+
+    # When a single addition is not sufficient
+    with pytest.raises(ValueError, match='Adding a single alphanumeric'):
+        ch_n = ['A', 'A']
+        # add all options for first duplicate channel (0)
+        ch_n.extend([f'{ch_n[0]}-{c}' for c in string.ascii_lowercase + '0'])
+        create_info(ch_n, 1000., verbose='error')
 
 
 def test_fiducials_io(tmp_path):
@@ -165,7 +172,8 @@ def test_fiducials_io(tmp_path):
 
     # test safeguards
     pts[0]['coord_frame'] += 1
-    pytest.raises(ValueError, write_fiducials, temp_fname, pts, coord_frame)
+    with pytest.raises(ValueError, match='coord_frame entries that are incom'):
+        write_fiducials(temp_fname, pts, coord_frame, overwrite=True)
 
 
 def test_info():
@@ -474,12 +482,6 @@ def test_check_consistency():
         info2['lowpass'] = 'foo'
     pytest.raises(ValueError, info2._check_consistency)
 
-    info2 = info.copy()
-    with info2._unlock():
-        info2['filename'] = 'foo'
-    with pytest.warns(RuntimeWarning, match='filename'):
-        info2._check_consistency()
-
     # Silent type conversion to float
     info2 = info.copy()
     with info2._unlock(check_after=True):
@@ -651,7 +653,7 @@ def _test_anonymize_info(base_info):
         new_info = anonymize_info(base_info.copy(), daysback=delta_t_2.days)
     assert_object_equal(new_info, exp_info_3)
 
-    with pytest.warns(None):  # meas_date is None
+    with _record_warnings():  # meas_date is None
         new_info = anonymize_info(base_info.copy())
     assert_object_equal(new_info, exp_info_3)
 
@@ -807,7 +809,7 @@ def test_check_compensation_consistency():
         with catch_logging() as log:
             Epochs(raw, events, None, -0.2, 0.2, preload=False,
                    picks=picks, verbose=True)
-            assert'Removing 5 compensators' in log.getvalue()
+            assert 'Removing 5 compensators' in log.getvalue()
 
 
 def test_field_round_trip(tmp_path):
@@ -995,7 +997,7 @@ def test_channel_name_limit(tmp_path, monkeypatch, fname):
     #
     # forward
     #
-    with pytest.warns(None):  # not enough points for CTF
+    with _record_warnings():  # not enough points for CTF
         sphere = make_sphere_model('auto', 'auto', evoked.info)
     src = setup_volume_source_space(
         pos=dict(rr=[[0, 0, 0.04]], nn=[[0, 1., 0.]]))
@@ -1057,3 +1059,24 @@ def test_info_bad():
             info[key] = info[key]
     with pytest.raises(ValueError, match='between meg<->head'):
         info['dev_head_t'] = Transform('mri', 'head', np.eye(4))
+
+
+def test_get_montage():
+    """Test ContainsMixin.get_montage()."""
+    ch_names = make_standard_montage('standard_1020').ch_names
+    sfreq = 512
+    data = np.zeros((len(ch_names), sfreq * 2))
+    raw = RawArray(data, create_info(ch_names, sfreq, 'eeg'))
+    raw.set_montage('standard_1020')
+
+    assert len(raw.get_montage().ch_names) == len(ch_names)
+    raw.info['bads'] = [ch_names[0]]
+    assert len(raw.get_montage().ch_names) == len(ch_names)
+
+    # test info
+    raw = RawArray(data, create_info(ch_names, sfreq, 'eeg'))
+    raw.set_montage('standard_1020')
+
+    assert len(raw.info.get_montage().ch_names) == len(ch_names)
+    raw.info['bads'] = [ch_names[0]]
+    assert len(raw.info.get_montage().ch_names) == len(ch_names)

@@ -36,6 +36,7 @@ Events
    :toctree: generated/
 
    define_target_events
+   match_event_names
    shift_time_events
 
 :py:mod:`mne.epochs`:
@@ -49,7 +50,6 @@ Events
 .. autosummary::
    :toctree: generated/
 
-   add_channels_epochs
    average_movements
    combine_event_ids
    equalize_epoch_counts

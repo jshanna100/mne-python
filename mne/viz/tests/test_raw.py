@@ -4,21 +4,24 @@
 
 import itertools
 import os
+from copy import deepcopy
 
-import numpy as np
-from numpy.testing import assert_allclose
-import pytest
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib import backend_bases
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose
 
-from mne import pick_types, Annotations, create_info
-from mne.datasets import testing
-from mne.utils import get_config, set_config
-from mne.io import RawArray
-from mne.utils import _dt_to_stamp
-from mne.viz.utils import _fake_click
+from mne import Annotations, create_info, pick_types
 from mne.annotations import _sync_onset
+from mne.datasets import testing
+from mne.io import RawArray
+from mne.io.pick import _DATA_CH_TYPES_ORDER_DEFAULT, _PICK_TYPES_DATA_DICT
+from mne.utils import (_dt_to_stamp, _record_warnings, get_config, set_config,
+                       _assert_no_instances)
 from mne.viz import plot_raw, plot_sensors
+from mne.viz.utils import _fake_click, _fake_keypress
 
 
 def _annotation_helper(raw, browse_backend, events=False):
@@ -60,7 +63,7 @@ def _annotation_helper(raw, browse_backend, events=False):
             fig._fake_click(xy, fig=ann_fig, ax=ann_fig.mne.radio_ax,
                             xform='data')
     else:
-        # The modal dialogs of the pyqtgraph-backend would block the test,
+        # The modal dialogs of the Qt-backend would block the test,
         # thus a new description will be added programmatically.
         ann_fig._add_description('BAD test')
 
@@ -97,7 +100,7 @@ def _annotation_helper(raw, browse_backend, events=False):
     # with QTest, there seems to happen a rounding of pixels to integers
     # internally. This deviatian also seems to change between runs
     # (maybe device-dependent?).
-    atol = 1e-10 if ismpl else 1e-2
+    atol = 1e-10 if ismpl else 2e-2
     assert_allclose(onset, want_onset, atol=atol)
     assert_allclose(raw.annotations.duration[n_anns], 4., atol=atol)
     # modify annotation from end (duration 4 → 1.5)
@@ -180,7 +183,7 @@ def _proj_click(idx, fig, browse_backend):
         # (also see comment in test_plot_raw_selection).
         ssp_fig._proj_changed(not fig.mne.projs_on[idx], idx)
         # Update Checkbox
-        ssp_fig.checkboxes[idx].setChecked(fig.mne.projs_on[idx])
+        ssp_fig.checkboxes[idx].setChecked(bool(fig.mne.projs_on[idx]))
 
 
 def _proj_click_all(fig, browse_backend):
@@ -194,34 +197,46 @@ def _proj_click_all(fig, browse_backend):
         ssp_fig.toggle_all()
 
 
+def _spawn_child_fig(fig, attr, browse_backend, key):
+    # starting state
+    n_figs = browse_backend._get_n_figs()
+    n_children = len(fig.mne.child_figs)
+    # spawn the child fig
+    fig._fake_keypress(key)
+    # make sure the figure was actually spawned
+    assert len(fig.mne.child_figs) == n_children + 1
+    assert browse_backend._get_n_figs() == n_figs + 1
+    # make sure the parent fig knows the child fig's name
+    child_fig = getattr(fig.mne, attr)
+    assert child_fig is not None
+    return child_fig
+
+
+def _destroy_child_fig(fig, child_fig, attr, browse_backend, key, key_target):
+    # starting state
+    n_figs = browse_backend._get_n_figs()
+    n_children = len(fig.mne.child_figs)
+    # destroy child fig (_close_event is MPL agg backend workaround)
+    fig._fake_keypress(key, fig=key_target)
+    fig._close_event(child_fig)
+    # make sure the figure was actually destroyed
+    assert len(fig.mne.child_figs) == n_children - 1
+    assert browse_backend._get_n_figs() == n_figs - 1
+    assert getattr(fig.mne, attr) is None
+
+
 def _child_fig_helper(fig, key, attr, browse_backend):
     # Spawn and close child figs of raw.plot()
-    num_figs = browse_backend._get_n_figs()
     assert getattr(fig.mne, attr) is None
-    # spawn
-    fig._fake_keypress(key)
-    assert len(fig.mne.child_figs) == 1
-    assert browse_backend._get_n_figs() == num_figs + 1
-    child_fig = getattr(fig.mne, attr)
-    assert child_fig is not None
-    # close via main window toggle
-    fig._fake_keypress(key)
-    fig._close_event(child_fig)
-    assert len(fig.mne.child_figs) == 0
-    assert browse_backend._get_n_figs() == num_figs
-    assert getattr(fig.mne, attr) is None
-    # spawn again
-    fig._fake_keypress(key)
-    assert len(fig.mne.child_figs) == 1
-    assert browse_backend._get_n_figs() == num_figs + 1
-    child_fig = getattr(fig.mne, attr)
-    assert child_fig is not None
-    # close via child window
-    fig._fake_keypress(child_fig.mne.close_key, fig=child_fig)
-    fig._close_event(child_fig)
-    assert len(fig.mne.child_figs) == 0
-    assert browse_backend._get_n_figs() == num_figs
-    assert getattr(fig.mne, attr) is None
+    # spawn, then close via main window toggle
+    child_fig = _spawn_child_fig(fig, attr, browse_backend, key)
+    _destroy_child_fig(fig, child_fig, attr, browse_backend, key,
+                       key_target=fig)
+    # spawn again, then close via child window's close key
+    child_fig = _spawn_child_fig(fig, attr, browse_backend, key)
+    _destroy_child_fig(fig, child_fig, attr, browse_backend,
+                       key=child_fig.mne.close_key,
+                       key_target=child_fig)
 
 
 def test_scale_bar(browser_backend):
@@ -273,7 +288,8 @@ def test_plot_raw_selection(raw, browser_backend):
     assert len(fig.mne.traces) == len(sel_dict['Misc'])  # 1
     # switch to butterfly mode
     fig._fake_keypress('b', fig=sel_fig)
-    # ToDo: For pyqtgraph-backend the framework around RawTraceItem makes
+
+    # ToDo: For Qt-backend the framework around RawTraceItem makes
     #  it difficult to show the same channel multiple times which is why
     #  it is currently not implemented.
     #  This would be relevant if you wanted to plot several selections in
@@ -319,8 +335,11 @@ def test_plot_raw_selection(raw, browser_backend):
     fig._click_ch_name(ch_index=1, button=1)  # mark good
     assert lasso.ec[:, 0].sum() == 0   # all channels black
     # test lasso
-    # Testing lasso-interactivity of sensor-plot within pyqtgraph-backend
+    # Testing lasso-interactivity of sensor-plot within Qt-backend
     # with QTest doesn't seem to work.
+    want = ['MEG 0111', 'MEG 0112', 'MEG 0113', 'MEG 0131', 'MEG 0132',
+            'MEG 0133']
+    assert want == sorted(fig.mne.ch_names[fig.mne.picks])
     want = ['MEG 0121', 'MEG 0122', 'MEG 0123']
     if ismpl:
         sel_fig._set_custom_selection()  # lasso empty → should do nothing
@@ -381,18 +400,15 @@ def test_plot_raw_child_figures(raw, browser_backend):
     ismpl = browser_backend.name == 'matplotlib'
     with raw.info._unlock():
         raw.info['lowpass'] = 10.  # allow heavy decim during plotting
-    browser_backend._close_all()  # make sure we start clean
+    # make sure we start clean
     assert browser_backend._get_n_figs() == 0
     fig = raw.plot()
     assert browser_backend._get_n_figs() == 1
     # test child fig toggles
     _child_fig_helper(fig, '?', 'fig_help', browser_backend)
     _child_fig_helper(fig, 'j', 'fig_proj', browser_backend)
-    # In pyqtgraph, this is a dock-widget instead of a separated window.
-    if ismpl:
+    if ismpl:  # in mne-qt-browser, annotation is a dock-widget, not a window
         _child_fig_helper(fig, 'a', 'fig_annotation', browser_backend)
-    assert len(fig.mne.child_figs) == 0  # make sure the helper cleaned up
-    assert browser_backend._get_n_figs() == 1
     # test right-click → channel location popup
     fig._redraw()
     fig._click_ch_name(ch_index=2, button=3)
@@ -401,12 +417,11 @@ def test_plot_raw_child_figures(raw, browser_backend):
     fig._fake_keypress('escape', fig=fig.mne.child_figs[0])
     if ismpl:
         fig._close_event(fig.mne.child_figs[0])
+    assert len(fig.mne.child_figs) == 0
     assert browser_backend._get_n_figs() == 1
     # test right-click on non-data channel
     ix = raw.get_channel_types().index('ias')  # find the shielding channel
     trace_ix = fig.mne.ch_order.tolist().index(ix)  # get its plotting position
-    assert len(fig.mne.child_figs) == 0
-    assert browser_backend._get_n_figs() == 1
     fig._redraw()
     fig._click_ch_name(ch_index=trace_ix, button=3)  # should be no-op
     assert len(fig.mne.child_figs) == 0
@@ -415,7 +430,35 @@ def test_plot_raw_child_figures(raw, browser_backend):
     fig._resize_by_factor(0.5)
 
 
-def test_plot_raw_keypresses(raw, browser_backend):
+def test_orphaned_annot_fig(raw, browser_backend):
+    """Test that annotation window is not orphaned (GH #10454)."""
+    if browser_backend.name != 'matplotlib':
+        return
+    assert browser_backend._get_n_figs() == 0
+    fig = raw.plot()
+    _spawn_child_fig(fig, 'fig_annotation', browser_backend, 'a')
+    fig._fake_keypress(key=fig.mne.close_key)
+    fig._close_event()
+    assert len(fig.mne.child_figs) == 0
+    assert browser_backend._get_n_figs() == 0
+
+
+def _monkeypatch_fig(fig, browser_backend):
+    if browser_backend.name == 'matplotlib':
+        fig.canvas.manager.full_screen_toggle = lambda: None
+    else:
+        # Monkeypatch the Qt methods
+        def _full():
+            fig.isFullScreen = lambda: True
+
+        def _norm():
+            fig.isFullScreen = lambda: False
+
+        fig.showFullScreen = _full
+        fig.showNormal = _norm
+
+
+def test_plot_raw_keypresses(raw, browser_backend, monkeypatch):
     """Test keypress interactivity of plot_raw()."""
     with raw.info._unlock():
         raw.info['lowpass'] = 10.  # allow heavy decim during plotting
@@ -425,11 +468,14 @@ def test_plot_raw_keypresses(raw, browser_backend):
     keys = ('pagedown', 'down', 'up', 'down', 'right', 'left', '-', '+', '=',
             'd', 'd', 'pageup', 'home', 'end', 'z', 'z', 's', 's', 'f11', 't',
             'b')
+    # Avoid annoying fullscreen issues by monkey-patching our handlers
+    _monkeypatch_fig(fig, browser_backend)
     # test for group_by='original'
     for key in 2 * keys + ('escape',):
         fig._fake_keypress(key)
     # test for group_by='selection'
     fig = plot_raw(raw, group_by='selection')
+    _monkeypatch_fig(fig, browser_backend)
     for key in 2 * keys + ('escape',):
         fig._fake_keypress(key)
 
@@ -479,7 +525,7 @@ def test_plot_raw_traces(raw, events, browser_backend):
     assert labels == [raw.ch_names[5], raw.ch_names[2], raw.ch_names[3]]
     for _ in (0, 0):
         # first click changes channels to mid; second time shouldn't change
-        # This needs to be changed for pyqtgraph, because there scrollbars are
+        # This needs to be changed for Qt, because there scrollbars are
         # drawn differently (value of slider at lower end, not at middle)
         yclick = 0.5 if ismpl else 0.7
         fig._fake_click((0.5, yclick), ax=vscroll)
@@ -532,7 +578,7 @@ def test_plot_raw_groupby(raw, browser_backend, group_by):
     fig._fake_click((0.5, 0.5), ax=fig.mne.ax_vscroll)  # change channels
     if browser_backend.name == 'matplotlib':
         # Test lasso-selection
-        # (test difficult with pyqtgraph-backend, set plot_raw_selection)
+        # (test difficult with Qt-backend, set plot_raw_selection)
         sel_fig = fig.mne.fig_selection
         topo_ax = sel_fig.mne.sensor_ax
         fig._fake_click([-0.425, 0.20223853], fig=sel_fig, ax=topo_ax,
@@ -554,7 +600,7 @@ def test_plot_raw_meas_date(raw, browser_backend):
     annot = Annotations([1 + raw.first_samp / raw.info['sfreq']], [5], ['bad'])
     with pytest.warns(RuntimeWarning, match='outside data range'):
         raw.set_annotations(annot)
-    with pytest.warns(None):  # sometimes projection
+    with _record_warnings():  # sometimes projection
         raw.plot(group_by='position', order=np.arange(8))
     fig = raw.plot()
     for key in ['down', 'up', 'escape']:
@@ -566,7 +612,7 @@ def test_plot_raw_nan(raw, browser_backend):
     raw._data[:] = np.nan
     # this should (at least) not die, the output should pretty clearly show
     # that there is a problem so probably okay to just plot something blank
-    with pytest.warns(None):
+    with _record_warnings():
         raw.plot(scalings='auto')
 
 
@@ -663,7 +709,7 @@ def test_remove_annotations(raw, hide_which, browser_backend):
 def test_plot_raw_filtered(filtorder, raw, browser_backend):
     """Test filtering of raw plots."""
     # Opening that many plots can cause a Segmentation fault
-    # if multithreading is activated in pyqtgraph-backend
+    # if multithreading is activated in Qt-backend
     pg_kwargs = {'precompute': False}
     with pytest.raises(ValueError, match='lowpass.*Nyquist'):
         raw.plot(lowpass=raw.info['sfreq'] / 2., filtorder=filtorder,
@@ -687,7 +733,9 @@ def test_plot_raw_psd(raw, raw_orig):
     raw_unchanged = raw.copy()
     # normal mode
     fig = raw.plot_psd(average=False)
-    fig.canvas.resize_event()
+    fig.canvas.callbacks.process(
+        'resize_event',
+        backend_bases.ResizeEvent('resize_event', fig.canvas))
     # specific mode
     picks = pick_types(raw.info, meg='mag', eeg=False)[:4]
     raw.plot_psd(tmax=None, picks=picks, area_mode='range', average=False,
@@ -705,7 +753,7 @@ def test_plot_raw_psd(raw, raw_orig):
     plt.close('all')
     # need 2, got 1
     ax = plt.axes()
-    with pytest.raises(ValueError, match='of length 2, while the length is 1'):
+    with pytest.raises(ValueError, match='of length 2.*the length is 1'):
         raw.plot_psd(ax=ax, average=True)
     plt.close('all')
     # topo psd
@@ -770,11 +818,12 @@ def test_plot_raw_psd(raw, raw_orig):
     plt.close('all')
 
     # gh-7631
-    data = 1e-3 * np.random.rand(2, 100)
-    info = create_info(['CH1', 'CH2'], 100)
+    n_times = sfreq = n_fft = 100
+    data = 1e-3 * np.random.rand(2, n_times)
+    info = create_info(['CH1', 'CH2'], sfreq)  # ch_types defaults to 'misc'
     raw = RawArray(data, info)
     picks = pick_types(raw.info, misc=True)
-    raw.plot_psd(picks=picks, spatial_colors=False)
+    raw.plot_psd(picks=picks, spatial_colors=False, n_fft=n_fft)
     plt.close('all')
 
 
@@ -808,8 +857,8 @@ def test_plot_sensors(raw):
     assert fig.lasso.selection == []
     _fake_click(fig, ax, (0.65, 1), xform='ax', kind='motion')
     _fake_click(fig, ax, (0.65, 0.7), xform='ax', kind='motion')
-    fig.canvas.key_press_event('control')
-    _fake_click(fig, ax, (0, 0.7), xform='ax', kind='release')
+    _fake_keypress(fig, 'control')
+    _fake_click(fig, ax, (0, 0.7), xform='ax', kind='release', key='control')
     assert fig.lasso.selection == ['MEG 0121']
 
     # check that point appearance changes
@@ -818,17 +867,49 @@ def test_plot_sensors(raw):
     assert (fc[:, -1] == [0.5, 1., 0.5]).all()
     assert (ec[:, -1] == [0.25, 1., 0.25]).all()
 
-    _fake_click(fig, ax, (0.7, 1), xform='ax', kind='motion')
+    _fake_click(fig, ax, (0.7, 1), xform='ax', kind='motion', key='control')
     xy = ax.collections[0].get_offsets()
-    _fake_click(fig, ax, xy[2], xform='data')  # single selection
+    _fake_click(fig, ax, xy[2], xform='data', key='control')  # single sel
     assert fig.lasso.selection == ['MEG 0121', 'MEG 0131']
-    _fake_click(fig, ax, xy[2], xform='data')  # deselect
+    _fake_click(fig, ax, xy[2], xform='data', key='control')  # deselect
     assert fig.lasso.selection == ['MEG 0121']
     plt.close('all')
 
     raw.info['dev_head_t'] = None  # like empty room
     with pytest.warns(RuntimeWarning, match='identity'):
         raw.plot_sensors()
+
+    # Test plotting with sphere='eeglab'
+    info = create_info(
+        ch_names=['Fpz', 'Oz', 'T7', 'T8'],
+        sfreq=100,
+        ch_types='eeg'
+    )
+    data = 1e-6 * np.random.rand(4, 100)
+    raw_eeg = RawArray(data=data, info=info)
+    raw_eeg.set_montage('biosemi64')
+    raw_eeg.plot_sensors(sphere='eeglab')
+
+    # Should work with "FPz" as well
+    raw_eeg.rename_channels({'Fpz': 'FPz'})
+    raw_eeg.plot_sensors(sphere='eeglab')
+
+    # Should still work without Fpz/FPz, as long as we still have Oz
+    raw_eeg.drop_channels('FPz')
+    raw_eeg.plot_sensors(sphere='eeglab')
+
+    # Should raise if Oz is missing too, as we cannot reconstruct Fpz anymore
+    raw_eeg.drop_channels('Oz')
+    with pytest.raises(ValueError, match='could not find: Fpz'):
+        raw_eeg.plot_sensors(sphere='eeglab')
+
+    # Should raise if we don't have a montage
+    chs = deepcopy(raw_eeg.info['chs'])
+    raw_eeg.set_montage(None)
+    with raw_eeg.info._unlock():
+        raw_eeg.info['chs'] = chs
+    with pytest.raises(ValueError, match='No montage was set'):
+        raw_eeg.plot_sensors(sphere='eeglab')
 
 
 @pytest.mark.parametrize('cfg_value', (None, '0.1,0.1'))
@@ -860,3 +941,35 @@ def test_clock_xticks(raw, dur, n_dec, browser_backend):
     assert tick_texts[0].startswith('19:01:53')
     if len(tick_texts[0].split('.')) > 1:
         assert len(tick_texts[0].split('.')[1]) == n_dec
+
+
+def test_plotting_order_consistency():
+    """Test that our internal variables have some consistency."""
+    pick_data_set = set(_PICK_TYPES_DATA_DICT)
+    pick_data_set.remove('meg')
+    pick_data_set.remove('fnirs')
+    missing = pick_data_set.difference(set(_DATA_CH_TYPES_ORDER_DEFAULT))
+    assert missing == set()
+
+
+def test_plotting_temperature_gsr(browser_backend):
+    """Test that we can plot temperature and GSR."""
+    data = np.random.RandomState(0).randn(2, 1000)
+    data[0] += 37  # deg C
+    # no idea what the scale should be for GSR
+    info = create_info(2, 1000., ['temperature', 'gsr'])
+    raw = RawArray(data, info)
+    fig = raw.plot()
+    tick_texts = fig._get_ticklabels('y')
+    assert len(tick_texts) == 2
+
+
+@pytest.mark.pgtest
+def test_plotting_memory_garbage_collection(raw, pg_backend):
+    """Test that memory can be garbage collected properly."""
+    pytest.importorskip('mne_qt_browser', minversion='0.4')
+    raw.plot().close()
+    import mne_qt_browser
+    from mne_qt_browser._pg_figure import MNEQtBrowser
+    assert len(mne_qt_browser._browser_instances) == 0
+    _assert_no_instances(MNEQtBrowser, 'after closing')

@@ -1,6 +1,6 @@
 .. -*- mode: rst -*-
 
-|GH-Linux|_ |GH-macOS|_ |Azure|_ |Circle|_ |Codecov|_ |PyPI|_ |conda-forge|_ |Zenodo|_
+|GH-Linux|_ |GH-macOS|_ |Cirrus|_ |Azure|_ |Circle|_ |Codecov|_ |PyPI|_ |conda-forge|_ |Zenodo|_
 
 |MNE|_
 
@@ -9,6 +9,9 @@
 
 .. |GH-macOS| image:: https://github.com/mne-tools/mne-python/workflows/macos%20/%20conda/badge.svg?branch=main
 .. _GH-macOS: https://github.com/mne-tools/mne-python/actions?query=branch:main+event:push
+
+.. |Cirrus| image:: https://api.cirrus-ci.com/github/mne-tools/mne-python.svg
+.. _Cirrus: https://cirrus-ci.com/github/mne-tools/mne-python
 
 .. |Azure| image:: https://dev.azure.com/mne-tools/mne-python/_apis/build/status/mne-tools.mne-python?branchName=main
 .. _Azure: https://dev.azure.com/mne-tools/mne-python/_build/latest?definitionId=1&branchName=main
@@ -52,9 +55,9 @@ Installing MNE-Python
 
 To install the latest stable version of MNE-Python, you can use pip_ in a terminal:
 
-.. code-block:: bash
+.. code-block:: console
 
-    pip install -U mne
+    $ pip install -U mne
 
 - MNE-Python 0.17 was the last release to support Python 2.7
 - MNE-Python 0.18 requires Python 3.5 or higher
@@ -70,15 +73,15 @@ Get the latest code
 
 To install the latest version of the code using pip_ open a terminal and type:
 
-.. code-block:: bash
+.. code-block:: console
 
-    pip install -U https://github.com/mne-tools/mne-python/archive/main.zip
+    $ pip install -U https://github.com/mne-tools/mne-python/archive/main.zip
 
 To get the latest code using `git <https://git-scm.com/>`__, open a terminal and type:
 
-.. code-block:: bash
+.. code-block:: console
 
-    git clone https://github.com/mne-tools/mne-python.git
+    $ git clone https://github.com/mne-tools/mne-python.git
 
 Alternatively, you can also download a
 `zip file of the latest development version <https://github.com/mne-tools/mne-python/archive/main.zip>`__.
@@ -92,21 +95,30 @@ The minimum required dependencies to run MNE-Python are:
 - Python >= 3.7
 - NumPy >= 1.18.1
 - SciPy >= 1.4.1
+- Matplotlib >= 3.1.0
+- pooch >= 1.5
+- tqdm
+- Jinja2
+- decorator
 
 For full functionality, some functions require:
 
-- Matplotlib >= 3.1.0
 - Scikit-learn >= 0.22.0
+- joblib >= 0.15 (for parallelization control)
 - Numba >= 0.48.0
 - NiBabel >= 2.5.0
+- OpenMEEG >= 2.5.5
 - Pandas >= 1.0.0
 - Picard >= 0.3
 - CuPy >= 7.1.1 (for NVIDIA CUDA acceleration)
 - DIPY >= 1.1.0
 - Imageio >= 2.6.1
-- PyVista >= 0.30
+- PyVista >= 0.32
 - pyvistaqt >= 0.4
 - mffpy >= 0.5.7
+- h5py
+- h5io
+- pymatreader
 
 Contributing to MNE-Python
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -125,12 +137,12 @@ https://mne.discourse.group
 Licensing
 ^^^^^^^^^
 
-MNE-Python is **BSD-licenced** (3 clause):
+MNE-Python is **BSD-licenced** (BSD-3-Clause):
 
     This software is OSI Certified Open Source Software.
     OSI Certified is a certification mark of the Open Source Initiative.
 
-    Copyright (c) 2011-2021, authors of MNE-Python.
+    Copyright (c) 2011-2022, authors of MNE-Python.
     All rights reserved.
 
     Redistribution and use in source and binary forms, with or without

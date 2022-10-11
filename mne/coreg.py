@@ -26,6 +26,7 @@ from .io._digitization import _get_data_as_dict_from_dig
 # namespace, too)
 from ._freesurfer import (_read_mri_info, get_mni_fiducials,  # noqa: F401
                           estimate_head_mri_t)  # noqa: F401
+from ._freesurfer import _import_nibabel
 from .label import read_label, Label
 from .source_space import (add_source_space_distances, read_source_spaces,  # noqa: E501,F401
                            write_source_spaces)
@@ -38,6 +39,7 @@ from .transforms import (rotation, rotation3d, scaling, translation, Transform,
                          combine_transforms, _quat_to_euler,
                          _fit_matched_points, apply_trans,
                          rot_to_quat, _angle_between_quats)
+from .channels import make_dig_montage
 from .utils import (get_config, get_subjects_dir, logger, pformat, verbose,
                     warn, has_nibabel, fill_doc, _validate_type,
                     _check_subject, _check_option)
@@ -52,14 +54,29 @@ mri_transforms_dirname = os.path.join(subject_dirname, 'mri', 'transforms')
 surf_dirname = os.path.join(subject_dirname, 'surf')
 bem_fname = os.path.join(bem_dirname, "{subject}-{name}.fif")
 head_bem_fname = pformat(bem_fname, name='head')
+head_sparse_fname = pformat(bem_fname, name='head-sparse')
 fid_fname = pformat(bem_fname, name='fiducials')
 fid_fname_general = os.path.join(bem_dirname, "{head}-fiducials.fif")
 src_fname = os.path.join(bem_dirname, '{subject}-{spacing}-src.fif')
 _head_fnames = (os.path.join(bem_dirname, 'outer_skin.surf'),
+                head_sparse_fname,
                 head_bem_fname)
 _high_res_head_fnames = (os.path.join(bem_dirname, '{subject}-head-dense.fif'),
                          os.path.join(surf_dirname, 'lh.seghead'),
                          os.path.join(surf_dirname, 'lh.smseghead'))
+
+
+def _map_fid_name_to_idx(name: str) -> int:
+    """Map a fiducial name to its index in the DigMontage."""
+    name = name.lower()
+
+    if name == 'lpa':
+        return 0
+    elif name == 'nasion':
+        return 1
+    else:
+        assert name == 'rpa'
+        return 2
 
 
 def _make_writable(fname):
@@ -238,8 +255,7 @@ def _decimate_points(pts, res=10):
     zax = np.arange(zmin, zmax, res)
 
     # find voxels containing one or more point
-    H, _ = np.histogramdd(pts, bins=(xax, yax, zax), normed=False)
-    X, Y, Z = pts.T
+    H, _ = np.histogramdd(pts, bins=(xax, yax, zax), density=False)
     xbins, ybins, zbins = np.nonzero(H)
     x = xax[xbins]
     y = yax[ybins]
@@ -281,21 +297,7 @@ def _decimate_points(pts, res=10):
 
 
 def _trans_from_params(param_info, params):
-    """Convert transformation parameters into a transformation matrix.
-
-    Parameters
-    ----------
-    param_info : tuple,  len = 3
-        Tuple describing the parameters in x (do_translate, do_rotate,
-        do_scale).
-    params : tuple
-        The transformation parameters.
-
-    Returns
-    -------
-    trans : array, shape = (4, 4)
-        Transformation matrix.
-    """
+    """Convert transformation parameters into a transformation matrix."""
     do_rotate, do_translate, do_scale = param_info
     i = 0
     trans = []
@@ -821,7 +823,7 @@ def _scale_params(subject_to, subject_from, scale, subjects_dir):
         scale = cfg['scale']
     scale = np.atleast_1d(scale)
     if scale.ndim != 1 or scale.shape[0] not in (1, 3):
-        raise ValueError("Invalid shape for scale parameer. Need scalar "
+        raise ValueError("Invalid shape for scale parameter. Need scalar "
                          "or array of length 3. Got shape %s."
                          % (scale.shape,))
     n_params = len(scale)
@@ -830,7 +832,7 @@ def _scale_params(subject_to, subject_from, scale, subjects_dir):
 
 @verbose
 def scale_bem(subject_to, bem_name, subject_from=None, scale=None,
-              subjects_dir=None, verbose=None):
+              subjects_dir=None, *, on_defects='raise', verbose=None):
     """Scale a bem file.
 
     Parameters
@@ -849,6 +851,9 @@ def scale_bem(subject_to, bem_name, subject_from=None, scale=None,
         otherwise it is read from subject_to's config file.
     subjects_dir : None | str
         Override the SUBJECTS_DIR environment variable.
+    %(on_defects)s
+
+        .. versionadded:: 1.0
     %(verbose)s
     """
     subjects_dir, subject_from, scale, uniform = \
@@ -862,7 +867,7 @@ def scale_bem(subject_to, bem_name, subject_from=None, scale=None,
     if os.path.exists(dst):
         raise IOError("File already exists: %s" % dst)
 
-    surfs = read_bem_surfaces(src)
+    surfs = read_bem_surfaces(src, on_defects=on_defects)
     for surf in surfs:
         surf['rr'] *= scale
         if not uniform:
@@ -930,7 +935,7 @@ def scale_labels(subject_to, pattern=None, overwrite=False, subject_from=None,
 @verbose
 def scale_mri(subject_from, subject_to, scale, overwrite=False,
               subjects_dir=None, skip_fiducials=False, labels=True,
-              annot=False, verbose=None):
+              annot=False, *, on_defects='raise', verbose=None):
     """Create a scaled copy of an MRI subject.
 
     Parameters
@@ -952,6 +957,9 @@ def scale_mri(subject_from, subject_to, scale, overwrite=False,
         Also scale all labels (default True).
     annot : bool
         Copy ``*.annot`` files to the new location (default False).
+    %(on_defects)s
+
+        .. versionadded:: 1.0
     %(verbose)s
 
     See Also
@@ -1005,7 +1013,7 @@ def scale_mri(subject_from, subject_to, scale, overwrite=False,
     logger.debug('BEM files [in m]')
     for bem_name in paths['bem']:
         scale_bem(subject_to, bem_name, subject_from, scale, subjects_dir,
-                  verbose=False)
+                  on_defects=on_defects, verbose=False)
 
     logger.debug('fiducials [in m]')
     for fname in paths['fid']:
@@ -1015,7 +1023,7 @@ def scale_mri(subject_from, subject_to, scale, overwrite=False,
         for pt in pts:
             pt['r'] = pt['r'] * scale
         dest = fname.format(subject=subject_to, subjects_dir=subjects_dir)
-        write_fiducials(dest, pts, cframe, verbose=False)
+        write_fiducials(dest, pts, cframe, overwrite=True, verbose=False)
 
     logger.debug('MRIs [nibabel]')
     os.mkdir(mri_dirname.format(subjects_dir=subjects_dir,
@@ -1065,7 +1073,7 @@ def scale_mri(subject_from, subject_to, scale, overwrite=False,
 
 @verbose
 def scale_source_space(subject_to, src_name, subject_from=None, scale=None,
-                       subjects_dir=None, n_jobs=1, verbose=None):
+                       subjects_dir=None, n_jobs=None, verbose=None):
     """Scale a source space for an mri created with scale_mri().
 
     Parameters
@@ -1163,12 +1171,7 @@ def _scale_mri(subject_to, mri_fname, subject_from, scale, subjects_dir):
     """Scale an MRI by setting its affine."""
     subjects_dir, subject_from, scale, _ = _scale_params(
         subject_to, subject_from, scale, subjects_dir)
-
-    if not has_nibabel():
-        warn('Skipping MRI scaling for %s, please install nibabel')
-        return
-
-    import nibabel
+    nibabel = _import_nibabel('scale an MRI')
     fname_from = op.join(mri_dirname.format(
         subjects_dir=subjects_dir, subject=subject_from), mri_fname)
     fname_to = op.join(mri_dirname.format(
@@ -1260,11 +1263,13 @@ def _scale_xfm(subject_to, xfm_fname, mri_name, subject_from, scale,
     _write_fs_xfm(fname_to, T_ras_mni['trans'], kind)
 
 
-def _read_surface(filename):
+def _read_surface(filename, *, on_defects):
     bem = dict()
     if filename is not None and op.exists(filename):
         if filename.endswith('.fif'):
-            bem = read_bem_surfaces(filename, verbose=False)[0]
+            bem = read_bem_surfaces(
+                filename, on_defects=on_defects, verbose=False
+            )[0]
         else:
             try:
                 bem = read_surface(filename, return_dict=True)[2]
@@ -1287,20 +1292,15 @@ class Coregistration(object):
         The measurement info.
     %(subject)s
     %(subjects_dir)s
-    fiducials : list | dict | str
-        The fiducials given in the MRI (surface RAS) coordinate
-        system. If a dict is provided it must be a dict with 3 entries
-        with keys 'lpa', 'rpa' and 'nasion' with as values coordinates in m.
-        If a list it must be a list of DigPoint instances as returned
-        by the read_fiducials function.
-        If set to 'estimated', the fiducials are initialized
-        automatically using fiducials defined in MNI space on fsaverage
-        template. If set to 'auto', one tries to find the fiducials
-        in a file with the canonical name (``bem/{subject}-fiducials.fif``)
-        and if abstent one falls back to 'estimated'. Defaults to 'auto'.
+    %(fiducials)s
+    %(on_defects)s
+
+        .. versionadded:: 1.0
 
     Attributes
     ----------
+    fiducials : instance of DigMontage
+        A montage containing the MRI fiducials.
     trans : instance of Transform
         MRI<->Head coordinate transformation.
 
@@ -1320,12 +1320,14 @@ class Coregistration(object):
     to create a surrogate MRI subject with the proper scale factors.
     """
 
-    def __init__(self, info, subject, subjects_dir=None, fiducials='auto'):
+    def __init__(self, info, subject, subjects_dir=None, fiducials='auto', *,
+                 on_defects='raise'):
         _validate_type(info, (Info, None), 'info')
         self._info = info
         self._subject = _check_subject(subject, subject)
         self._subjects_dir = get_subjects_dir(subjects_dir, raise_error=True)
         self._scale_mode = None
+        self._on_defects = on_defects
 
         self._rot_trans = None
         self._default_parameters = \
@@ -1350,6 +1352,8 @@ class Coregistration(object):
 
         self._setup_digs()
         self._setup_bem()
+
+        self._fid_filename = None
         self._setup_fiducials(fiducials)
         self.reset()
 
@@ -1390,25 +1394,31 @@ class Coregistration(object):
             raise RuntimeError("No standard head model was "
                                f"found for subject {self._subject}")
         if high_res_path is not None:
-            self._bem_high_res = _read_surface(high_res_path)
+            self._bem_high_res = _read_surface(
+                high_res_path, on_defects=self._on_defects
+            )
             logger.info(f'Using high resolution head model in {high_res_path}')
         else:
-            self._bem_high_res = _read_surface(low_res_path)
+            self._bem_high_res = _read_surface(
+                low_res_path, on_defects=self._on_defects
+            )
             logger.info(f'Using low resolution head model in {low_res_path}')
         if low_res_path is None:
             # This should be very rare!
             warn('No low-resolution head found, decimating high resolution '
-                 'mesh (%d vertices): %s' % (len(self._bem_high_res.surf.rr),
+                 'mesh (%d vertices): %s' % (len(self._bem_high_res['rr']),
                                              high_res_path,))
             # Create one from the high res one, which we know we have
-            rr, tris = decimate_surface(self._bem_high_res.surf.rr,
-                                        self._bem_high_res.surf.tris,
+            rr, tris = decimate_surface(self._bem_high_res['rr'],
+                                        self._bem_high_res['tris'],
                                         n_triangles=5120)
             # directly set the attributes of bem_low_res
             self._bem_low_res = complete_surface_info(
                 dict(rr=rr, tris=tris), copy=False, verbose=False)
         else:
-            self._bem_low_res = _read_surface(low_res_path)
+            self._bem_low_res = _read_surface(
+                low_res_path, on_defects=self._on_defects
+            )
 
     def _setup_fiducials(self, fids):
         _validate_type(fids, (str, dict, list))
@@ -1424,6 +1434,7 @@ class Coregistration(object):
                 logger.info(f'Using fiducials from: {fid_filename}.')
                 fids, _ = read_fiducials(fid_filename)
                 fid_accurate = True
+                self._fid_filename = fid_filename
             else:
                 fids = 'estimated'
 
@@ -1446,15 +1457,18 @@ class Coregistration(object):
         # does not seem to happen by itself ... so hard code it:
         self._reset_fiducials()
 
-    def _reset_fiducials(self):  # noqa: D102
-        if self._fid_points is not None:
-            self._lpa = self._fid_points[0:1]
-            self._nasion = self._fid_points[1:2]
-            self._rpa = self._fid_points[2:3]
+    def _reset_fiducials(self):
+        dig_montage = make_dig_montage(
+            lpa=self._fid_points[0],
+            nasion=self._fid_points[1],
+            rpa=self._fid_points[2],
+            coord_frame='mri'
+        )
+        self.fiducials = dig_montage
 
     def _update_params(self, rot=None, tra=None, sca=None,
-                       force_update_omitted=False):
-        if force_update_omitted:
+                       force_update=False):
+        if force_update and tra is None:
             tra = self._translation
         rot_changed = False
         if rot is not None:
@@ -1547,7 +1561,7 @@ class Coregistration(object):
             The modified Coregistration object.
         """
         self._grow_hair = value
-        self._update_params(self._rotation, self._translation, self._scale)
+        self._update_params(force_update=True)
         return self
 
     def set_rotation(self, rot):
@@ -1633,6 +1647,11 @@ class Coregistration(object):
             apply_trans(self._head_mri_t, self._filtered_extra_points))[1]
 
     @property
+    def _has_hsp_data(self):
+        return (self._has_mri_data and
+                len(self._nearest_transformed_high_res_mri_idx_hsp) > 0)
+
+    @property
     def _has_hpi_data(self):
         return (self._has_mri_data and
                 len(self._nearest_transformed_high_res_mri_idx_hpi) > 0)
@@ -1644,15 +1663,27 @@ class Coregistration(object):
 
     @property
     def _has_lpa_data(self):
-        return (np.any(self._lpa) and np.any(self._dig_dict['lpa']))
+        mri_point = self.fiducials.dig[_map_fid_name_to_idx('lpa')]
+        assert mri_point['ident'] == FIFF.FIFFV_POINT_LPA
+        has_mri_data = np.any(mri_point['r'])
+        has_head_data = np.any(self._dig_dict['lpa'])
+        return has_mri_data and has_head_data
 
     @property
     def _has_nasion_data(self):
-        return (np.any(self._nasion) and np.any(self._dig_dict.nasion))
+        mri_point = self.fiducials.dig[_map_fid_name_to_idx('nasion')]
+        assert mri_point['ident'] == FIFF.FIFFV_POINT_NASION
+        has_mri_data = np.any(mri_point['r'])
+        has_head_data = np.any(self._dig_dict['nasion'])
+        return has_mri_data and has_head_data
 
     @property
     def _has_rpa_data(self):
-        return (np.any(self._rpa) and np.any(self._dig_dict['rpa']))
+        mri_point = self.fiducials.dig[_map_fid_name_to_idx('rpa')]
+        assert mri_point['ident'] == FIFF.FIFFV_POINT_RPA
+        has_mri_data = np.any(mri_point['r'])
+        has_head_data = np.any(self._dig_dict['rpa'])
+        return has_mri_data and has_head_data
 
     @property
     def _processed_high_res_mri_points(self):
@@ -1729,7 +1760,7 @@ class Coregistration(object):
         self._log_dig_mri_distance('Start')
         n_scale_params = self._n_scale_params
         if n_scale_params == 3:
-            # enfore 1 even for 3-axis here (3 points is not enough)
+            # enforce 1 even for 3-axis here (3 points is not enough)
             logger.info("Enforcing 1 scaling parameter for fit "
                         "with fiducials.")
             n_scale_params = 1
@@ -1740,7 +1771,11 @@ class Coregistration(object):
         head_pts = np.vstack((self._dig_dict['lpa'],
                               self._dig_dict['nasion'],
                               self._dig_dict['rpa']))
-        mri_pts = np.vstack((self._lpa, self._nasion, self._rpa))
+        mri_pts = np.vstack(
+            (self.fiducials.dig[0]['r'],  # LPA
+             self.fiducials.dig[1]['r'],  # Nasion
+             self.fiducials.dig[2]['r'])  # RPA
+        )
         weights = [lpa_weight, nasion_weight, rpa_weight]
 
         if n_scale_params == 0:
@@ -1772,7 +1807,9 @@ class Coregistration(object):
             if getattr(self, f'_has_{key}_data'):
                 head_pts.append(self._dig_dict[key])
                 if self._icp_fid_match == 'matched':
-                    mri_pts.append(getattr(self, f'_{key}'))
+                    idx = _map_fid_name_to_idx(name=key)
+                    p = self.fiducials.dig[idx]['r'].reshape(1, -1)
+                    mri_pts.append(p)
                 else:
                     assert self._icp_fid_match == 'nearest'
                     mri_pts.append(self._processed_high_res_mri_points[
@@ -1879,11 +1916,11 @@ class Coregistration(object):
                 self._update_params(rot=est[:3], tra=est[3:6], sca=est[6:9])
             angle, move, scale = self._changes
             self._log_dig_mri_distance(f'  ICP {iteration + 1:2d} ')
+            if callback is not None:
+                callback(iteration, n_iterations)
             if angle <= self._icp_angle and move <= self._icp_distance and \
                     all(scale <= self._icp_scale):
                 break
-            if callback is not None:
-                callback(iteration, n_iterations)
         self._log_dig_mri_distance('End      ')
         return self
 
@@ -1922,7 +1959,7 @@ class Coregistration(object):
                     "distance >= %.3f m.", n_excluded, distance)
         # set the filter
         self._extra_points_filter = mask
-        self._update_params(force_update_omitted=True)
+        self._update_params(force_update=True)
         return self
 
     def compute_dig_mri_distances(self):
@@ -1945,7 +1982,7 @@ class Coregistration(object):
 
     @property
     def trans(self):
-        """Return the head-mri transform."""
+        """The head->mri :class:`~mne.transforms.Transform`."""
         return Transform('head', 'mri', self._head_mri_t)
 
     def reset(self):
@@ -1963,3 +2000,59 @@ class Coregistration(object):
         self._extra_points_filter = None
         self._update_nearest_calc()
         return self
+
+    def _get_fiducials_distance(self):
+        distance = dict()
+        for key in ('lpa', 'nasion', 'rpa'):
+            idx = _map_fid_name_to_idx(name=key)
+            fid = self.fiducials.dig[idx]['r'].reshape(1, -1)
+
+            transformed_mri = apply_trans(self._mri_trans, fid)
+            transformed_hsp = apply_trans(
+                self._head_mri_t, self._dig_dict[key])
+            distance[key] = np.linalg.norm(
+                np.ravel(transformed_mri - transformed_hsp))
+        return np.array(list(distance.values())) * 1e3
+
+    def _get_fiducials_distance_str(self):
+        dists = self._get_fiducials_distance()
+        return f"Fiducials: {dists[0]:.1f}, {dists[1]:.1f}, {dists[2]:.1f} mm"
+
+    def _get_point_distance(self):
+        mri_points = list()
+        hsp_points = list()
+        if self._hsp_weight > 0 and self._has_hsp_data:
+            mri_points.append(self._transformed_high_res_mri_points[
+                self._nearest_transformed_high_res_mri_idx_hsp])
+            hsp_points.append(self._transformed_dig_extra)
+            assert len(mri_points[-1]) == len(hsp_points[-1])
+        if self._eeg_weight > 0 and self._has_eeg_data:
+            mri_points.append(self._transformed_high_res_mri_points[
+                self._nearest_transformed_high_res_mri_idx_eeg])
+            hsp_points.append(self._transformed_dig_eeg)
+            assert len(mri_points[-1]) == len(hsp_points[-1])
+        if self._hpi_weight > 0 and self._has_hpi_data:
+            mri_points.append(self._transformed_high_res_mri_points[
+                self._nearest_transformed_high_res_mri_idx_hpi])
+            hsp_points.append(self._transformed_dig_hpi)
+            assert len(mri_points[-1]) == len(hsp_points[-1])
+        if all(len(h) == 0 for h in hsp_points):
+            return None
+        mri_points = np.concatenate(mri_points)
+        hsp_points = np.concatenate(hsp_points)
+        return np.linalg.norm(mri_points - hsp_points, axis=-1)
+
+    def _get_point_distance_str(self):
+        point_distance = self._get_point_distance()
+        if point_distance is None:
+            return ""
+        dists = 1e3 * point_distance
+        av_dist = np.mean(dists)
+        std_dist = np.std(dists)
+        kinds = [kind for kind, check in
+                 (('HSP', self._hsp_weight > 0 and self._has_hsp_data),
+                  ('EEG', self._eeg_weight > 0 and self._has_eeg_data),
+                  ('HPI', self._hpi_weight > 0 and self._has_hpi_data))
+                 if check]
+        kinds = '+'.join(kinds)
+        return f"{len(dists)} {kinds}: {av_dist:.1f} ± {std_dist:.1f} mm"

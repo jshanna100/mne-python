@@ -9,12 +9,12 @@
 # C code.
 
 from copy import deepcopy
-from distutils.version import LooseVersion
 from functools import partial, lru_cache
 from collections import OrderedDict
 from glob import glob
 from os import path as op
 from struct import pack
+import time
 import warnings
 
 import numpy as np
@@ -31,7 +31,7 @@ from .transforms import (transform_surface_to, _pol_to_cart, _cart_to_sph,
 from .utils import (logger, verbose, get_subjects_dir, warn, _check_fname,
                     _check_option, _ensure_int, _TempDir, run_subprocess,
                     _check_freesurfer_home, _hashable_ndarray, fill_doc,
-                    _validate_type, _require_version)
+                    _validate_type, _require_version, _pl)
 
 
 ###############################################################################
@@ -39,7 +39,7 @@ from .utils import (logger, verbose, get_subjects_dir, warn, _check_fname,
 
 @verbose
 def get_head_surf(subject, source=('bem', 'head'), subjects_dir=None,
-                  verbose=None):
+                  on_defects='raise', verbose=None):
     """Load the subject head surface.
 
     Parameters
@@ -56,6 +56,9 @@ def get_head_surf(subject, source=('bem', 'head'), subjects_dir=None,
     subjects_dir : str, or None
         Path to the SUBJECTS_DIR. If None, the path is obtained by using
         the environment variable SUBJECTS_DIR.
+    %(on_defects)s
+
+        .. versionadded:: 1.0
     %(verbose)s
 
     Returns
@@ -64,11 +67,12 @@ def get_head_surf(subject, source=('bem', 'head'), subjects_dir=None,
         The head surface.
     """
     return _get_head_surface(subject=subject, source=source,
-                             subjects_dir=subjects_dir)
+                             subjects_dir=subjects_dir, on_defects=on_defects)
 
 
 # TODO this should be refactored with mne._freesurfer._get_head_surface
-def _get_head_surface(subject, source, subjects_dir, raise_error=True):
+def _get_head_surface(subject, source, subjects_dir, on_defects,
+                      raise_error=True):
     """Load the subject head surface."""
     from .bem import read_bem_surfaces
     # Load the head surface from the BEM
@@ -85,6 +89,7 @@ def _get_head_surface(subject, source, subjects_dir, raise_error=True):
         if op.exists(this_head):
             surf = read_bem_surfaces(this_head, True,
                                      FIFF.FIFFV_BEM_SURF_ID_HEAD,
+                                     on_defects=on_defects,
                                      verbose=False)
         else:
             # let's do a more sophisticated search
@@ -98,6 +103,7 @@ def _get_head_surface(subject, source, subjects_dir, raise_error=True):
                 try:
                     surf = read_bem_surfaces(this_head, True,
                                              FIFF.FIFFV_BEM_SURF_ID_HEAD,
+                                             on_defects=on_defects,
                                              verbose=False)
                 except ValueError:
                     pass
@@ -325,9 +331,12 @@ def _project_onto_surface(rrs, surf, project_rrs=False, return_nn=False,
         idx = _compute_nearest(surf['rr'], rrs)
         out = (None, None, surf['rr'][idx])
         if return_nn:
+            surf_geom = _get_tri_supp_geom(surf)
             nn = _accumulate_normals(surf['tris'].astype(int), surf_geom['nn'],
                                      len(surf['rr']))
-            out += (nn[idx],)
+            nn = nn[idx]
+            _normalize_vectors(nn)
+            out += (nn,)
     return out
 
 
@@ -543,7 +552,7 @@ class _DistanceQuery(object):
 
 
 @verbose
-def _points_outside_surface(rr, surf, n_jobs=1, verbose=None):
+def _points_outside_surface(rr, surf, n_jobs=None, verbose=None):
     """Check whether points are outside a surface.
 
     Parameters
@@ -560,56 +569,141 @@ def _points_outside_surface(rr, surf, n_jobs=1, verbose=None):
     """
     rr = np.atleast_2d(rr)
     assert rr.shape[1] == 3
-    assert n_jobs > 0
-    parallel, p_fun, _ = parallel_func(_get_solids, n_jobs)
+    parallel, p_fun, n_jobs = parallel_func(_get_solids, n_jobs)
     tot_angles = parallel(p_fun(surf['rr'][tris], rr)
                           for tris in np.array_split(surf['tris'], n_jobs))
     return np.abs(np.sum(tot_angles, axis=0) / (2 * np.pi) - 1.0) > 1e-5
 
 
+def _surface_to_polydata(surf):
+    import pyvista as pv
+    vertices = np.array(surf['rr'])
+    if 'tris' not in surf:
+        return pv.PolyData(vertices)
+    else:
+        triangles = np.array(surf['tris'])
+        triangles = np.c_[np.full(len(triangles), 3), triangles]
+        return pv.PolyData(vertices, triangles)
+
+
+def _polydata_to_surface(pd, normals=True):
+    from pyvista import PolyData
+    if not isinstance(pd, PolyData):
+        pd = PolyData(pd)
+    out = dict(rr=pd.points, tris=pd.faces.reshape(-1, 4)[:, 1:])
+    if normals:
+        out['nn'] = pd.point_normals
+    return out
+
+
 class _CheckInside(object):
     """Efficiently check if points are inside a surface."""
 
-    def __init__(self, surf):
-        from scipy.spatial import Delaunay
+    @verbose
+    def __init__(self, surf, *, mode='old', verbose=None):
+        assert mode in ('pyvista', 'old')
+        self.mode = mode
+        t0 = time.time()
         self.surf = surf
+        if self.mode == 'pyvista':
+            self._init_pyvista()
+        else:
+            self._init_old()
+        logger.debug(
+            f'Setting up {mode} interior check for {len(self.surf["rr"])} '
+            f'points took {(time.time() - t0) * 1000:0.1f} ms')
+
+    def _init_old(self):
+        from scipy.spatial import Delaunay
         self.inner_r = None
-        self.cm = surf['rr'].mean(0)
-        if not _points_outside_surface(
-                self.cm[np.newaxis], surf)[0]:  # actually inside
-            # Immediately cull some points from the checks
-            self.inner_r = np.linalg.norm(surf['rr'] - self.cm, axis=-1).min()
+        self.cm = self.surf['rr'].mean(0)
         # We could use Delaunay or ConvexHull here, Delaunay is slightly slower
         # to construct but faster to evaluate
         # See https://stackoverflow.com/questions/16750618/whats-an-efficient-way-to-find-if-a-point-lies-in-the-convex-hull-of-a-point-cl  # noqa
-        self.del_tri = Delaunay(surf['rr'])
+        self.del_tri = Delaunay(self.surf['rr'])
+        if self.del_tri.find_simplex(self.cm) >= 0:
+            # Immediately cull some points from the checks
+            dists = np.linalg.norm(self.surf['rr'] - self.cm, axis=-1)
+            self.inner_r = dists.min()
+            self.outer_r = dists.max()
+
+    def _init_pyvista(self):
+        if not isinstance(self.surf, dict):
+            self.pdata = self.surf
+            self.surf = _polydata_to_surface(self.pdata)
+        else:
+            self.pdata = _surface_to_polydata(self.surf).clean()
 
     @verbose
-    def __call__(self, rr, n_jobs=1, verbose=None):
-        inside = np.ones(len(rr), bool)  # innocent until proven guilty
-        idx = np.arange(len(rr))
+    def __call__(self, rr, n_jobs=None, verbose=None):
+        n_orig = len(rr)
+        logger.info(f'Checking surface interior status for '
+                    f'{n_orig} point{_pl(n_orig, " ")}...')
+        t0 = time.time()
+        if self.mode == 'pyvista':
+            inside = self._call_pyvista(rr)
+        else:
+            inside = self._call_old(rr, n_jobs)
+        n = inside.sum()
+        logger.info(
+            f'    Total {n}/{n_orig} point{_pl(n, " ")} inside the surface')
+        logger.info(
+            f'Interior check completed in {(time.time() - t0) * 1000:0.1f} ms')
+        return inside
 
+    def _call_pyvista(self, rr):
+        pdata = _surface_to_polydata(dict(rr=rr))
+        out = pdata.select_enclosed_points(self.pdata, check_surface=False)
+        return out['SelectedPoints'].astype(bool)
+
+    def _call_old(self, rr, n_jobs):
+        n_orig = len(rr)
+        prec = int(np.ceil(np.log10(max(n_orig, 10))))
+        inside = np.ones(n_orig, bool)  # innocent until proven guilty
+        idx = np.arange(n_orig)
         # Limit to indices that can plausibly be outside the surf
+        # but are not definitely outside it
         if self.inner_r is not None:
-            mask = np.linalg.norm(rr - self.cm, axis=-1) >= self.inner_r
+            dists = np.linalg.norm(rr - self.cm, axis=-1)
+            in_mask = dists < self.inner_r
+            n = (in_mask).sum()
+            n_pad = str(n).rjust(prec)
+            logger.info(
+                f'    Found {n_pad}/{n_orig} point{_pl(n, " ")} '
+                f'inside  an interior sphere of radius '
+                f'{1000 * self.inner_r:6.1f} mm')
+            out_mask = dists > self.outer_r
+            inside[out_mask] = False
+            n = (out_mask).sum()
+            n_pad = str(n).rjust(prec)
+            logger.info(
+                f'    Found {n_pad}/{n_orig} point{_pl(n, " ")} '
+                f'outside an exterior sphere of radius '
+                f'{1000 * self.outer_r:6.1f} mm')
+            mask = (~in_mask) & (~out_mask)  # not definitely inside or outside
             idx = idx[mask]
             rr = rr[mask]
-            logger.info('    Skipping interior check for %d sources that fit '
-                        'inside a sphere of radius %6.1f mm'
-                        % ((~mask).sum(), self.inner_r * 1000))
 
         # Use qhull as our first pass (*much* faster than our check)
         del_outside = self.del_tri.find_simplex(rr) < 0
-        omit_outside = sum(del_outside)
+        n = sum(del_outside)
         inside[idx[del_outside]] = False
         idx = idx[~del_outside]
         rr = rr[~del_outside]
-        logger.info('    Skipping solid angle check for %d points using Qhull'
-                    % (omit_outside,))
+        n_pad = str(n).rjust(prec)
+        check_pad = str(len(del_outside)).rjust(prec)
+        logger.info(
+            f'    Found {n_pad}/{check_pad} point{_pl(n, " ")} outside using '
+            'surface Qhull')
 
         # use our more accurate check
         solid_outside = _points_outside_surface(rr, self.surf, n_jobs)
-        omit_outside += np.sum(solid_outside)
+        n = np.sum(solid_outside)
+        n_pad = str(n).rjust(prec)
+        check_pad = str(len(solid_outside)).rjust(prec)
+        logger.info(
+            f'    Found {n_pad}/{check_pad} point{_pl(n, " ")} outside using '
+            'solid angles')
         inside[idx[solid_outside]] = False
         return inside
 
@@ -733,9 +827,12 @@ def read_surface(fname, read_metadata=False, return_dict=False,
             ret += (dict(),)
 
     if return_dict:
-        ret += (dict(rr=ret[0], tris=ret[1], ntri=len(ret[1]), use_tris=ret[1],
-                     np=len(ret[0])),)
+        ret += (_rr_tris_dict(ret[0], ret[1]),)
     return ret
+
+
+def _rr_tris_dict(rr, tris):
+    return dict(rr=rr, tris=tris, ntri=len(tris), use_tris=tris, np=len(rr))
 
 
 def _read_mri_surface(fname):
@@ -1101,7 +1198,7 @@ def write_surface(fname, coords, faces, create_stamp='', volume_info=None,
     if file_format == 'freesurfer':
         try:
             import nibabel as nib
-            has_nibabel = LooseVersion(nib.__version__) > LooseVersion('2.1.0')
+            has_nibabel = True
         except ImportError:
             has_nibabel = False
         if has_nibabel:
@@ -1143,11 +1240,11 @@ def write_surface(fname, coords, faces, create_stamp='', volume_info=None,
 def _decimate_surface_vtk(points, triangles, n_triangles):
     """Aux function."""
     try:
-        from vtk.util.numpy_support import \
+        from vtkmodules.util.numpy_support import \
             numpy_to_vtk, numpy_to_vtkIdTypeArray
-        from vtk.numpy_interface.dataset_adapter import WrapDataObject
-        from vtk import \
-            vtkPolyData, vtkQuadricDecimation, vtkPoints, vtkCellArray
+        from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
+        from vtkmodules.vtkCommonCore import vtkPoints
+        from vtkmodules.vtkFiltersCore import vtkQuadricDecimation
     except ImportError:
         raise ValueError('This function requires the VTK package to be '
                          'installed')
@@ -1176,10 +1273,9 @@ def _decimate_surface_vtk(points, triangles, n_triangles):
     reduction = 1 - (float(n_triangles) / len(triangles))
     decimate.SetTargetReduction(reduction)
     decimate.Update()
-    out = WrapDataObject(decimate.GetOutput())
-    rrs = out.Points
-    tris = out.Polygons.reshape(-1, 4)[:, 1:]
-    return rrs, tris
+
+    out = _polydata_to_surface(decimate.GetOutput(), normals=False)
+    return out['rr'], out['tris']
 
 
 def _decimate_surface_sphere(rr, tris, n_triangles):
@@ -1232,7 +1328,7 @@ def _decimate_surface_sphere(rr, tris, n_triangles):
 
 
 @verbose
-def decimate_surface(points, triangles, n_triangles, method='quadric',
+def decimate_surface(points, triangles, n_triangles, method='quadric', *,
                      verbose=None):
     """Decimate surface data.
 
@@ -1454,7 +1550,7 @@ def mesh_edges(tris):
 
     Returns
     -------
-    edges : sparse matrix
+    edges : scipy.sparse.spmatrix
         The adjacency matrix.
     """
     tris = _hashable_ndarray(tris)
@@ -1602,7 +1698,8 @@ def _complete_sphere_surf(sphere, idx, level, complete=True):
 
 @verbose
 def dig_mri_distances(info, trans, subject, subjects_dir=None,
-                      dig_kinds='auto', exclude_frontal=False, verbose=None):
+                      dig_kinds='auto', exclude_frontal=False,
+                      on_defects='raise', verbose=None):
     """Compute distances between head shape points and the scalp surface.
 
     This function is useful to check that coregistration is correct.
@@ -1623,6 +1720,9 @@ def dig_mri_distances(info, trans, subject, subjects_dir=None,
     %(dig_kinds)s
     %(exclude_frontal)s
         Default is False.
+    %(on_defects)s
+
+        .. versionadded:: 1.0
     %(verbose)s
 
     Returns
@@ -1640,7 +1740,7 @@ def dig_mri_distances(info, trans, subject, subjects_dir=None,
     """
     from .bem import get_fitting_dig
     pts = get_head_surf(subject, ('head-dense', 'head', 'bem'),
-                        subjects_dir=subjects_dir)['rr']
+                        subjects_dir=subjects_dir, on_defects=on_defects)['rr']
     trans = _get_trans(trans, fro="mri", to="head")[0]
     pts = apply_trans(trans, pts)
     info_dig = get_fitting_dig(
@@ -1657,7 +1757,7 @@ def _mesh_borders(tris, mask):
     return np.unique(edges.row[border_edges])
 
 
-def _marching_cubes(image, level, smooth=0):
+def _marching_cubes(image, level, smooth=0, fill_hole_size=None):
     """Compute marching cubes on a 3D image."""
     # vtkDiscreteMarchingCubes would be another option, but it merges
     # values at boundaries which is not what we want
@@ -1665,29 +1765,39 @@ def _marching_cubes(image, level, smooth=0):
     # Also vtkDiscreteFlyingEdges3D should be faster.
     # If we ever want not-discrete (continuous/float) marching cubes,
     # we should probably use vtkFlyingEdges3D rather than vtkMarchingCubes.
-    from vtk import (vtkImageData, vtkThreshold,
-                     vtkWindowedSincPolyDataFilter, vtkDiscreteFlyingEdges3D,
-                     vtkGeometryFilter, vtkDataSetAttributes, VTK_DOUBLE)
-    from vtk.util import numpy_support
-    _validate_type(smooth, 'numeric', smooth)
-    smooth = float(smooth)
-    if not 0 <= smooth < 1:
-        raise ValueError('smooth must be between 0 (inclusive) and 1 '
-                         f'(exclusive), got {smooth}')
+    from vtkmodules.vtkCommonDataModel import \
+        vtkImageData, vtkDataSetAttributes
+    from vtkmodules.vtkFiltersCore import vtkThreshold
+    from vtkmodules.vtkFiltersGeneral import vtkDiscreteFlyingEdges3D
+    from vtkmodules.vtkFiltersGeometry import vtkGeometryFilter
+    from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk
+    from scipy.ndimage import binary_dilation
 
     if image.ndim != 3:
         raise ValueError(f'3D data must be supplied, got {image.shape}')
-    # force double as passing integer types directly can be problematic!
-    image_shape = image.shape
-    data_vtk = numpy_support.numpy_to_vtk(
-        image.ravel(), deep=True, array_type=VTK_DOUBLE)
-    del image
+
     level = np.array(level)
     if level.ndim != 1 or level.size == 0 or level.dtype.kind not in 'ui':
         raise TypeError(
             'level must be non-empty numeric or 1D array-like of int, '
             f'got {level.ndim}D array-like of {level.dtype} with '
             f'{level.size} elements')
+
+    # fill holes
+    if fill_hole_size is not None:
+        image = image.copy()  # don't modify original
+        for val in level:
+            bin_image = image == val
+            mask = image == 0  # don't go into other areas
+            bin_image = binary_dilation(bin_image, iterations=fill_hole_size,
+                                        mask=mask)
+            image[bin_image] = val
+
+    # force double as passing integer types directly can be problematic!
+    image_shape = image.shape
+    data_vtk = numpy_to_vtk(image.ravel().astype(float), deep=True)
+    del image
+
     mc = vtkDiscreteFlyingEdges3D()
     # create image
     imdata = vtkImageData()
@@ -1696,33 +1806,23 @@ def _marching_cubes(image, level, smooth=0):
     imdata.SetOrigin([0, 0, 0])
     imdata.GetPointData().SetScalars(data_vtk)
 
-    # compute marching cubes
+    # compute marching cubes on smoothed data
     mc.SetNumberOfContours(len(level))
     for li, lev in enumerate(level):
         mc.SetValue(li, lev)
     mc.SetInputData(imdata)
-    sel_input = mc
-    if smooth:
-        smoother = vtkWindowedSincPolyDataFilter()
-        smoother.SetInputConnection(mc.GetOutputPort())
-        smoother.SetNumberOfIterations(100)
-        smoother.BoundarySmoothingOff()
-        smoother.FeatureEdgeSmoothingOff()
-        smoother.SetFeatureAngle(120.0)
-        smoother.SetPassBand(1 - smooth)
-        smoother.NonManifoldSmoothingOn()
-        smoother.NormalizeCoordinatesOff()
-        sel_input = smoother
-    sel_input.Update()
+    mc.Update()
+    mc = _vtk_smooth(mc.GetOutput(), smooth)
 
     # get verts and triangles
     selector = vtkThreshold()
-    selector.SetInputConnection(sel_input.GetOutputPort())
+    selector.SetInputData(mc)
     dsa = vtkDataSetAttributes()
     selector.SetInputArrayToProcess(
         0, 0, 0, imdata.FIELD_ASSOCIATION_POINTS, dsa.SCALARS)
     geometry = vtkGeometryFilter()
     geometry.SetInputConnection(selector.GetOutputPort())
+
     out = list()
     for val in level:
         try:
@@ -1735,12 +1835,42 @@ def _marching_cubes(image, level, smooth=0):
             selector.SetUpperThreshold(val)
         geometry.Update()
         polydata = geometry.GetOutput()
-        rr = numpy_support.vtk_to_numpy(polydata.GetPoints().GetData())
-        tris = numpy_support.vtk_to_numpy(
+        rr = vtk_to_numpy(polydata.GetPoints().GetData())
+        tris = vtk_to_numpy(
             polydata.GetPolys().GetConnectivityArray()).reshape(-1, 3)
         rr = np.ascontiguousarray(rr[:, ::-1])
         tris = np.ascontiguousarray(tris[:, ::-1])
         out.append((rr, tris))
+    return out
+
+
+def _vtk_smooth(pd, smooth):
+    _validate_type(smooth, 'numeric', smooth)
+    smooth = float(smooth)
+    if not 0 <= smooth < 1:
+        raise ValueError('smoothing factor must be between 0 (inclusive) and '
+                         f'1 (exclusive), got {smooth}')
+    if smooth == 0:
+        return pd
+    from vtkmodules.vtkFiltersCore import vtkWindowedSincPolyDataFilter
+    logger.info(f'    Smoothing by a factor of {smooth}')
+    return_ndarray = False
+    if isinstance(pd, dict):
+        pd = _surface_to_polydata(pd)
+        return_ndarray = True
+    smoother = vtkWindowedSincPolyDataFilter()
+    smoother.SetInputData(pd)
+    smoother.SetNumberOfIterations(100)
+    smoother.BoundarySmoothingOff()
+    smoother.FeatureEdgeSmoothingOff()
+    smoother.SetFeatureAngle(120.0)
+    smoother.SetPassBand(1 - smooth)
+    smoother.NonManifoldSmoothingOn()
+    smoother.NormalizeCoordinatesOff()
+    smoother.Update()
+    out = smoother.GetOutput()
+    if return_ndarray:
+        out = _polydata_to_surface(out, normals=False)
     return out
 
 
@@ -1751,8 +1881,10 @@ def _warn_missing_chs(info, dig_image, after_warp, verbose=None):
         set(np.unique(np.array(dig_image.dataobj))))
     missing_ch = [info.ch_names[idx - 1] for idx in missing]
     if missing_ch and verbose != 'error':
-        warn('Channels ' + ', '.join(missing_ch) + ' were not assigned '
-             'voxels' + (' after applying SDR warp' if after_warp else ''))
+        warn(f'Channel{_pl(missing_ch)} '
+             f'{", ".join(repr(ch) for ch in missing_ch)} not assigned '
+             'voxels ' +
+             (f' after applying {after_warp}' if after_warp else ''))
 
 
 @verbose
@@ -1775,7 +1907,7 @@ def warp_montage_volume(montage, base_image, reg_affine, sdr_morph,
     ----------
     montage : instance of mne.channels.DigMontage
         The montage object containing the channels.
-    base_image : str | pathlib.Path | nibabel.spatialimages.SpatialImage
+    base_image : path-like | nibabel.spatialimages.SpatialImage
         Path to a volumetric scan (e.g. CT) of the subject. Can be in any
         format readable by nibabel. Can also be a nibabel image object.
         Local extrema (max or min) should be nearby montage channel locations.
@@ -1786,11 +1918,11 @@ def warp_montage_volume(montage, base_image, reg_affine, sdr_morph,
     subject_to : str
         The name of the subject to use as a template to morph to
         (e.g. 'fsaverage').
-    subjects_dir_from : str | pathlib.Path | None
+    subjects_dir_from : path-like | None
         The path to the Freesurfer ``recon-all`` directory for the
         ``subject_from`` subject. The ``SUBJECTS_DIR`` environment
         variable will be used when ``None``.
-    subjects_dir_to : str | pathlib.Path | None
+    subjects_dir_to : path-like | None
         The path to the Freesurfer ``recon-all`` directory for the
         ``subject_to`` subject. ``subject_dir_from`` will be used
         when ``None``.
@@ -1896,7 +2028,7 @@ def warp_montage_volume(montage, base_image, reg_affine, sdr_morph,
                 image_from[voxel] = i + 1
 
     # apply the mapping
-    image_from = nib.Nifti1Image(image_from, fs_from_img.affine)
+    image_from = nib.spatialimages.SpatialImage(image_from, fs_from_img.affine)
     _warn_missing_chs(montage, image_from, after_warp=False)
 
     template_brain = nib.load(
@@ -1906,7 +2038,9 @@ def warp_montage_volume(montage, base_image, reg_affine, sdr_morph,
         image_from, template_brain, reg_affine, sdr_morph,
         interpolation='nearest')
 
-    _warn_missing_chs(montage, image_to, after_warp=True)
+    after_warp = \
+        'SDR warp' if sdr_morph is not None else 'affine transformation'
+    _warn_missing_chs(montage, image_to, after_warp=after_warp)
 
     # recover the contact positions as the center of mass
     warped_data = np.asanyarray(image_to.dataobj)
@@ -1925,7 +2059,7 @@ def warp_montage_volume(montage, base_image, reg_affine, sdr_morph,
     return montage_warped, image_from, image_to
 
 
-_VOXELS_MAX = 100  # define constant to avoid runtime issues
+_VOXELS_MAX = 1000  # define constant to avoid runtime issues
 
 
 @fill_doc
@@ -1957,6 +2091,9 @@ def get_montage_volume_labels(montage, subject, subjects_dir=None,
 
     _validate_type(montage, DigMontage, 'montage')
     _validate_type(dist, (int, float), 'dist')
+
+    if dist < 0 or dist > 10:
+        raise ValueError('`dist` must be between 0 and 10')
 
     aseg, aseg_data = _get_aseg(aseg, subject, subjects_dir)
 

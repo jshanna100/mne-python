@@ -5,6 +5,7 @@ import re
 import shutil
 import zipfile
 
+import pooch
 import pytest
 
 from mne import datasets, read_labels_from_annot, write_labels_to_annot
@@ -18,13 +19,9 @@ from mne.datasets.utils import _manifest_check_download
 from mne.utils import (requires_good_network,
                        get_subjects_dir, ArgvSetter, _pl, use_log_level,
                        catch_logging, hashfunc)
-from mne.utils.check import _soft_import
 
 
-# import pooch library for handling the dataset downloading
-pooch = _soft_import('pooch', 'dataset downloading', strict=True)
-
-subjects_dir = op.join(testing.data_path(download=False), 'subjects')
+subjects_dir = testing.data_path(download=False) / 'subjects'
 
 
 def test_datasets_basic(tmp_path, monkeypatch):
@@ -39,7 +36,7 @@ def test_datasets_basic(tmp_path, monkeypatch):
             dataset = getattr(datasets.brainstorm, dname)
         else:
             dataset = getattr(datasets, dname)
-        if dataset.data_path(download=False) != '':
+        if str(dataset.data_path(download=False)) != '.':
             assert isinstance(dataset.get_version(), str)
             assert datasets.has_dataset(dname)
         else:
@@ -47,11 +44,17 @@ def test_datasets_basic(tmp_path, monkeypatch):
             assert not datasets.has_dataset(dname)
         print('%s: %s' % (dname, datasets.has_dataset(dname)))
     tempdir = str(tmp_path)
+    # Explicitly test one that isn't preset (given the config)
+    monkeypatch.setenv('MNE_DATASETS_SAMPLE_PATH', tempdir)
+    dataset = datasets.sample
+    assert str(dataset.data_path(download=False)) == '.'
+    assert dataset.get_version() != ''
+    assert dataset.get_version() is None
     # don't let it read from the config file to get the directory,
     # force it to look for the default
     monkeypatch.setenv('_MNE_FAKE_HOME_DIR', tempdir)
     monkeypatch.delenv('SUBJECTS_DIR', raising=False)
-    assert (datasets.utils._get_path(None, 'foo', 'bar') ==
+    assert (str(datasets.utils._get_path(None, 'foo', 'bar')) ==
             op.join(tempdir, 'mne_data'))
     assert get_subjects_dir(None) is None
     _set_montage_coreg_path()
@@ -71,6 +74,11 @@ def test_downloads(tmp_path, monkeypatch, capsys):
     # that we're hitting (https://github.com/pytest-dev/pytest/issues/5997)
     # now that we use pooch
     with capsys.disabled():
+        with pytest.raises(RuntimeError, match='Do not download .* in tests'):
+            path = datasets._fake.data_path(update_path=False, **kwargs)
+        monkeypatch.setattr(
+            datasets.utils,
+            '_MODULES_TO_ENSURE_DOWNLOAD_IS_FALSE_IN_TESTS', ())
         path = datasets._fake.data_path(update_path=False, **kwargs)
     assert op.isdir(path)
     assert op.isfile(op.join(path, 'bar'))
@@ -177,7 +185,6 @@ def _fake_zip_fetch(url, path, fname, known_hash):
 @pytest.mark.parametrize('n_have', range(len(_zip_fnames)))
 def test_manifest_check_download(tmp_path, n_have, monkeypatch):
     """Test our manifest downloader."""
-    pooch = _soft_import('pooch', 'download datasets')
     monkeypatch.setattr(pooch, 'retrieve', _fake_zip_fetch)
     destination = op.join(str(tmp_path), 'empty')
     manifest_path = op.join(str(tmp_path), 'manifest.txt')
@@ -263,4 +270,4 @@ def test_fetch_uncompressed_file(tmp_path):
         folder_name=op.join(tmp_path, 'foo'),
         hash=None)
     fetch_dataset(dataset_dict, path=None, force_update=True)
-    assert op.isfile(op.join(tmp_path, 'foo', 'LICENSE.foo'))
+    assert (tmp_path / 'foo' / 'LICENSE.foo').is_file()

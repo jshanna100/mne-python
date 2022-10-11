@@ -19,7 +19,7 @@ from ..io import RawArray, BaseRaw, Info
 from ..chpi import (read_head_pos, head_pos_to_trans_rot_t, get_chpi_info,
                     _get_hpi_initial_fit)
 from ..io.constants import FIFF
-from ..forward import (_magnetic_dipole_field_vec, _merge_meg_eeg_fwds,
+from ..forward import (_magnetic_dipole_field_vec, _merge_fwds,
                        _stc_src_sel, convert_forward_solution,
                        _prepare_for_forward, _transform_orig_meg_coils,
                        _compute_forwards, _to_forward_dict,
@@ -31,25 +31,21 @@ from ..source_estimate import _BaseSourceEstimate
 from ..surface import _CheckInside
 from ..utils import (logger, verbose, check_random_state, _pl, _validate_type,
                      _check_preload)
-from ..parallel import check_n_jobs
 from .source import SourceSimulator
 
 
 def _check_cov(info, cov):
     """Check that the user provided a valid covariance matrix for the noise."""
+    _validate_type(cov, (Covariance, None, dict, str, 'path-like'), 'cov')
     if isinstance(cov, Covariance) or cov is None:
         pass
     elif isinstance(cov, dict):
         cov = make_ad_hoc_cov(info, cov, verbose=False)
-    elif isinstance(cov, str):
+    else:
         if cov == 'simple':
             cov = make_ad_hoc_cov(info, None, verbose=False)
         else:
             cov = read_cov(cov, verbose=False)
-    else:
-        raise TypeError('Covariance matrix type not recognized. Valid input '
-                        'types are: instance of Covariance, dict, str, None. '
-                        ', got %s' % (cov,))
     return cov
 
 
@@ -129,7 +125,7 @@ def _check_head_pos(head_pos, info, first_samp, times=None):
 
 @verbose
 def simulate_raw(info, stc=None, trans=None, src=None, bem=None, head_pos=None,
-                 mindist=1.0, interp='cos2', n_jobs=1, use_cps=True,
+                 mindist=1.0, interp='cos2', n_jobs=None, use_cps=True,
                  forward=None, first_samp=0, max_iter=10000, verbose=None):
     u"""Simulate raw data.
 
@@ -243,7 +239,6 @@ def simulate_raw(info, stc=None, trans=None, src=None, bem=None, head_pos=None,
     .. footbibliography::
     """  # noqa: E501
     _validate_type(info, Info, 'info')
-    raw_verbose = verbose
 
     if len(pick_types(info, meg=False, stim=True)) == 0:
         event_ch = None
@@ -251,7 +246,6 @@ def simulate_raw(info, stc=None, trans=None, src=None, bem=None, head_pos=None,
         event_ch = pick_channels(info['ch_names'],
                                  _get_stim_channel(None, info))[0]
 
-    n_jobs = check_n_jobs(n_jobs)
     if forward is not None:
         if any(x is not None for x in (trans, src, bem, head_pos)):
             raise ValueError('If forward is not None then trans, src, bem, '
@@ -331,13 +325,12 @@ def simulate_raw(info, stc=None, trans=None, src=None, bem=None, head_pos=None,
     raw_data = np.concatenate(raw_datas, axis=-1)
     raw = RawArray(raw_data, info, first_samp=first_samp, verbose=False)
     raw.set_annotations(raw.annotations)
-    raw.verbose = raw_verbose
-    logger.info('Done')
+    logger.info('[done]')
     return raw
 
 
 @verbose
-def add_eog(raw, head_pos=None, interp='cos2', n_jobs=1, random_state=None,
+def add_eog(raw, head_pos=None, interp='cos2', n_jobs=None, random_state=None,
             verbose=None):
     """Add blink noise to raw data.
 
@@ -391,7 +384,7 @@ def add_eog(raw, head_pos=None, interp='cos2', n_jobs=1, random_state=None,
 
 
 @verbose
-def add_ecg(raw, head_pos=None, interp='cos2', n_jobs=1, random_state=None,
+def add_ecg(raw, head_pos=None, interp='cos2', n_jobs=None, random_state=None,
             verbose=None):
     """Add ECG noise to raw data.
 
@@ -534,7 +527,7 @@ def _add_exg(raw, kind, head_pos, interp, n_jobs, random_state):
 
 
 @verbose
-def add_chpi(raw, head_pos=None, interp='cos2', n_jobs=1, verbose=None):
+def add_chpi(raw, head_pos=None, interp='cos2', n_jobs=None, verbose=None):
     """Add cHPI activations to raw data.
 
     Parameters
@@ -569,13 +562,13 @@ def add_chpi(raw, head_pos=None, interp='cos2', n_jobs=1, verbose=None):
     # turn on cHPI in file
     data = raw._data
     data[hpi_pick, :] = hpi_ons.sum()
-    _log_ch('cHPI status bits enbled and', info, hpi_pick)
+    _log_ch('cHPI status bits enabled and', info, hpi_pick)
     sinusoids = 70e-9 * np.sin(2 * np.pi * hpi_freqs[:, np.newaxis] *
                                (np.arange(len(times)) / info['sfreq']))
     info = pick_info(info, meg_picks)
     with info._unlock():
         info.update(projs=[], bads=[])  # Ensure no 'projs' or 'bads'
-    megcoils, _, _, _ = _prep_meg_channels(info, ignore_ref=False)
+    megcoils = _prep_meg_channels(info, ignore_ref=True)['defs']
     used = np.zeros(len(raw.times), bool)
     dev_head_ts.append(dev_head_ts[-1])  # ZOH after time ends
     get_fwd = _HPIForwards(offsets, dev_head_ts, megcoils, hpi_rrs, hpi_nns)
@@ -693,24 +686,27 @@ def _iter_forward_solutions(info, trans, src, bem, dev_head_ts, mindist,
     with info._unlock():
         info.update(projs=[], bads=[])  # Ensure no 'projs' or 'bads'
     mri_head_t, trans = _get_trans(trans)
-    megcoils, meg_info, compcoils, megnames, eegels, eegnames, rr, info, \
-        update_kwargs, bem = _prepare_for_forward(
-            src, mri_head_t, info, bem, mindist, n_jobs, allow_bem_none=True,
-            verbose=False)
+    sensors, rr, info, update_kwargs, bem = _prepare_for_forward(
+        src, mri_head_t, info, bem, mindist, n_jobs, allow_bem_none=True,
+        verbose=False)
     del (src, mindist)
 
-    if forward is None:
-        eegfwd = _compute_forwards(rr, bem, [eegels], [None],
-                                   [None], ['eeg'], n_jobs, verbose=False)[0]
-        eegfwd = _to_forward_dict(eegfwd, eegnames)
+    eegnames = sensors.get('eeg', dict()).get('ch_names', [])
+    if not len(eegnames):
+        eegfwd = None
+    elif forward is not None:
+        eegfwd = pick_channels_forward(forward, eegnames, verbose=False)
     else:
-        if len(eegnames) > 0:
-            eegfwd = pick_channels_forward(forward, eegnames, verbose=False)
-        else:
-            eegfwd = None
+        eegels = sensors.get('eeg', dict()).get('defs', [])
+        this_sensors = dict(eeg=dict(ch_names=eegnames, defs=eegels))
+        eegfwd = _compute_forwards(rr, bem=bem, sensors=this_sensors,
+                                   n_jobs=n_jobs, verbose=False)['eeg']
+        eegfwd = _to_forward_dict(eegfwd, eegnames)
+        del eegels
+    del eegnames
 
     # short circuit here if there are no MEG channels (don't need to iterate)
-    if len(pick_types(info, meg=True)) == 0:
+    if 'meg' not in sensors:
         eegfwd.update(**update_kwargs)
         for _ in dev_head_ts:
             yield eegfwd
@@ -725,13 +721,20 @@ def _iter_forward_solutions(info, trans, src, bem, dev_head_ts, mindist,
         # make a copy so it isn't mangled in use
         bem_surf = transform_surface_to(bem['surfs'][idx[0]], coord_frame,
                                         mri_head_t, copy=True)
+    megcoils = sensors['meg']['defs']
+    if 'eeg' in sensors:
+        del sensors['eeg']
+    megnames = sensors['meg']['ch_names']
+    fwds = dict()
+    if eegfwd is not None:
+        fwds['eeg'] = eegfwd
+    del eegfwd
     for ti, dev_head_t in enumerate(dev_head_ts):
         # Could be *slightly* more efficient not to do this N times,
         # but the cost here is tiny compared to actual fwd calculation
         logger.info('Computing gain matrix for transform #%s/%s'
                     % (ti + 1, len(dev_head_ts)))
         _transform_orig_meg_coils(megcoils, dev_head_t)
-        _transform_orig_meg_coils(compcoils, dev_head_t)
 
         # Make sure our sensors are all outside our BEM
         coil_rr = np.array([coil['r0'] for coil in megcoils])
@@ -750,13 +753,14 @@ def _iter_forward_solutions(info, trans, src, bem, dev_head_ts, mindist,
                 raise RuntimeError('%s MEG sensors collided with inner skull '
                                    'surface for transform %s'
                                    % (np.sum(~outside), ti))
-            megfwd = _compute_forwards(rr, bem, [megcoils], [compcoils],
-                                       [meg_info], ['meg'], n_jobs,
-                                       verbose=False)[0]
+            megfwd = _compute_forwards(
+                rr, sensors=sensors, bem=bem, n_jobs=n_jobs,
+                verbose=False)['meg']
             megfwd = _to_forward_dict(megfwd, megnames)
         else:
             megfwd = pick_channels_forward(forward, megnames, verbose=False)
-        fwd = _merge_meg_eeg_fwds(megfwd, eegfwd, verbose=False)
+        fwds['meg'] = megfwd
+        fwd = _merge_fwds(fwds, verbose=False)
         fwd.update(**update_kwargs)
 
         yield fwd

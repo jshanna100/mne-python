@@ -6,22 +6,18 @@
 #
 # License: Simplified BSD
 
-from functools import partial
 from collections import OrderedDict
 
 import numpy as np
 
 from ..annotations import _annotations_starts_stops
 from ..filter import create_filter
-from ..io.pick import pick_types, _pick_data_channels, pick_info, pick_channels
-from ..utils import verbose, _validate_type, _check_option
-from ..time_frequency import psd_welch
+from ..io.pick import pick_types, pick_channels
+from ..utils import legacy, verbose, _validate_type, _check_option
 from ..defaults import _handle_default
-from .topo import _plot_topo, _plot_timeseries, _plot_timeseries_unified
-from .utils import (plt_show, _compute_scalings, _handle_decim, _check_cov,
-                    _shorten_path_from_middle,
-                    _get_channel_plotting_order, _make_event_color_dict,
-                    _show_browser)
+from .utils import (_compute_scalings, _handle_decim, _check_cov,
+                    _shorten_path_from_middle, _handle_precompute,
+                    _get_channel_plotting_order, _make_event_color_dict)
 
 _RAW_CLIP_DEF = 1.5
 
@@ -36,7 +32,8 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
              proj=True, group_by='type', butterfly=False, decim='auto',
              noise_cov=None, event_id=None, show_scrollbars=True,
              show_scalebars=True, time_format='float',
-             precompute='auto', use_opengl=None, verbose=None):
+             precompute=None, use_opengl=None, *, theme=None,
+             overview_mode=None, verbose=None):
     """Plot raw data.
 
     Parameters
@@ -69,23 +66,7 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
         Color to make bad channels.
     %(event_color)s
         Defaults to ``'cyan'``.
-    scalings : 'auto' | dict | None
-        Scaling factors for the traces. If any fields in scalings are 'auto',
-        the scaling factor is set to match the 99.5th percentile of a subset of
-        the corresponding data. If scalings == 'auto', all scalings fields are
-        set to 'auto'. If any fields are 'auto' and data is not preloaded, a
-        subset of times up to 100mb will be loaded. If None, defaults to::
-
-            dict(mag=1e-12, grad=4e-11, eeg=20e-6, eog=150e-6, ecg=5e-4,
-                 emg=1e-3, ref_meg=1e-12, misc=1e-3, stim=1,
-                 resp=1, chpi=1e-4, whitened=1e2)
-
-        A particular scaling value ``s`` corresponds to half of the visualized
-        signal range around zero (i.e. from ``0`` to ``+s`` or from ``0`` to
-        ``-s``). For example, the default scaling of ``20e-6`` (20µV) for EEG
-        signals means that the visualized range will be 40µV (20µV in the
-        positive direction and 20µV in the negative direction).
-
+    %(scalings)s
     remove_dc : bool
         If True remove DC component when plotting data.
     order : array of int | None
@@ -105,7 +86,7 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
         Whether to halt program execution until the figure is closed.
         Useful for setting bad channels on the fly by clicking on a line.
         May not work on all systems / platforms.
-        (Only pyqtgraph) If you run from a script, this needs to
+        (Only Qt) If you run from a script, this needs to
         be ``True`` or a Qt-eventloop needs to be started somewhere
         else in the script (e.g. if you want to implement the browser
         inside another Qt-Application).
@@ -142,7 +123,7 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
         Individual projectors can be enabled/disabled interactively (see
         Notes). This argument only affects the plot; use ``raw.apply_proj()``
         to modify the data stored in the Raw object.
-    %(browse_group_by)s
+    %(group_by_browse)s
     butterfly : bool
         Whether to start in butterfly mode. Defaults to False.
     decim : int | 'auto'
@@ -176,12 +157,17 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
     %(time_format)s
     %(precompute)s
     %(use_opengl)s
+    %(theme_pg)s
+
+        .. versionadded:: 1.0
+    %(overview_mode)s
+
+        .. versionadded:: 1.1
     %(verbose)s
 
     Returns
     -------
-    fig : instance of matplotlib.figure.Figure
-        Raw traces.
+    %(browser)s
 
     Notes
     -----
@@ -209,11 +195,7 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
     By default, the channel means are removed when ``remove_dc`` is set to
     ``True``. This flag can be toggled by pressing 'd'.
 
-    .. note:: For the pyqtgraph backend to run in IPython with ``block=False``
-              you must run the magic command ``%%gui qt5`` first.
-    .. note:: To report issues with the pyqtgraph-backend, please use the
-              `issues <https://github.com/mne-tools/mne-qt-browser/issues>`_
-              of ``mne-qt-browser``.
+    %(notes_2d_backend)s
     """
     from ..io.base import BaseRaw
     from ._figure import _get_browser
@@ -293,6 +275,10 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
         order = np.concatenate(list(selections.values()))
         default_selection = list(selections)[0]
         n_channels = len(selections[default_selection])
+    assert isinstance(order, np.ndarray)
+    assert order.dtype.kind == 'i'
+    if order.size == 0:
+        raise RuntimeError('No channels found to plot')
 
     # handle event colors
     event_color_dict = _make_event_color_dict(event_color, events, event_id)
@@ -317,6 +303,7 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
 
     # gather parameters and initialize figure
     _validate_type(use_opengl, (bool, None), 'use_opengl')
+    precompute = _handle_precompute(precompute)
     params = dict(inst=raw,
                   info=info,
                   # channels and channel order
@@ -361,41 +348,26 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=20,
                   scrollbars_visible=show_scrollbars,
                   scalebars_visible=show_scalebars,
                   window_title=title,
-                  # pyqtgraph-specific
+                  bgcolor=bgcolor,
+                  # Qt-specific
                   precompute=precompute,
-                  use_opengl=use_opengl)
+                  use_opengl=use_opengl,
+                  theme=theme,
+                  overview_mode=overview_mode,
+                  )
 
-    fig = _get_browser(**params)
-
-    fig._update_picks()
-
-    # make channel selection dialog, if requested (doesn't work well in init)
-    if group_by in ('selection', 'position'):
-        fig._create_selection_fig()
-
-    # update projector and data, and plot
-    fig._update_projector()
-    fig._update_trace_offsets()
-    fig._setup_annotation_colors()
-
-    # Draw Plot
-    fig._redraw(update_data=True, annotations=True)
-
-    # start with projectors dialog open, if requested
-    if show_options:
-        fig._toggle_proj_fig()
-
-    _show_browser(show, block=block, fig=fig)
+    fig = _get_browser(show=show, block=block, **params)
 
     return fig
 
 
+@legacy(alt='Raw.compute_psd().plot()')
 @verbose
 def plot_raw_psd(raw, fmin=0, fmax=np.inf, tmin=None, tmax=None, proj=False,
                  n_fft=None, n_overlap=0, reject_by_annotation=True,
                  picks=None, ax=None, color='black', xscale='linear',
                  area_mode='std', area_alpha=0.33, dB=True, estimate='auto',
-                 show=True, n_jobs=1, average=False, line_alpha=None,
+                 show=True, n_jobs=None, average=False, line_alpha=None,
                  spatial_colors=True, sphere=None, window='hamming',
                  exclude='bads', verbose=None):
     """%(plot_psd_doc)s.
@@ -404,40 +376,31 @@ def plot_raw_psd(raw, fmin=0, fmax=np.inf, tmin=None, tmax=None, proj=False,
     ----------
     raw : instance of Raw
         The raw object.
-    fmin : float
-        Start frequency to consider.
-    fmax : float
-        End frequency to consider.
-    tmin : float | None
-        Start time to consider.
-    tmax : float | None
-        End time to consider.
-    proj : bool
-        Apply projection.
+    %(fmin_fmax_psd)s
+    %(tmin_tmax_psd)s
+    %(proj_psd)s
     n_fft : int | None
-        Number of points to use in Welch FFT calculations.
-        Default is None, which uses the minimum of 2048 and the
-        number of time points.
+        Number of points to use in Welch FFT calculations. Default is ``None``,
+        which uses the minimum of 2048 and the number of time points.
     n_overlap : int
         The number of points of overlap between blocks. The default value
         is 0 (no overlap).
-    %(reject_by_annotation_raw)s
-    %(plot_psd_picks_good_data)s
-    ax : instance of Axes | None
-        Axes to plot into. If None, axes will be created.
-    %(plot_psd_color)s
-    %(plot_psd_xscale)s
-    %(plot_psd_area_mode)s
-    %(plot_psd_area_alpha)s
-    %(plot_psd_dB)s
-    %(plot_psd_estimate)s
+    %(reject_by_annotation_psd)s
+    %(picks_good_data_noref)s
+    %(ax_plot_psd)s
+    %(color_plot_psd)s
+    %(xscale_plot_psd)s
+    %(area_mode_plot_psd)s
+    %(area_alpha_plot_psd)s
+    %(dB_plot_psd)s
+    %(estimate_plot_psd)s
     %(show)s
     %(n_jobs)s
-    %(plot_psd_average)s
-    %(plot_psd_line_alpha)s
-    %(plot_psd_spatial_colors)s
-    %(topomap_sphere_auto)s
-    %(window-psd)s
+    %(average_plot_psd)s
+    %(line_alpha_plot_psd)s
+    %(spatial_colors_psd)s
+    %(sphere_topomap_auto)s
+    %(window_psd)s
 
         .. versionadded:: 0.22.0
     exclude : list of str | 'bads'
@@ -452,57 +415,47 @@ def plot_raw_psd(raw, fmin=0, fmax=np.inf, tmin=None, tmax=None, proj=False,
     -------
     fig : instance of Figure
         Figure with frequency spectra of the data channels.
+
+    Notes
+    -----
+    %(notes_plot_*_psd_func)s
     """
-    from ._mpl_figure import _psd_figure
-    # handle FFT
-    if n_fft is None:
-        if tmax is None or not np.isfinite(tmax):
-            tmax = raw.times[-1]
-        tmin = 0. if tmin is None else tmin
-        n_fft = min(np.diff(raw.time_as_index([tmin, tmax]))[0] + 1, 2048)
-    # generate figure
-    fig = _psd_figure(
-        inst=raw, proj=proj, picks=picks, axes=ax, tmin=tmin, tmax=tmax,
-        fmin=fmin, fmax=fmax, sphere=sphere, xscale=xscale, dB=dB,
-        average=average, estimate=estimate, area_mode=area_mode,
-        line_alpha=line_alpha, area_alpha=area_alpha, color=color,
-        spatial_colors=spatial_colors, n_jobs=n_jobs, n_fft=n_fft,
-        n_overlap=n_overlap, reject_by_annotation=reject_by_annotation,
-        window=window, exclude=exclude)
-    plt_show(show)
+    fig = raw.plot_psd(
+        fmin=fmin, fmax=fmax, tmin=tmin, tmax=tmax, picks=picks,
+        proj=proj, reject_by_annotation=reject_by_annotation, method='welch',
+        ax=ax, color=color, xscale=xscale, area_mode=area_mode,
+        area_alpha=area_alpha, dB=dB, estimate=estimate, show=show,
+        line_alpha=line_alpha, spatial_colors=spatial_colors, sphere=sphere,
+        exclude=exclude, n_jobs=n_jobs, average=average, verbose=verbose,
+        n_fft=n_fft, n_overlap=n_overlap, window=window)
     return fig
 
 
+@legacy(alt='Raw.compute_psd().plot_topo()')
 @verbose
 def plot_raw_psd_topo(raw, tmin=0., tmax=None, fmin=0., fmax=100., proj=False,
-                      n_fft=2048, n_overlap=0, layout=None, color='w',
-                      fig_facecolor='k', axis_facecolor='k', dB=True,
-                      show=True, block=False, n_jobs=1, axes=None,
+                      *, n_fft=2048, n_overlap=0, dB=True, layout=None,
+                      color='w', fig_facecolor='k', axis_facecolor='k',
+                      axes=None, block=False, show=True, n_jobs=None,
                       verbose=None):
-    """Plot channel-wise frequency spectra as topography.
+    """Plot power spectral density, separately for each channel.
 
     Parameters
     ----------
     raw : instance of io.Raw
         The raw instance to use.
-    tmin : float
-        Start time for calculations. Defaults to zero.
-    tmax : float | None
-        End time for calculations. If None (default), the end of data is used.
-    fmin : float
-        Start frequency to consider. Defaults to zero.
-    fmax : float
-        End frequency to consider. Defaults to 100.
-    proj : bool
-        Apply projection. Defaults to False.
+    %(tmin_tmax_psd)s
+    %(fmin_fmax_psd_topo)s
+    %(proj_psd)s
     n_fft : int
         Number of points to use in Welch FFT calculations. Defaults to 2048.
     n_overlap : int
         The number of points of overlap between blocks. Defaults to 0
         (no overlap).
+    %(dB_spectrum_plot_topo)s
     layout : instance of Layout | None
         Layout instance specifying sensor positions (does not need to be
-        specified for Neuromag data). If None (default), the correct layout is
+        specified for Neuromag data). If ``None`` (default), the layout is
         inferred from the data.
     color : str | tuple
         A matplotlib-compatible color to use for the curves. Defaults to white.
@@ -512,16 +465,12 @@ def plot_raw_psd_topo(raw, tmin=0., tmax=None, fmin=0., fmax=100., proj=False,
     axis_facecolor : str | tuple
         A matplotlib-compatible color to use for the axis background.
         Defaults to black.
-    dB : bool
-        If True, transform data to decibels. Defaults to True.
-    show : bool
-        Show figure if True. Defaults to True.
+    %(axes_spectrum_plot_topo)s
     block : bool
         Whether to halt program execution until the figure is closed.
         May not work on all systems / platforms. Defaults to False.
+    %(show)s
     %(n_jobs)s
-    axes : instance of matplotlib Axes | None
-        Axes to plot into. If None, axes will be created.
     %(verbose)s
 
     Returns
@@ -529,36 +478,11 @@ def plot_raw_psd_topo(raw, tmin=0., tmax=None, fmin=0., fmax=100., proj=False,
     fig : instance of matplotlib.figure.Figure
         Figure distributing one image per channel across sensor topography.
     """
-    if layout is None:
-        from ..channels.layout import find_layout
-        layout = find_layout(raw.info)
-
-    psds, freqs = psd_welch(raw, tmin=tmin, tmax=tmax, fmin=fmin,
-                            fmax=fmax, proj=proj, n_fft=n_fft,
-                            n_overlap=n_overlap, n_jobs=n_jobs)
-    if dB:
-        psds = 10 * np.log10(psds)
-        y_label = 'dB'
-    else:
-        y_label = 'Power'
-    show_func = partial(_plot_timeseries_unified, data=[psds], color=color,
-                        times=[freqs])
-    click_func = partial(_plot_timeseries, data=[psds], color=color,
-                         times=[freqs])
-    picks = _pick_data_channels(raw.info)
-    info = pick_info(raw.info, picks)
-
-    fig = _plot_topo(info, times=freqs, show_func=show_func,
-                     click_func=click_func, layout=layout,
-                     axis_facecolor=axis_facecolor,
-                     fig_facecolor=fig_facecolor, x_label='Frequency (Hz)',
-                     unified=True, y_label=y_label, axes=axes)
-
-    try:
-        plt_show(show, block=block)
-    except TypeError:  # not all versions have this
-        plt_show(show)
-    return fig
+    return raw.plot_psd_topo(
+        tmin=tmin, tmax=tmax, fmin=fmin, fmax=fmax, proj=proj, method='welch',
+        dB=dB, layout=layout, color=color, fig_facecolor=fig_facecolor,
+        axis_facecolor=axis_facecolor, axes=axes, block=block, show=show,
+        n_jobs=n_jobs, verbose=verbose, n_fft=n_fft, n_overlap=n_overlap)
 
 
 def _setup_channel_selections(raw, kind, order):
@@ -596,7 +520,7 @@ def _setup_channel_selections(raw, kind, order):
                       ecg=True, emg=True, ref_meg=False, misc=True,
                       resp=True, chpi=True, exci=True, ias=True, syst=True,
                       seeg=False, bio=True, ecog=False, fnirs=False, dbs=False,
-                      exclude=())
+                      temperature=True, gsr=True, exclude=())
     if len(misc) and np.in1d(misc, order).any():
         selections_dict['Misc'] = misc
     return selections_dict

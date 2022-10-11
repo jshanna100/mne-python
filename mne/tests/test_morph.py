@@ -3,13 +3,14 @@
 #
 # License: BSD-3-Clause
 import os.path as op
+from inspect import signature
 
 import pytest
 import numpy as np
 from numpy.testing import (assert_array_less, assert_allclose,
                            assert_array_equal)
 from scipy.spatial.distance import cdist
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, eye as speye
 
 import mne
 from mne import (SourceEstimate, VolSourceEstimate, VectorSourceEstimate,
@@ -27,8 +28,7 @@ from mne.minimum_norm import (apply_inverse, read_inverse_operator,
 from mne.source_space import _add_interpolator, _grid_interp
 from mne.transforms import quat_to_rot
 from mne.utils import (requires_nibabel, check_version, requires_version,
-                       requires_dipy, requires_h5py, catch_logging)
-from mne.fixes import _get_args
+                       requires_dipy, catch_logging, _record_warnings)
 
 # Setup paths
 
@@ -67,7 +67,7 @@ def _real_vec_stc():
 
 def test_sourcemorph_consistency():
     """Test SourceMorph class consistency."""
-    assert _get_args(SourceMorph.__init__)[1:] == \
+    assert list(signature(SourceMorph.__init__).parameters)[1:-1] == \
         mne.morph._SOURCE_MORPH_ATTRIBUTES
 
 
@@ -193,7 +193,7 @@ def test_surface_source_morph_round_trip(smooth, lower, upper, n_warn, dtype):
         with pytest.raises(ValueError, match='required to use nearest'):
             morph = compute_source_morph(stc, 'sample', 'fsaverage', **kwargs)
         return
-    with pytest.warns(None) as w:
+    with _record_warnings() as w:
         morph = compute_source_morph(stc, 'sample', 'fsaverage', **kwargs)
     w = [ww for ww in w if 'vertices not included' in str(ww.message)]
     assert len(w) == n_warn
@@ -209,6 +209,20 @@ def test_surface_source_morph_round_trip(smooth, lower, upper, n_warn, dtype):
     assert_power_preserved(stc, stc_back)
 
 
+@testing.requires_testing_data
+def test_surface_source_morph_shortcut():
+    """Test that our shortcut for smooth=0 works."""
+    stc = mne.read_source_estimate(fname_smorph)
+    morph_identity = compute_source_morph(
+        stc, 'sample', 'sample', spacing=stc.vertices, smooth=0,
+        subjects_dir=subjects_dir)
+    stc_back = morph_identity.apply(stc)
+    assert_allclose(stc_back.data, stc.data, rtol=1e-4)
+    abs_sum = morph_identity.morph_mat - speye(len(stc.data), format='csc')
+    abs_sum = np.abs(abs_sum.data).sum()
+    assert abs_sum < 1e-4
+
+
 def assert_power_preserved(orig, new, limits=(1., 1.05)):
     """Assert that the power is preserved during a round-trip morph."""
     __tracebackhide__ = True
@@ -222,7 +236,7 @@ def assert_power_preserved(orig, new, limits=(1., 1.05)):
         assert min_ < power_ratio < max_, f'Power ratio {kind} = {power_ratio}'
 
 
-@requires_h5py
+@requires_version('h5io')
 @testing.requires_testing_data
 def test_surface_vector_source_morph(tmp_path):
     """Test surface and vector source estimate morph."""
@@ -274,7 +288,7 @@ def test_surface_vector_source_morph(tmp_path):
         source_morph_surf.apply(stc_vol)
 
 
-@requires_h5py
+@requires_version('h5io')
 @requires_nibabel()
 @requires_dipy()
 @pytest.mark.slowtest
@@ -459,18 +473,18 @@ def test_volume_source_morph_basic(tmp_path):
     assert_allclose(img_vol, img_vol_2)
 
 
-@requires_h5py
+@requires_version('h5io')
 @requires_nibabel()
 @requires_dipy()
 @pytest.mark.slowtest
 @testing.requires_testing_data
 @pytest.mark.parametrize(
     'subject_from, subject_to, lower, upper, dtype, morph_mat', [
-        ('sample', 'fsaverage', 10.0, 10.4, float, False),
+        ('sample', 'fsaverage', 5.9, 6.1, float, False),
         ('fsaverage', 'fsaverage', 0., 0.1, float, False),
         ('sample', 'sample', 0., 0.1, complex, False),
         ('sample', 'sample', 0., 0.1, float, True),  # morph_mat
-        ('sample', 'fsaverage', 7.0, 7.4, float, True),  # morph_mat
+        ('sample', 'fsaverage', 10, 12, float, True),  # morph_mat
     ])
 def test_volume_source_morph_round_trip(
         tmp_path, subject_from, subject_to, lower, upper, dtype, morph_mat,
@@ -553,7 +567,7 @@ def test_volume_source_morph_round_trip(
     # check that power is more or less preserved (labelizing messes with this)
     if morph_mat:
         if subject_to == 'fsaverage':
-            limits = (14.0, 14.2)
+            limits = (18, 18.5)
         else:
             limits = (7, 7.5)
     else:
@@ -866,7 +880,6 @@ def test_mixed_source_morph(_mixed_morph_srcs, vector):
 
     # Now actually morph
     stc_fs = morph.apply(stc)
-    img = stc_fs.volume().as_volume(src_fs, mri_resolution=False)
     vol_info = _get_mri_info_data(fname_aseg_fs, data=True)
     rrs = np.concatenate([src_fs[2]['rr'][sp['vertno']] for sp in src_fs[2:]])
     n_want = np.in1d(_get_atlas_values(vol_info, rrs), ids).sum()

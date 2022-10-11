@@ -38,12 +38,12 @@ from mne.decoding import LinearModel
 print(__doc__)
 
 data_path = sample.data_path()
-sample_path = data_path + '/MEG/sample'
+sample_path = data_path / 'MEG' / 'sample'
 
 # %%
 # Set parameters
-raw_fname = sample_path + '/sample_audvis_filt-0-40_raw.fif'
-event_fname = sample_path + '/sample_audvis_filt-0-40_raw-eve.fif'
+raw_fname = sample_path / 'sample_audvis_filt-0-40_raw.fif'
+event_fname = sample_path / 'sample_audvis_filt-0-40_raw-eve.fif'
 tmin, tmax = -0.1, 0.4
 event_id = dict(aud_l=1, vis_l=3)
 
@@ -67,7 +67,7 @@ meg_data = meg_epochs.get_data().reshape(len(labels), -1)
 # Decoding in sensor space using a LogisticRegression classifier
 # --------------------------------------------------------------
 
-clf = LogisticRegression(solver='lbfgs')
+clf = LogisticRegression(solver='liblinear')  # liblinear is faster than lbfgs
 scaler = StandardScaler()
 
 # create a linear model with LogisticRegression
@@ -89,7 +89,8 @@ for name, coef in (('patterns', model.patterns_), ('filters', model.filters_)):
 
     # Plot
     evoked = EvokedArray(coef, meg_epochs.info, tmin=epochs.tmin)
-    evoked.plot_topomap(title='MEG %s' % name, time_unit='s')
+    fig = evoked.plot_topomap()
+    fig.suptitle(f'MEG {name}')
 
 # %%
 # Let's do the same on EEG data using a scikit-learn pipeline
@@ -101,8 +102,10 @@ y = epochs.events[:, 2]
 clf = make_pipeline(
     Vectorizer(),                       # 1) vectorize across time and channels
     StandardScaler(),                   # 2) normalize features across trials
-    LinearModel(
-        LogisticRegression(solver='lbfgs')))  # 3) fits a logistic regression
+    LinearModel(                        # 3) fits a logistic regression
+        LogisticRegression(solver='liblinear')
+    )
+)
 clf.fit(X, y)
 
 # Extract and plot patterns and filters
@@ -111,7 +114,8 @@ for name in ('patterns_', 'filters_'):
     # contained in the pipeline, in reverse order.
     coef = get_coef(clf, name, inverse_transform=True)
     evoked = EvokedArray(coef, epochs.info, tmin=epochs.tmin)
-    evoked.plot_topomap(title='EEG %s' % name[:-1], time_unit='s')
+    fig = evoked.plot_topomap()
+    fig.suptitle(f'EEG {name[:-1]}')
 
 # %%
 # References

@@ -16,7 +16,6 @@ from glob import glob
 from itertools import cycle
 import os.path as op
 import warnings
-from distutils.version import LooseVersion
 from collections import defaultdict
 
 import numpy as np
@@ -137,6 +136,9 @@ def plot_cov(cov, info, exclude=(), colorbar=True, proj=False, show_svd=True,
         else:
             logger.info('    The projection vectors do not apply to these '
                         'channels.')
+
+    if np.iscomplexobj(C):
+        C = np.sqrt((C * C.conj()).real)
 
     fig_cov, axes = plt.subplots(1, len(idx_names), squeeze=False,
                                  figsize=(3.8 * len(idx_names), 3.7))
@@ -624,12 +626,11 @@ def _get_bem_plotting_surfaces(bem_path):
 def plot_events(events, sfreq=None, first_samp=0, color=None, event_id=None,
                 axes=None, equal_spacing=True, show=True, on_missing='raise',
                 verbose=None):
-    """Plot events to get a visual display of the paradigm.
+    """Plot :term:`events` to get a visual display of the paradigm.
 
     Parameters
     ----------
-    events : array, shape (n_events, 3)
-        The events.
+    %(events)s
     sfreq : float | None
         The sample frequency. If None, data will be displayed in samples (not
         seconds).
@@ -642,7 +643,7 @@ def plot_events(events, sfreq=None, first_samp=0, color=None, event_id=None,
         Dictionary of event_id integers as keys and colors as values. If None,
         colors are automatically drawn from a default list (cycled through if
         number of events longer than list of default colors). Color can be any
-        valid :doc:`matplotlib color <tutorials/colors/colors>`.
+        valid :doc:`matplotlib color <matplotlib:tutorials/colors/colors>`.
     event_id : dict | None
         Dictionary of event labels (e.g. 'aud_l') as keys and their associated
         event_id values. Labels are used to plot a legend. If None, no legend
@@ -762,14 +763,10 @@ def plot_events(events, sfreq=None, first_samp=0, color=None, event_id=None,
 
 def _get_presser(fig):
     """Get our press callback."""
-    import matplotlib
     callbacks = fig.canvas.callbacks.callbacks['button_press_event']
     func = None
     for key, val in callbacks.items():
-        if LooseVersion(matplotlib.__version__) >= '3':
-            func = val()
-        else:
-            func = val.func
+        func = val()
         if func.__class__.__name__ == 'partial':
             break
         else:
@@ -885,7 +882,7 @@ _DEFAULT_ALIM = (-80, 10)
 def plot_filter(h, sfreq, freq=None, gain=None, title=None, color='#1f77b4',
                 flim=None, fscale='log', alim=_DEFAULT_ALIM, show=True,
                 compensate=False, plot=('time', 'magnitude', 'delay'),
-                axes=None):
+                axes=None, *, dlim=None):
     """Plot properties of a filter.
 
     Parameters
@@ -938,6 +935,11 @@ def plot_filter(h, sfreq, freq=None, gain=None, title=None, color='#1f77b4',
         Defaults to ``None``.
 
         .. versionadded:: 0.21.0
+    dlim : None | tuple
+        The y-axis delay limits (sec) to use (default:
+        ``(-tmax / 2., tmax / 2.)``).
+
+        .. versionadded:: 1.1.0
 
     Returns
     -------
@@ -1004,7 +1006,7 @@ def plot_filter(h, sfreq, freq=None, gain=None, title=None, color='#1f77b4',
                 warnings.simplefilter('ignore')
                 gd = group_delay((h['b'], h['a']), omega)[1]
                 if compensate:
-                    gd += group_delay(h['b'].conj(), h['a'].conj(), omega)[1]
+                    gd += group_delay((h['b'].conj(), h['a'].conj()), omega)[1]
             n = estimate_ringing_samples((h['b'], h['a']))
             delta = np.zeros(n)
             delta[0] = 1
@@ -1042,8 +1044,9 @@ def plot_filter(h, sfreq, freq=None, gain=None, title=None, color='#1f77b4',
                          % (len(axes), len(plot)))
 
     t = np.arange(len(h))
-    dlim = np.abs(t).max() / 2.
-    dlim = [-dlim, dlim]
+    if dlim is None:
+        dlim = np.abs(t).max() / 2.
+        dlim = [-dlim, dlim]
     if compensate:
         n_shift = (len(h) - 1) // 2
         t -= n_shift
@@ -1150,7 +1153,7 @@ def plot_ideal_filter(freq, gain, axes=None, title='', flim=None, fscale='log',
         >>> from mne.viz import plot_ideal_filter
         >>> freq = [0, 1, 40, 50]
         >>> gain = [0, 1, 1, 0]
-        >>> plot_ideal_filter(freq, gain, flim=(0.1, 100))  #doctest: +ELLIPSIS
+        >>> plot_ideal_filter(freq, gain, flim=(0.1, 100))  #doctest: +SKIP
         <...Figure...>
     """
     import matplotlib.pyplot as plt

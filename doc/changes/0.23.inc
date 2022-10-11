@@ -292,7 +292,7 @@ Bugs
 
 - When creating `~mne.Epochs`, we now ensure that ``reject_tmin`` and ``reject_tmax`` cannot fall outside of the epochs' time interval anymore (:gh:`8821` by `Richard Höchenberger`_)
 
-- `~mne.io.read_raw_bti` erroneously treated response channels as respiratory channels (:gh:`8855` by `Richard Höchenberger`_)
+- `~mne.io.read_raw_bti` erroneously treated response channels as respiratory channels (:gh:`8856` by `Richard Höchenberger`_)
 
 - The RMS trace shown in the time viewer of `~mne.SourceEstimate` plots is now correctly labeled as ``RMS`` (was ``GFP`` before) (:gh:`8965` by `Richard Höchenberger`_)
 
@@ -324,7 +324,7 @@ API changes
 ~~~~~~~~~~~
 - Introduced new ``'auto'`` settings for ``ICA.max_iter``. The old default ``max_iter=200`` will be removed in MNE-Python 0.24 (:gh:`9099` **by new contributor** |Cora Kim|_)
 
-- `mne.viz.plot_sensors_connectivity` now allows setting the colorbar label via the ``cbar_label`` parameter (:gh:`9248` by `Daniel McCloy`_)
+- ``mne.viz.plot_sensors_connectivity`` now allows setting the colorbar label via the ``cbar_label`` parameter (:gh:`9248` by `Daniel McCloy`_)
 
 - ``mne.read_selection`` has been deprecated in favor of `mne.read_vectorview_selection`. ``mne.read_selection`` will be removed in MNE-Python 0.24 (:gh:`8870` by `Richard Höchenberger`_)
 

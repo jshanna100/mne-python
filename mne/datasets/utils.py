@@ -9,8 +9,11 @@
 # License: BSD Style.
 
 from collections import OrderedDict
+import importlib
+import inspect
 import os
 import os.path as op
+from pathlib import Path
 import sys
 import zipfile
 import tempfile
@@ -19,11 +22,9 @@ import numpy as np
 
 from .config import _hcp_mmp_license_text, MNE_DATASETS
 from ..label import read_labels_from_annot, Label, write_labels_to_annot
-from ..utils import (get_config, set_config, logger,
+from ..utils import (get_config, set_config, logger, _validate_type,
                      verbose, get_subjects_dir, _pl, _safe_input)
-from ..utils.docs import docdict
-from ..utils.check import _soft_import
-from ..externals.doccer import docformat
+from ..utils.docs import docdict, _docformat
 
 
 _data_path_doc = """Get path to local copy of {name} dataset.
@@ -52,15 +53,15 @@ _data_path_doc = """Get path to local copy of {name} dataset.
 
     Returns
     -------
-    path : str
+    path : instance of Path
         Path to {name} dataset directory.
 """
 _data_path_doc_accept = _data_path_doc.split('%(verbose)s')
 _data_path_doc_accept[-1] = '%(verbose)s' + _data_path_doc_accept[-1]
 _data_path_doc_accept.insert(1, '    %(accept)s')
 _data_path_doc_accept = ''.join(_data_path_doc_accept)
-_data_path_doc = docformat(_data_path_doc, docdict)
-_data_path_doc_accept = docformat(_data_path_doc_accept, docdict)
+_data_path_doc = _docformat(_data_path_doc, docdict)
+_data_path_doc_accept = _docformat(_data_path_doc_accept, docdict)
 
 _version_doc = """Get version of the local {name} dataset.
 
@@ -79,6 +80,7 @@ def _dataset_version(path, name):
         with open(ver_fname, 'r') as fid:
             version = fid.readline().strip()  # version is on first line
     else:
+        logger.debug(f'Version file missing: {ver_fname}')
         # Sample dataset versioning was introduced after 0.3
         # SPM dataset was introduced with 0.7
         versions = dict(sample='0.7', spm='0.3')
@@ -89,9 +91,8 @@ def _dataset_version(path, name):
 def _get_path(path, key, name):
     """Get a dataset path."""
     # 1. Input
+    _validate_type(path, ('path-like', None), path)
     if path is not None:
-        if not isinstance(path, str):
-            raise ValueError('path must be a string or None')
         return path
     # 2. get_config(key) — unless key is None or "" (special get_config values)
     # 3. get_config('MNE_DATA')
@@ -102,7 +103,7 @@ def _get_path(path, key, name):
                    f"not exist. Either create this directory manually and try "
                    f"again, or set MNE_DATA to an existing directory.")
             raise FileNotFoundError(msg)
-        return path
+        return Path(path)
     # 4. ~/mne_data (but use a fake home during testing so we don't
     #    unnecessarily create ~/mne_data)
     logger.info('Using default location ~/mne_data for %s...' % name)
@@ -118,7 +119,7 @@ def _get_path(path, key, name):
                           "argument to data_path() where user has "
                           "write permissions, for ex:data_path"
                           "('/home/xyz/me2/')" % (path))
-    return path
+    return Path(path)
 
 
 def _do_path_update(path, update_path, key, name):
@@ -139,17 +140,64 @@ def _do_path_update(path, update_path, key, name):
                 update_path = False
 
         if update_path:
-            set_config(key, path, set_env=False)
+            set_config(key, str(path), set_env=False)
     return path
+
+
+# This is meant to be semi-public: let packages like mne-bids use it to make
+# sure they don't accidentally set download=True in their tests, too
+_MODULES_TO_ENSURE_DOWNLOAD_IS_FALSE_IN_TESTS = ('mne',)
+
+
+def _check_in_testing_and_raise(name, download):
+    """Check if we're in an MNE test and raise an error if download!=False."""
+    root_dirs = [
+        importlib.import_module(ns)
+        for ns in _MODULES_TO_ENSURE_DOWNLOAD_IS_FALSE_IN_TESTS]
+    root_dirs = [str(Path(ns.__file__).parent) for ns in root_dirs]
+    check = False
+    func = None
+    frame = inspect.currentframe()
+    try:
+        # First, traverse out of the data_path() call
+        while frame:
+            if frame.f_code.co_name in ('data_path', 'load_data'):
+                func = frame.f_code.co_name
+                frame = frame.f_back.f_back  # out of verbose decorator
+                break
+            frame = frame.f_back
+        # Next, see what the caller was
+        while frame:
+            fname = frame.f_code.co_filename
+            if fname is not None:
+                fname = Path(fname)
+                # in mne namespace, and
+                # (can't use is_relative_to here until 3.9)
+                if any(str(fname).startswith(rd) for rd in root_dirs) and (
+                        # in tests/*.py
+                        fname.parent.stem == 'tests' or
+                        # or in a conftest.py
+                        fname.stem == 'conftest.py'):
+                    check = True
+                    break
+            frame = frame.f_back
+    finally:
+        del frame
+    if check and download is not False:
+        raise RuntimeError(
+            f'Do not download dataset {repr(name)} in tests, pass '
+            f'{func}(download=False) to prevent accidental downloads')
 
 
 def _download_mne_dataset(name, processor, path, force_update,
                           update_path, download, accept=False):
     """Aux function for downloading internal MNE datasets."""
+    import pooch
     from mne.datasets._fetch import fetch_dataset
 
+    _check_in_testing_and_raise(name, download)
+
     # import pooch library for handling the dataset downloading
-    pooch = _soft_import('pooch', 'dataset downloading', strict=True)
     dataset_params = MNE_DATASETS[name]
     dataset_params['dataset_name'] = name
     config_key = MNE_DATASETS[name]['config_key']
@@ -235,7 +283,7 @@ def has_dataset(name):
         check = dataset_name
     else:
         check = MNE_DATASETS[dataset_name]['folder_name']
-    return dp.endswith(check)
+    return str(dp).endswith(check)
 
 
 @verbose
@@ -287,7 +335,7 @@ def _download_all_example_data(verbose=True):
     fetch_fsaverage(None)
     fetch_infant_template('6mo')
     fetch_hcp_mmp_parcellation(
-        subjects_dir=sample_path + '/subjects', accept=True)
+        subjects_dir=sample_path / 'subjects', accept=True)
     limo.load_data(subject=1, update_path=True)
 
     erp_core.data_path()
@@ -312,8 +360,7 @@ def fetch_aparc_sub_parcellation(subjects_dir=None, verbose=None):
     ----------
     .. footbibliography::
     """
-    # import pooch library for handling the dataset downloading
-    pooch = _soft_import('pooch', 'dataset downloading', strict=True)
+    import pooch
 
     subjects_dir = get_subjects_dir(subjects_dir, raise_error=True)
     destination = op.join(subjects_dir, 'fsaverage', 'label')
@@ -363,8 +410,7 @@ def fetch_hcp_mmp_parcellation(subjects_dir=None, combine=True, *,
     ----------
     .. footbibliography::
     """
-    # import pooch library for handling the dataset downloading
-    pooch = _soft_import('pooch', 'dataset downloading', strict=True)
+    import pooch
 
     subjects_dir = get_subjects_dir(subjects_dir, raise_error=True)
     destination = op.join(subjects_dir, 'fsaverage', 'label')
@@ -493,8 +539,7 @@ def fetch_hcp_mmp_parcellation(subjects_dir=None, combine=True, *,
 
 
 def _manifest_check_download(manifest_path, destination, url, hash_):
-    # import pooch library for handling the dataset downloading
-    pooch = _soft_import('pooch', 'dataset downloading', strict=True)
+    import pooch
 
     with open(manifest_path, 'r') as fid:
         names = [name.strip() for name in fid.readlines()]

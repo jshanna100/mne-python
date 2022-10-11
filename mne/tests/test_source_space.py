@@ -22,12 +22,12 @@ from mne import (read_source_spaces, write_source_spaces,
                  read_bem_solution, read_freesurfer_lut,
                  read_trans)
 from mne.fixes import _get_img_fdata
-from mne.utils import (requires_nibabel, run_subprocess,
-                       modified_env, requires_mne, check_version)
+from mne.utils import (requires_nibabel, run_subprocess, _record_warnings,
+                       requires_mne, check_version)
 from mne.surface import _accumulate_normals, _triangle_neighbors
 from mne.source_estimate import _get_src_type
 from mne.source_space import (get_volume_labels_from_src,
-                              _compare_source_spaces,
+                              _compare_source_spaces, get_decimated_surfaces,
                               compute_distance_to_sensors)
 from mne.io.pick import _picks_to_idx
 from mne.io.constants import FIFF
@@ -160,6 +160,39 @@ def test_add_patch_info(monkeypatch):
                 s[key] = None
         add_source_space_distances(src_new, dist_limit=0)
         _compare_source_spaces(src, src_new, 'approx')
+
+
+# We could test "src_py" here, but we can rely on our existing tests to
+# make sure the pinfo/patch_inds/nearest match
+@testing.requires_testing_data
+@pytest.mark.parametrize('src_kind', ['fwd', 'src'])
+def test_surface_source_space_doc(src_kind):
+    """Test surface source space docstring."""
+    # make sure we're correct about this stuff for both kinds!
+    if src_kind == 'fwd':
+        src = mne.read_source_spaces(fname_fwd)
+    else:
+        assert src_kind == 'src'
+        src = mne.read_source_spaces(fname_src)
+    for s in src:
+        if src_kind == 'src':  # original
+            assert len(s['pinfo']) == s['nuse']
+            assert_array_equal(s['patch_inds'], np.arange(s['nuse']))
+        else:  # pts removed
+            assert len(s['pinfo']) > s['nuse']
+        all_pinfo = np.concatenate(s['pinfo'])
+        assert_array_equal(np.sort(all_pinfo), np.arange(s['np']))
+        assert len(s['patch_inds']) == s['nuse']
+        assert len(s['vertno']) == s['nuse']
+        assert len(s['patch_inds']) == s['nuse']
+        for idx in (0, 42, 173):
+            this_dense_vertex = s['vertno'][idx]
+            # 'pinfo'
+            this_vertex_represents = s['pinfo'][s['patch_inds'][idx]]
+            assert len(this_vertex_represents) > 1
+            # 'nearest'
+            for other in this_vertex_represents:
+                assert s['nearest'][other] == this_dense_vertex
 
 
 @testing.requires_testing_data
@@ -306,7 +339,7 @@ def test_volume_source_space(tmp_path):
         del src_new
         src_new = read_source_spaces(temp_name)
         _compare_source_spaces(src, src_new, mode='approx')
-    with pytest.raises(IOError, match='surface file.*not found'):
+    with pytest.raises(IOError, match='surface file.*not exist'):
         setup_volume_source_space(
             'sample', surface='foo', mri=fname_mri, subjects_dir=subjects_dir)
     bem['surfs'][-1]['coord_frame'] = FIFF.FIFFV_COORD_HEAD
@@ -452,7 +485,7 @@ def test_setup_source_space(tmp_path):
 
     # ico 5 (fsaverage) - write to temp file
     src = read_source_spaces(fname_ico)
-    with pytest.warns(None):  # sklearn equiv neighbors
+    with _record_warnings():  # sklearn equiv neighbors
         src_new = setup_source_space('fsaverage', spacing='ico5',
                                      subjects_dir=subjects_dir, add_dist=False)
     _compare_source_spaces(src, src_new, mode='approx')
@@ -464,7 +497,7 @@ def test_setup_source_space(tmp_path):
     # oct-6 (sample) - auto filename + IO
     src = read_source_spaces(fname)
     temp_name = tmp_path / 'temp-src.fif'
-    with pytest.warns(None):  # sklearn equiv neighbors
+    with _record_warnings():  # sklearn equiv neighbors
         src_new = setup_source_space('sample', spacing='oct6',
                                      subjects_dir=subjects_dir, add_dist=False)
         write_source_spaces(temp_name, src_new, overwrite=True)
@@ -489,23 +522,24 @@ def test_setup_source_space(tmp_path):
 @pytest.mark.slowtest
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize('spacing', [2, 7])
-def test_setup_source_space_spacing(tmp_path, spacing):
+def test_setup_source_space_spacing(tmp_path, spacing, monkeypatch):
     """Test setting up surface source spaces using a given spacing."""
     copytree(op.join(subjects_dir, 'sample'), tmp_path / 'sample')
     args = [] if spacing == 7 else ['--spacing', str(spacing)]
-    with modified_env(SUBJECTS_DIR=str(tmp_path), SUBJECT='sample'):
-        run_subprocess(['mne_setup_source_space'] + args)
+    monkeypatch.setenv('SUBJECTS_DIR', str(tmp_path))
+    monkeypatch.setenv('SUBJECT', 'sample')
+    run_subprocess(['mne_setup_source_space'] + args)
     src = read_source_spaces(
         tmp_path / 'sample' / 'bem' / ('sample-%d-src.fif' % spacing)
     )
-    src_new = setup_source_space('sample', spacing=spacing, add_dist=False,
-                                 subjects_dir=subjects_dir)
+    # No need to pass subjects_dir here because we've setenv'ed it
+    src_new = setup_source_space('sample', spacing=spacing, add_dist=False)
     _compare_source_spaces(src, src_new, mode='approx', nearest=True)
     # Degenerate conditions
     with pytest.raises(TypeError, match='spacing must be.*got.*float.*'):
-        setup_source_space('sample', 7., subjects_dir=subjects_dir)
+        setup_source_space('sample', 7.)
     with pytest.raises(ValueError, match='spacing must be >= 2, got 1'):
-        setup_source_space('sample', 1, subjects_dir=subjects_dir)
+        setup_source_space('sample', 1)
 
 
 @testing.requires_testing_data
@@ -885,6 +919,22 @@ def test_morphed_source_space_return():
                   src, subjects_dir=subjects_dir)
 
 
+@testing.requires_testing_data
+@pytest.mark.parametrize('src, n, nv', [
+    (fname_fs, 2, 10242), (fname_src, 2, 258), (fname_vol, 0, 0),
+])
+def test_get_decimated_surfaces(src, n, nv):
+    """Test get_decimated_surfaces."""
+    surfaces = get_decimated_surfaces(src)
+    assert len(surfaces) == n
+    if n == 0:
+        return
+    for s in surfaces:
+        assert set(s) == {'rr', 'tris'}
+        assert len(s['rr']) == nv
+        assert_array_equal(np.unique(s['tris']), np.arange(nv))
+
+
 # The following code was used to generate small-src.fif.gz.
 # Unfortunately the C code bombs when trying to add source space distances,
 # possibly due to incomplete "faking" of a smaller surface on our part here.
@@ -898,7 +948,8 @@ import mne
 data_path = mne.datasets.sample.data_path()
 src = mne.setup_source_space('sample', fname=None, spacing='oct5')
 hemis = ['lh', 'rh']
-fnames = [data_path + '/subjects/sample/surf/%s.decimated' % h for h in hemis]
+fnames = [
+    str(data_path) + '/subjects/sample/surf/%s.decimated' % h for h in hemis]
 
 vs = list()
 for s, fname in zip(src, fnames):
@@ -911,7 +962,8 @@ for s, fname in zip(src, fnames):
     mne.write_surface(fname, coords, faces)
 
 # we need to move sphere surfaces
-spheres = [data_path + '/subjects/sample/surf/%s.sphere' % h for h in hemis]
+spheres = [
+    str(data_path) + '/subjects/sample/surf/%s.sphere' % h for h in hemis]
 for s in spheres:
     os.rename(s, s + '.bak')
 try:

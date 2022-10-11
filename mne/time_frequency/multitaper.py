@@ -4,9 +4,11 @@
 # Parts of this code were copied from NiTime http://nipy.sourceforge.net/nitime
 
 import operator
+
 import numpy as np
 
-from ..parallel import parallel_func, check_n_jobs
+from ..filter import next_fast_len
+from ..parallel import parallel_func
 from ..utils import sum_squared, warn, verbose, logger, _check_option
 
 
@@ -61,7 +63,7 @@ def dpss_windows(N, half_nbw, Kmax, low_bias=True, interp_from=None,
     from scipy import interpolate
     from scipy.fft import rfft, irfft
     from scipy.signal.windows import dpss as sp_dpss
-    from ..filter import next_fast_len
+
     # This np.int32 business works around a weird Windows bug, see
     # gh-5039 and https://github.com/scipy/scipy/pull/8608
     Kmax = np.int32(operator.index(Kmax))
@@ -318,7 +320,7 @@ def _mt_spectra(x, dpss, sfreq, n_fft=None):
         x_mt[idx] = rfft(sig[..., np.newaxis, :] * dpss, n=n_fft)
     # Adjust DC and maybe Nyquist, depending on one-sided transform
     x_mt[..., 0] /= np.sqrt(2.)
-    if x.shape[1] % 2 == 0:
+    if n_fft % 2 == 0:
         x_mt[..., -1] /= np.sqrt(2.)
     return x_mt, freqs
 
@@ -362,10 +364,13 @@ def _compute_mt_params(n_times, sfreq, bandwidth, low_bias, adaptive,
 
 
 @verbose
-def psd_array_multitaper(x, sfreq, fmin=0, fmax=np.inf, bandwidth=None,
+def psd_array_multitaper(x, sfreq, fmin=0.0, fmax=np.inf, bandwidth=None,
                          adaptive=False, low_bias=True, normalization='length',
-                         n_jobs=1, verbose=None):
-    """Compute power spectral density (PSD) using a multi-taper method.
+                         output='power', n_jobs=None, verbose=None):
+    r"""Compute power spectral density (PSD) using a multi-taper method.
+
+    The power spectral density is computed with DPSS
+    tapers\ :footcite:p:`Slepian1978`.
 
     Parameters
     ----------
@@ -385,20 +390,25 @@ def psd_array_multitaper(x, sfreq, fmin=0, fmax=np.inf, bandwidth=None,
     low_bias : bool
         Only use tapers with more than 90%% spectral concentration within
         bandwidth.
-    normalization : str
-        Either "full" or "length" (default). If "full", the PSD will
-        be normalized by the sampling rate as well as the length of
-        the signal (as in nitime).
+    %(normalization)s
+    output : str
+        The format of the returned ``psds`` array. Can be either ``'complex'``
+        or ``'power'``. If ``'power'``, the power spectral density is returned.
+        If ``output='complex'``, the complex fourier coefficients are returned
+        per taper.
     %(n_jobs)s
     %(verbose)s
 
     Returns
     -------
-    psds : ndarray, shape (..., n_freqs) or
-        The power spectral densities. All dimensions up to the last will
-        be the same as input.
+    psds : ndarray, shape (..., n_freqs) or (..., n_tapers, n_freqs)
+        The power spectral densities. All dimensions up to the last (or the
+        last two if ``output='complex'``) will be the same as input.
     freqs : array
         The frequency points in Hz of the PSD.
+    weights : ndarray
+        The weights used for averaging across tapers. Only returned if
+        ``output='complex'``.
 
     See Also
     --------
@@ -410,6 +420,10 @@ def psd_array_multitaper(x, sfreq, fmin=0, fmax=np.inf, bandwidth=None,
     Notes
     -----
     .. versionadded:: 0.14.0
+
+    References
+    ----------
+    .. footbibliography::
     """
     from scipy.fft import rfftfreq
     _check_option('normalization', normalization, ['length', 'full'])
@@ -423,44 +437,57 @@ def psd_array_multitaper(x, sfreq, fmin=0, fmax=np.inf, bandwidth=None,
 
     dpss, eigvals, adaptive = _compute_mt_params(
         n_times, sfreq, bandwidth, low_bias, adaptive)
+    n_tapers = len(dpss)
+    weights = np.sqrt(eigvals)[np.newaxis, :, np.newaxis]
 
     # decide which frequencies to keep
     freqs = rfftfreq(n_times, 1. / sfreq)
     freq_mask = (freqs >= fmin) & (freqs <= fmax)
     freqs = freqs[freq_mask]
+    n_freqs = len(freqs)
 
-    psd = np.zeros((x.shape[0], freq_mask.sum()))
+    if output == 'complex':
+        psd = np.zeros((x.shape[0], n_tapers, n_freqs), dtype='complex')
+    else:
+        psd = np.zeros((x.shape[0], n_freqs))
+
     # Let's go in up to 50 MB chunks of signals to save memory
-    n_jobs = check_n_jobs(n_jobs)
-    n_chunk = max(50000000 // (len(freq_mask) * len(eigvals) * 16), n_jobs)
+    n_chunk = max(50000000 // (len(freq_mask) * len(eigvals) * 16), 1)
     offsets = np.concatenate((np.arange(0, x.shape[0], n_chunk), [x.shape[0]]))
     for start, stop in zip(offsets[:-1], offsets[1:]):
         x_mt = _mt_spectra(x[start:stop], dpss, sfreq)[0]
-        if not adaptive:
-            weights = np.sqrt(eigvals)[np.newaxis, :, np.newaxis]
-            psd[start:stop] = _psd_from_mt(x_mt[:, :, freq_mask], weights)
+        if output == 'power':
+            if not adaptive:
+                psd[start:stop] = _psd_from_mt(x_mt[:, :, freq_mask], weights)
+            else:
+                parallel, my_psd_from_mt_adaptive, n_jobs = \
+                    parallel_func(_psd_from_mt_adaptive, n_jobs)
+                n_splits = min(stop - start, n_jobs)
+                out = parallel(my_psd_from_mt_adaptive(x, eigvals, freq_mask)
+                               for x in np.array_split(x_mt, n_splits))
+                psd[start:stop] = np.concatenate(out)
         else:
-            n_splits = min(stop - start, n_jobs)
-            parallel, my_psd_from_mt_adaptive, n_jobs = \
-                parallel_func(_psd_from_mt_adaptive, n_splits)
-            out = parallel(my_psd_from_mt_adaptive(x, eigvals, freq_mask)
-                           for x in np.array_split(x_mt, n_splits))
-            psd[start:stop] = np.concatenate(out)
+            psd[start:stop] = x_mt[:, :, freq_mask]
 
     if normalization == 'full':
         psd /= sfreq
 
     # Combining/reshaping to original data shape
-    psd.shape = dshape + (-1,)
+    last_dims = (n_freqs,) if output == 'power' else (n_tapers, n_freqs)
+    psd.shape = dshape + last_dims
     if ndim_in == 1:
         psd = psd[0]
-    return psd, freqs
+
+    if output == 'complex':
+        return psd, freqs, weights
+    else:
+        return psd, freqs
 
 
 @verbose
 def tfr_array_multitaper(epoch_data, sfreq, freqs, n_cycles=7.0,
                          zero_mean=True, time_bandwidth=None, use_fft=True,
-                         decim=1, output='complex', n_jobs=1,
+                         decim=1, output='complex', n_jobs=None,
                          verbose=None):
     """Compute Time-Frequency Representation (TFR) using DPSS tapers.
 
@@ -497,9 +524,9 @@ def tfr_array_multitaper(epoch_data, sfreq, freqs, n_cycles=7.0,
             is done after the convolutions.
     output : str, default 'complex'
 
-        * 'complex' : single trial complex.
+        * 'complex' : single trial per taper complex values.
         * 'power' : single trial power.
-        * 'phase' : single trial phase.
+        * 'phase' : single trial per taper phase.
         * 'avg_power' : average of single trial power.
         * 'itc' : inter-trial coherence.
         * 'avg_power_itc' : average of single trial power and inter-trial
@@ -512,11 +539,13 @@ def tfr_array_multitaper(epoch_data, sfreq, freqs, n_cycles=7.0,
     Returns
     -------
     out : array
-        Time frequency transform of epoch_data. If output is in ['complex',
-        'phase', 'power'], then shape of out is (n_epochs, n_chans, n_freqs,
-        n_times), else it is (n_chans, n_freqs, n_times). If output is
-        'avg_power_itc', the real values code for 'avg_power' and the
-        imaginary values code for the 'itc': out = avg_power + i * itc.
+        Time frequency transform of epoch_data. If ``output in ['complex',
+        'phase']``, then the shape of ``out`` is ``(n_epochs, n_chans,
+        n_tapers, n_freqs, n_times)``; if output is 'power', the shape of
+        ``out`` is ``(n_epochs, n_chans, n_freqs, n_times)``, else it is
+        ``(n_chans, n_freqs, n_times)``. If output is 'avg_power_itc', the real
+        values in ``out`` contain the average power and the imaginary values
+        contain the ITC: ``out = avg_power + i * itc``.
 
     See Also
     --------

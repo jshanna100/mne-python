@@ -163,7 +163,8 @@ def _split_gof(M, X, gain):
     assert gain.shape[0] == M.shape[0], (gain.shape, M.shape)
     # find an orthonormal basis for our matrices that spans the actual data
     U, s, _ = np.linalg.svd(gain, full_matrices=False)
-    U = U[:, s >= s[0] * 1e-6]
+    if U.shape[1] > 0:
+        U = U[:, s >= s[0] * 1e-6]
     # the part that gets explained
     fit_orth = U.T @ M
     # the part that got over-explained (landed in residual)
@@ -347,7 +348,7 @@ def mixed_norm(evoked, forward, noise_cov, alpha='sure', loose='auto',
     dgap_freq : int or np.inf
         The duality gap is evaluated every dgap_freq iterations. Ignored if
         solver is 'cd'.
-    %(rank_None)s
+    %(rank_none)s
 
         .. versionadded:: 0.18
     %(pick_ori)s
@@ -393,8 +394,8 @@ def mixed_norm(evoked, forward, noise_cov, alpha='sure', loose='auto',
     if dgap_freq <= 0.:
         raise ValueError('dgap_freq must be a positive integer.'
                          ' Got dgap_freq = %s' % dgap_freq)
-    if not(isinstance(sure_alpha_grid, (np.ndarray, list)) or
-           sure_alpha_grid == "auto"):
+    if not (isinstance(sure_alpha_grid, (np.ndarray, list)) or
+            sure_alpha_grid == "auto"):
         raise ValueError('If not equal to "auto" sure_alpha_grid must be an '
                          'array. Got %s' % type(sure_alpha_grid))
     if ((isinstance(sure_alpha_grid, str) and sure_alpha_grid != "auto")
@@ -613,7 +614,7 @@ def tf_mixed_norm(evoked, forward, noise_cov,
         * l1_ratio. 0 means no time regularization a.k.a. MxNE.
     dgap_freq : int or np.inf
         The duality gap is evaluated every dgap_freq iterations.
-    %(rank_None)s
+    %(rank_none)s
 
         .. versionadded:: 0.18
     %(pick_ori)s

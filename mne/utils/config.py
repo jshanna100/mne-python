@@ -11,15 +11,15 @@ import os
 import os.path as op
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import re
 
-import numpy as np
-
-from .check import (_validate_type, _check_pyqt5_version, _check_option,
+from .check import (_validate_type, _check_qt_version, _check_option,
                     _check_fname)
 from .docs import fill_doc
+from .misc import _pl
 from ._logging import warn, logger
 
 
@@ -68,12 +68,20 @@ def set_memmap_min_size(memmap_min_size):
 # List the known configuration values
 known_config_types = (
     'MNE_3D_OPTION_ANTIALIAS',
+    'MNE_3D_OPTION_DEPTH_PEELING',
+    'MNE_3D_OPTION_MULTI_SAMPLES',
+    'MNE_3D_OPTION_SMOOTH_SHADING',
+    'MNE_3D_OPTION_THEME',
     'MNE_BROWSE_RAW_SIZE',
-    'MNE_BROWSE_BACKEND',
-    'MNE_BROWSE_USE_OPENGL',
+    'MNE_BROWSER_BACKEND',
+    'MNE_BROWSER_OVERVIEW_MODE',
+    'MNE_BROWSER_PRECOMPUTE',
+    'MNE_BROWSER_THEME',
+    'MNE_BROWSER_USE_OPENGL',
     'MNE_CACHE_DIR',
     'MNE_COREG_ADVANCED_RENDERING',
     'MNE_COREG_COPY_ANNOT',
+    'MNE_COREG_FULLSCREEN',
     'MNE_COREG_GUESS_MRI_SUBJECT',
     'MNE_COREG_HEAD_HIGH_RES',
     'MNE_COREG_HEAD_OPACITY',
@@ -81,7 +89,6 @@ known_config_types = (
     'MNE_COREG_INTERACTION',
     'MNE_COREG_MARK_INSIDE',
     'MNE_COREG_PREPARE_BEM',
-    'MNE_COREG_PROJECT_EEG',
     'MNE_COREG_ORIENT_TO_SURFACE',
     'MNE_COREG_SCALE_LABELS',
     'MNE_COREG_SCALE_BY_DISTANCE',
@@ -123,6 +130,7 @@ known_config_types = (
     'MNE_KIT2FIFF_STIM_CHANNEL_THRESHOLD',
     'MNE_LOGGING_LEVEL',
     'MNE_MEMMAP_MIN_SIZE',
+    'MNE_REPR_HTML',
     'MNE_SKIP_FTP_TESTS',
     'MNE_SKIP_NETWORK_TESTS',
     'MNE_SKIP_TESTING_DATASET_TESTS',
@@ -136,6 +144,8 @@ known_config_types = (
 # These allow for partial matches, e.g. 'MNE_STIM_CHANNEL_1' is okay key
 known_config_wildcards = (
     'MNE_STIM_CHANNEL',
+    'MNE_DATASETS_FNIRS',
+    'MNE_NIRS',
 )
 
 
@@ -280,7 +290,7 @@ def set_config(key, value, home_dir=None, set_env=True):
         value = str(value)
 
     if key not in known_config_types and not \
-            any(k in key for k in known_config_wildcards):
+            any(key.startswith(k) for k in known_config_wildcards):
         warn('Setting non-standard config type: "%s"' % key)
 
     # Read all previous values
@@ -406,7 +416,7 @@ def _get_stim_channel(stim_channel, info, raise_error=True):
     stim_channel = list()
     ch_count = 0
     ch = get_config('MNE_STIM_CHANNEL')
-    while(ch is not None and ch in info['ch_names']):
+    while ch is not None and ch in info['ch_names']:
         stim_channel.append(ch)
         ch_count += 1
         ch = get_config('MNE_STIM_CHANNEL_%d' % ch_count)
@@ -439,26 +449,44 @@ def _get_root_dir():
 
 
 def _get_numpy_libs():
-    from ._testing import SilenceStdout
-    with SilenceStdout(close=False) as capture:
-        np.show_config()
-    lines = capture.getvalue().split('\n')
-    capture.close()
-    libs = []
-    for li, line in enumerate(lines):
-        for key in ('lapack', 'blas'):
-            if line.startswith('%s_opt_info' % key):
-                lib = lines[li + 1]
-                if 'NOT AVAILABLE' in lib:
-                    lib = 'unknown'
-                else:
-                    try:
-                        lib = lib.split('[')[1].split("'")[1]
-                    except IndexError:
-                        pass  # keep whatever it was
-                libs += ['%s=%s' % (key, lib)]
-    libs = ', '.join(libs)
-    return libs
+    bad_lib = 'unknown linalg bindings'
+    try:
+        from threadpoolctl import threadpool_info
+    except Exception as exc:
+        return bad_lib + f' (threadpoolctl module not found: {exc})'
+    try:
+        pools = threadpool_info()
+    except Exception as exc:
+        return bad_lib + f' (threadpoolctl failed to get info: {exc})'
+    rename = dict(
+        openblas='OpenBLAS',
+        mkl='MKL',
+    )
+    for pool in pools:
+        if pool['internal_api'] in ('openblas', 'mkl'):
+            return (
+                f'{rename[pool["internal_api"]]} '
+                f'{pool["version"]} with '
+                f'{pool["num_threads"]} thread{_pl(pool["num_threads"])}')
+    return bad_lib
+
+
+_gpu_cmd = """\
+from pyvista import GPUInfo; \
+gi = GPUInfo(); \
+print(gi.version); \
+print(gi.renderer)"""
+
+
+def _get_gpu_info():
+    # Once https://github.com/pyvista/pyvista/pull/2250 is merged and PyVista
+    # does a release, we can triage based on version > 0.33.2
+    proc = subprocess.run(
+        [sys.executable, '-c', _gpu_cmd], check=False, capture_output=True)
+    out = proc.stdout.decode().strip().replace('\r', '').split('\n')
+    if proc.returncode or len(out) != 2:
+        return None, None
+    return out
 
 
 def sys_info(fid=None, show_paths=False, *, dependencies='user'):
@@ -474,9 +502,9 @@ def sys_info(fid=None, show_paths=False, *, dependencies='user'):
         Can be None to use :data:`sys.stdout`.
     show_paths : bool
         If True, print paths for each module.
-    dependencies : str
-        Can be "user" (default) to show user-relevant dependencies, or
-        "developer" to additionally show developer dependencies.
+    dependencies : 'user' | 'developer'
+        Show dependencies relevant for users (default) or for developers
+        (i.e., output includes additional dependencies).
 
         .. versionadded:: 0.24
 
@@ -507,12 +535,13 @@ def sys_info(fid=None, show_paths=False, *, dependencies='user'):
         pandas:        1.0.5
         pyvista:       0.25.3 {pyvistaqt=0.1.1, OpenGL 3.3 (Core Profile) Mesa 18.3.6 via llvmpipe (LLVM 7.0, 256 bits)}
         vtk:           9.0.1
-        PyQt5:         5.15.0
+        qtpy:          2.0.1 {PySide6=6.2.4}
+        pyqtgraph:     0.12.4
         pooch:         v1.5.1
     """  # noqa: E501
     _validate_type(dependencies, str)
     _check_option('dependencies', dependencies, ('user', 'developer'))
-    ljust = 21 if dependencies == 'developer' else 16
+    ljust = 21 if dependencies == 'developer' else 18
     platform_str = platform.platform()
     if platform.system() == 'Darwin' and sys.version_info[:2] < (3, 8):
         # platform.platform() in Python < 3.8 doesn't call
@@ -525,69 +554,73 @@ def sys_info(fid=None, show_paths=False, *, dependencies='user'):
             platform_str = f'macOS-{macos_ver}-{macos_architecture}'
         del macos_ver, macos_architecture
 
-    out = 'Platform:'.ljust(ljust) + platform_str + '\n'
-    out += 'Python:'.ljust(ljust) + str(sys.version).replace('\n', ' ') + '\n'
-    out += 'Executable:'.ljust(ljust) + sys.executable + '\n'
-    out += 'CPU:'.ljust(ljust) + ('%s: ' % platform.processor())
+    out = partial(print, end='', file=fid)
+    out('Platform:'.ljust(ljust) + platform_str + '\n')
+    out('Python:'.ljust(ljust) + str(sys.version).replace('\n', ' ') + '\n')
+    out('Executable:'.ljust(ljust) + sys.executable + '\n')
+    out('CPU:'.ljust(ljust) + f'{platform.processor()}: ')
     try:
         import multiprocessing
     except ImportError:
-        out += ('number of processors unavailable ' +
-                '(requires "multiprocessing" package)\n')
+        out('number of processors unavailable '
+            '(requires "multiprocessing" package)\n')
     else:
-        out += '%s cores\n' % multiprocessing.cpu_count()
-    out += 'Memory:'.ljust(ljust)
+        out(f'{multiprocessing.cpu_count()} cores\n')
+    out('Memory:'.ljust(ljust))
     try:
         import psutil
     except ImportError:
-        out += 'Unavailable (requires "psutil" package)'
+        out('Unavailable (requires "psutil" package)')
     else:
-        out += '%0.1f GB\n' % (psutil.virtual_memory().total / float(2 ** 30),)
-    out += '\n'
+        out(f'{psutil.virtual_memory().total / float(2 ** 30):0.1f} GB\n')
+    out('\n')
     libs = _get_numpy_libs()
     use_mod_names = ('mne', 'numpy', 'scipy', 'matplotlib', '', 'sklearn',
-                     'numba', 'nibabel', 'nilearn', 'dipy', 'cupy', 'pandas',
-                     'pyvista', 'pyvistaqt', 'ipyvtklink', 'vtk',
-                     'PyQt5', 'ipympl', 'mne_qt_browser')
+                     'numba', 'nibabel', 'nilearn', 'dipy', 'openmeeg', 'cupy',
+                     'pandas', 'pyvista', 'pyvistaqt', 'ipyvtklink', 'vtk',
+                     'qtpy', 'ipympl', 'pyqtgraph', 'pooch', '', 'mne_bids',
+                     'mne_nirs', 'mne_features', 'mne_qt_browser',
+                     'mne_connectivity', 'mne_icalabel')
     if dependencies == 'developer':
         use_mod_names += (
             '', 'sphinx', 'sphinx_gallery', 'numpydoc', 'pydata_sphinx_theme',
-            'mne_bids', 'pytest', 'nbclient')
+            'pytest', 'nbclient')
     for mod_name in use_mod_names:
         if mod_name == '':
-            out += '\n'
+            out('\n')
             continue
-        out += ('%s:' % mod_name).ljust(ljust)
+        out(f'{mod_name}:'.ljust(ljust))
         try:
             mod = __import__(mod_name)
         except Exception:
-            out += 'Not found\n'
+            out('Not found\n')
         else:
-            extra = ''
-            if mod_name == 'numpy':
-                extra += ' {%s}%s' % (libs, extra)
-            elif mod_name == 'matplotlib':
-                extra += ' {backend=%s}%s' % (mod.get_backend(), extra)
-            elif mod_name == 'pyvista':
-                try:
-                    from pyvista import GPUInfo
-                except ImportError:
-                    pass
-                else:
-                    gi = GPUInfo()
-                    extra += f' {{OpenGL {gi.version} via {gi.renderer}}}'
             if mod_name == 'vtk':
-                version = mod.vtkVersion()
+                vtk_version = mod.vtkVersion()
                 # 9.0 dev has VersionFull but 9.0 doesn't
                 for attr in ('GetVTKVersionFull', 'GetVTKVersion'):
-                    if hasattr(version, attr):
-                        version = getattr(version, attr)()
-                        break
-            elif mod_name == 'PyQt5':
-                version = _check_pyqt5_version()
+                    if hasattr(vtk_version, attr):
+                        version = getattr(vtk_version, attr)()
+                        if version != '':
+                            out(version)
+                            break
+                else:
+                    out('unknown')
             else:
-                version = mod.__version__
+                out(mod.__version__)
+            if mod_name == 'numpy':
+                out(f' {{{libs}}}')
+            elif mod_name == 'qtpy':
+                version, api = _check_qt_version(return_api=True)
+                out(f' {{{api}={version}}}')
+            elif mod_name == 'matplotlib':
+                out(f' {{backend={mod.get_backend()}}}')
+            elif mod_name == 'pyvista':
+                version, renderer = _get_gpu_info()
+                if version is None:
+                    out(' {OpenGL could not be initialized}')
+                else:
+                    out(f' {{OpenGL {version} via {renderer}}}')
             if show_paths:
-                extra += f'\n{" " * ljust}•{op.dirname(mod.__file__)}'
-            out += '%s%s\n' % (version, extra)
-    print(out, end='', file=fid)
+                out(f'\n{" " * ljust}•{op.dirname(mod.__file__)}')
+            out('\n')

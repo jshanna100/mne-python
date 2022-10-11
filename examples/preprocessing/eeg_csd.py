@@ -1,4 +1,7 @@
+# -*- coding: utf-8 -*-
 """
+.. _ex-eeg-csd:
+
 =====================================================
 Transform EEG data using current source density (CSD)
 =====================================================
@@ -30,7 +33,8 @@ data_path = sample.data_path()
 
 # %%
 # Load sample subject data
-raw = mne.io.read_raw_fif(data_path + '/MEG/sample/sample_audvis_raw.fif')
+meg_path = data_path / 'MEG' / 'sample'
+raw = mne.io.read_raw_fif(meg_path / 'sample_audvis_raw.fif')
 raw = raw.pick_types(meg=False, eeg=True, eog=True, ecg=True, stim=True,
                      exclude=raw.info['bads']).load_data()
 events = mne.find_events(raw)
@@ -79,7 +83,7 @@ for i, lambda2 in enumerate([0, 1e-7, 1e-5, 1e-3]):
         this_evoked_csd = mne.preprocessing.compute_current_source_density(
             evoked, stiffness=m, lambda2=lambda2)
         this_evoked_csd.plot_topomap(
-            0.1, axes=ax[i, j], outlines='skirt', contours=4, time_unit='s',
+            0.1, axes=ax[i, j], contours=4, time_unit='s',
             colorbar=False, show=False)
         ax[i, j].set_title('stiffness=%i\nλ²=%s' % (m, lambda2))
 

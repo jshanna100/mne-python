@@ -1,15 +1,20 @@
+# -*- coding: utf-8 -*-
+# Author: Eric Larson <larson.eric.d@gmail.com>
+#
+# License: BSD-3-Clause
+
+import importlib
 import inspect
 from inspect import getsource
 import os.path as op
+from pathlib import Path
 from pkgutil import walk_packages
 import re
-import sys
-from unittest import SkipTest
 
 import pytest
 
 import mne
-from mne.utils import requires_numpydoc, _pl
+from mne.utils import requires_numpydoc, _pl, _record_warnings
 
 public_modules = [
     # the list of modules users need to access for all functionality
@@ -64,15 +69,12 @@ def _func_name(func, cls=None):
 
 # functions to ignore args / docstring of
 docstring_ignores = {
-    'mne.externals',
     'mne.fixes',
     'mne.io.write',
     'mne.io.meas_info.Info',
 }
 char_limit = 800  # XX eventually we should probably get this lower
 tab_ignores = [
-    'mne.externals.tqdm._tqdm.__main__',
-    'mne.externals.tqdm._tqdm.cli',
     'mne.channels.tests.test_montage',
     'mne.io.curry.tests.test_curry',
 ]
@@ -117,6 +119,31 @@ def check_parameters_match(func, cls=None):
                  for err in validate(name)['errors']
                  if err[0] not in error_ignores and
                  (name.split('.')[-1], err[0]) not in error_ignores_specific]
+    # Add a check that all public functions and methods that have "verbose"
+    # set the default verbose=None
+    if cls is None:
+        mod_or_class = importlib.import_module('.'.join(name.split('.')[:-1]))
+    else:
+        mod_or_class = importlib.import_module('.'.join(name.split('.')[:-2]))
+        mod_or_class = getattr(mod_or_class, cls.__name__.split('.')[-1])
+    callable_ = getattr(mod_or_class, name.split('.')[-1])
+    try:
+        sig = inspect.signature(callable_)
+    except ValueError as exc:
+        msg = str(exc)
+        # E   ValueError: no signature found for builtin type
+        #     <class 'mne.forward.forward.Forward'>
+        if inspect.isclass(callable_) and 'no signature found for buil' in msg:
+            pass
+        else:
+            raise
+    else:
+        if 'verbose' in sig.parameters:
+            verbose_default = sig.parameters['verbose'].default
+            if verbose_default is not None:
+                incorrect += [
+                    f'{name} : verbose default is not None, '
+                    f'got: {verbose_default}']
     return incorrect
 
 
@@ -132,7 +159,7 @@ def test_docstring_parameters():
         if name not in ('mne', 'mne.gui'):
             extra = name.split('.')[1]
             assert hasattr(mne, extra)
-        with pytest.warns(None):  # traits warnings
+        with _record_warnings():  # traits warnings
             module = __import__(name, globals())
         for submod in name.split('.')[1:]:
             module = getattr(module, submod)
@@ -146,7 +173,8 @@ def test_docstring_parameters():
                 method = getattr(cls, method_name)
                 incorrect += check_parameters_match(method, cls=cls)
             if hasattr(cls, '__call__') and \
-                    'of type object' not in str(cls.__call__):
+                    'of type object' not in str(cls.__call__) and \
+                    'of ABCMeta object' not in str(cls.__call__):
                 incorrect += check_parameters_match(cls.__call__, cls)
         functions = inspect.getmembers(module, inspect.isfunction)
         for fname, func in functions:
@@ -165,17 +193,11 @@ def test_tabs():
     for _, modname, ispkg in walk_packages(mne.__path__, prefix='mne.'):
         # because we don't import e.g. mne.tests w/mne
         if not ispkg and modname not in tab_ignores:
-            # mod = importlib.import_module(modname)  # not py26 compatible!
             try:
-                with pytest.warns(None):
-                    __import__(modname)
-            except Exception:  # can't import properly
+                mod = importlib.import_module(modname)
+            except Exception:  # e.g., mne.export not having pybv
                 continue
-            mod = sys.modules[modname]
-            try:
-                source = getsource(mod)
-            except IOError:  # user probably should have run "make clean"
-                continue
+            source = getsource(mod)
             assert '\t' not in source, ('"%s" has tabs, please remove them '
                                         'or add it to the ignore list'
                                         % modname)
@@ -203,7 +225,6 @@ adjust_axes
 apply_maxfilter
 apply_trans
 channel_type
-check_n_jobs
 combine_kit_markers
 combine_tfr
 combine_transforms
@@ -250,7 +271,7 @@ def test_documented():
     doc_dir = op.abspath(op.join(op.dirname(__file__), '..', '..', 'doc'))
     doc_file = op.join(doc_dir, 'python_reference.rst')
     if not op.isfile(doc_file):
-        raise SkipTest('Documentation file not found: %s' % doc_file)
+        pytest.skip('Documentation file not found: %s' % doc_file)
     api_files = (
         'covariance', 'creating_from_arrays', 'datasets',
         'decoding', 'events', 'file_io', 'forward', 'inverse', 'logging',
@@ -271,7 +292,7 @@ def test_documented():
 
     missing = []
     for name in public_modules:
-        with pytest.warns(None):  # traits warnings
+        with _record_warnings():  # traits warnings
             module = __import__(name, globals())
         for submod in name.split('.')[1:]:
             module = getattr(module, submod)
@@ -282,7 +303,6 @@ def test_documented():
             if not name.startswith('_') and name not in known_names:
                 from_mod = inspect.getmodule(cf).__name__
                 if (from_mod.startswith('mne') and
-                        not from_mod.startswith('mne.externals') and
                         not any(from_mod.startswith(x)
                                 for x in documented_ignored_mods) and
                         name not in documented_ignored_names and
@@ -292,3 +312,19 @@ def test_documented():
         raise AssertionError('\n\nFound new public members missing from '
                              'doc/python_reference.rst:\n\n* ' +
                              '\n* '.join(sorted(set(missing))))
+
+
+def test_docdict_order():
+    """Test that docdict is alphabetical."""
+    from mne.utils.docs import docdict
+
+    # read the file as text, and get entries via regex
+    docs_path = Path(__file__).parent.parent / 'utils' / 'docs.py'
+    assert docs_path.is_file(), docs_path
+    with open(docs_path, 'r', encoding='UTF-8') as fid:
+        docs = fid.read()
+    entries = re.findall(r'docdict\[["\'](.+)["\']\] = ', docs)
+    # test length & uniqueness
+    assert len(docdict) == len(entries)
+    # test order
+    assert sorted(entries) == entries

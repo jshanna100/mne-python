@@ -14,11 +14,12 @@ import datetime
 from io import BytesIO
 import operator
 from textwrap import shorten
+import string
 
 import numpy as np
 
-from .pick import (channel_type, pick_channels, pick_info,
-                   get_channel_type_constants, pick_types)
+from .pick import (channel_type, _get_channel_types,
+                   get_channel_type_constants, pick_types, _contains_ch_type)
 from .constants import FIFF, _coord_frame_named
 from .open import fiff_open
 from .tree import dir_tree_find
@@ -27,22 +28,23 @@ from .tag import (read_tag, find_tag, _ch_coord_dict, _update_ch_info_named,
 from .proj import (_read_proj, _write_proj, _uniquify_projs, _normalize_proj,
                    _proj_equal, Projection)
 from .ctf_comp import _read_ctf_comp, write_ctf_comp
-from .write import (start_file, end_file, start_block, end_block,
+from .write import (start_and_end_file, start_block, end_block,
                     write_string, write_dig_points, write_float, write_int,
                     write_coord_trans, write_ch_info, write_name_list,
                     write_julian, write_float_matrix, write_id, DATE_NONE)
 from .proc_history import _read_proc_history, _write_proc_history
 from ..transforms import (invert_transform, Transform, _coord_frame_name,
-                          _ensure_trans)
+                          _ensure_trans, _frame_to_str)
 from ..utils import (logger, verbose, warn, object_diff, _validate_type,
                      _stamp_to_dt, _dt_to_stamp, _pl, _is_numeric,
-                     _check_option, _on_missing, _check_on_missing, fill_doc)
+                     _check_option, _on_missing, _check_on_missing, fill_doc,
+                     _check_fname, repr_html)
 from ._digitization import (_format_dig_points, _dig_kind_proper, DigPoint,
                             _dig_kind_rev, _dig_kind_ints, _read_dig_fif)
-from ._digitization import write_dig as _dig_write_dig
+from ._digitization import write_dig, _get_data_as_dict_from_dig
 from .compensator import get_current_comp
-from ..data.html_templates import info_template
 from ..defaults import _handle_default
+
 
 b = bytes  # alias
 
@@ -109,6 +111,7 @@ def _get_valid_units():
 @verbose
 def _unique_channel_names(ch_names, max_length=None, verbose=None):
     """Ensure unique channel names."""
+    suffixes = tuple(string.ascii_lowercase)
     if max_length is not None:
         ch_names[:] = [name[:max_length] for name in ch_names]
     unique_ids = np.unique(ch_names, return_index=True)[1]
@@ -129,19 +132,71 @@ def _unique_channel_names(ch_names, max_length=None, verbose=None):
             n_keep = min(len(ch_stem), n_keep)
             ch_stem = ch_stem[:n_keep]
             for idx, ch_idx in enumerate(overlaps):
-                ch_name = ch_stem + '-%s' % idx
+                # try idx first, then loop through lower case chars
+                for suffix in (idx,) + suffixes:
+                    ch_name = ch_stem + '-%s' % suffix
+                    if ch_name not in ch_names:
+                        break
                 if ch_name not in ch_names:
                     ch_names[ch_idx] = ch_name
                 else:
-                    raise ValueError('Adding a running number for a '
+                    raise ValueError('Adding a single alphanumeric for a '
                                      'duplicate resulted in another '
                                      'duplicate name %s' % ch_name)
-
     return ch_names
 
 
 class MontageMixin(object):
-    """Mixin for Montage setting."""
+    """Mixin for Montage getting and setting."""
+
+    @fill_doc
+    def get_montage(self):
+        """Get a DigMontage from instance.
+
+        Returns
+        -------
+        %(montage)s
+        """
+        from ..channels.montage import make_dig_montage
+        info = self if isinstance(self, Info) else self.info
+        if info['dig'] is None:
+            return None
+        # obtain coord_frame, and landmark coords
+        # (nasion, lpa, rpa, hsp, hpi) from DigPoints
+        montage_bunch = _get_data_as_dict_from_dig(info['dig'])
+        coord_frame = _frame_to_str.get(montage_bunch.coord_frame)
+
+        # get the channel names and chs data structure
+        ch_names, chs = info['ch_names'], info['chs']
+        picks = pick_types(info, meg=False, eeg=True, seeg=True,
+                           ecog=True, dbs=True, fnirs=True, exclude=[])
+
+        # channel positions from dig do not match ch_names one to one,
+        # so use loc[:3] instead
+        ch_pos = {ch_names[ii]: chs[ii]['loc'][:3] for ii in picks}
+
+        # fNIRS uses multiple channels for the same sensors, we use
+        # a private function to format these for dig montage.
+        fnirs_picks = pick_types(info, fnirs=True, exclude=[])
+        if len(ch_pos) == len(fnirs_picks):
+            ch_pos = _get_fnirs_ch_pos(info)
+        elif len(fnirs_picks) > 0:
+            raise ValueError("MNE does not support getting the montage "
+                             "for a mix of fNIRS and other data types. "
+                             "Please raise a GitHub issue if you "
+                             "require this feature.")
+
+        # create montage
+        montage = make_dig_montage(
+            ch_pos=ch_pos,
+            coord_frame=coord_frame,
+            nasion=montage_bunch.nasion,
+            lpa=montage_bunch.lpa,
+            rpa=montage_bunch.rpa,
+            hsp=montage_bunch.hsp,
+            hpi=montage_bunch.hpi,
+        )
+        return montage
 
     @verbose
     def set_montage(self, montage, match_case=True, match_alias=False,
@@ -154,17 +209,21 @@ class MontageMixin(object):
         %(match_case)s
         %(match_alias)s
         %(on_missing_montage)s
-        %(verbose_meth)s
+        %(verbose)s
 
         Returns
         -------
         inst : instance of Raw | Epochs | Evoked
-            The instance.
+            The instance, modified in-place.
+
+        See Also
+        --------
+        mne.channels.make_standard_montage
+        mne.channels.make_dig_montage
+        mne.channels.read_custom_montage
 
         Notes
         -----
-        Operates in place.
-
         .. warning::
             Only %(montage_types)s channels can have their positions set using
             a montage. Other channel types (e.g., MEG channels) should have
@@ -178,6 +237,68 @@ class MontageMixin(object):
         info = self if isinstance(self, Info) else self.info
         _set_montage(info, montage, match_case, match_alias, on_missing)
         return self
+
+
+class ContainsMixin(object):
+    """Mixin class for Raw, Evoked, Epochs and Info."""
+
+    def __contains__(self, ch_type):
+        """Check channel type membership.
+
+        Parameters
+        ----------
+        ch_type : str
+            Channel type to check for. Can be e.g. 'meg', 'eeg', 'stim', etc.
+
+        Returns
+        -------
+        in : bool
+            Whether or not the instance contains the given channel type.
+
+        Examples
+        --------
+        Channel type membership can be tested as::
+
+            >>> 'meg' in inst  # doctest: +SKIP
+            True
+            >>> 'seeg' in inst  # doctest: +SKIP
+            False
+
+        """
+        info = self if isinstance(self, Info) else self.info
+        if ch_type == 'meg':
+            has_ch_type = (_contains_ch_type(info, 'mag') or
+                           _contains_ch_type(info, 'grad'))
+        else:
+            has_ch_type = _contains_ch_type(info, ch_type)
+        return has_ch_type
+
+    @property
+    def compensation_grade(self):
+        """The current gradient compensation grade."""
+        info = self if isinstance(self, Info) else self.info
+        return get_current_comp(info)
+
+    @fill_doc
+    def get_channel_types(self, picks=None, unique=False, only_data_chs=False):
+        """Get a list of channel type for each channel.
+
+        Parameters
+        ----------
+        %(picks_all)s
+        unique : bool
+            Whether to return only unique channel types. Default is ``False``.
+        only_data_chs : bool
+            Whether to ignore non-data channels. Default is ``False``.
+
+        Returns
+        -------
+        channel_types : list
+            The channel types.
+        """
+        info = self if isinstance(self, Info) else self.info
+        return _get_channel_types(info, picks=picks, unique=unique,
+                                  only_data_chs=only_data_chs)
 
 
 def _format_trans(obj, key):
@@ -247,7 +368,7 @@ def _check_helium_info(helium_info):
     return helium_info
 
 
-class Info(dict, MontageMixin):
+class Info(dict, MontageMixin, ContainsMixin):
     """Measurement information.
 
     This data structure behaves like a dictionary. It contains all metadata
@@ -256,16 +377,21 @@ class Info(dict, MontageMixin):
     `FIF format specification <https://github.com/mne-tools/fiff-constants>`__,
     so new entries should not be manually added.
 
-    .. warning:: The only entries that should be manually changed by the user
-                 are ``info['bads']``, ``info['description']``,
-                 ``info['experimenter']`` and ``info['line_freq']``. All other
-                 entries should be considered read-only, though they can be
-                 modified by various MNE-Python functions or methods (which
-                 have safeguards to ensure all fields remain in sync).
+    .. note::
+        This class should not be instantiated directly via
+        ``mne.Info(...)``. Instead, use :func:`mne.create_info` to create
+        measurement information from scratch.
 
-    .. warning:: This class should not be instantiated directly. To create a
-                 measurement information structure, use
-                 :func:`mne.create_info`.
+    .. warning::
+        The only entries that should be manually changed by the user are:
+        ``info['bads']``, ``info['description']``, ``info['device_info']``
+        ``info['dev_head_t']``, ``info['experimenter']``,
+        ``info['helium_info']``, ``info['line_freq']``, ``info['temp']``,
+        and ``info['subject_info']``.
+
+        All other entries should be considered read-only, though they can be
+        modified by various MNE-Python functions or methods (which have
+        safeguards to ensure all fields remain in sync).
 
     Parameters
     ----------
@@ -289,10 +415,13 @@ class Info(dict, MontageMixin):
     chs : list of dict
         A list of channel information dictionaries, one per channel.
         See Notes for more information.
+    command_line : str
+        Contains the command and arguments used to create the source space
+        (used for source estimation).
     comps : list of dict
         CTF software gradient compensation data.
         See Notes for more information.
-    ctf_head_t : dict | None
+    ctf_head_t : Transform | None
         The transformation from 4D/CTF head coordinates to Neuromag head
         coordinates. This is only present in 4D/CTF data.
     custom_ref_applied : int
@@ -301,11 +430,15 @@ class Info(dict, MontageMixin):
         average reference to be set.
     description : str | None
         String description of the recording.
-    dev_ctf_t : dict | None
+    dev_ctf_t : Transform | None
         The transformation from device coordinates to 4D/CTF head coordinates.
         This is only present in 4D/CTF data.
-    dev_head_t : dict | None
+    dev_head_t : Transform | None
         The device to head transformation.
+    device_info : dict | None
+        Information about the acquisition device. See Notes for details.
+
+        .. versionadded:: 0.19
     dig : list of dict | None
         The Polhemus digitization data in head coordinates.
         See Notes for more information.
@@ -318,6 +451,12 @@ class Info(dict, MontageMixin):
         Name of the person that ran the experiment.
     file_id : dict | None
         The FIF globally unique ID. See Notes for more information.
+    gantry_angle : float | None
+        Tilt angle of the gantry in degrees.
+    helium_info : dict | None
+        Information about the device helium. See Notes for details.
+
+        .. versionadded:: 0.19
     highpass : float
         Highpass corner frequency in Hertz. Zero indicates a DC recording.
     hpi_meas : list of dict
@@ -332,27 +471,35 @@ class Info(dict, MontageMixin):
         Information about the HPI subsystem that was used (e.g., event
         channel used for cHPI measurements).
         See Notes for details.
+    kit_system_id : int
+        Identifies the KIT system.
     line_freq : float | None
         Frequency of the power line in Hertz.
-    gantry_angle : float | None
-        Tilt angle of the gantry in degrees.
     lowpass : float
         Lowpass corner frequency in Hertz.
         It is automatically set to half the sampling rate if there is
         otherwise no low-pass applied to the data.
+    maxshield : bool
+        True if active shielding (IAS) was active during recording.
     meas_date : datetime
         The time (UTC) of the recording.
 
         .. versionchanged:: 0.20
            This is stored as a :class:`~python:datetime.datetime` object
            instead of a tuple of seconds/microseconds.
-    utc_offset : str
-        "UTC offset of related meas_date (sHH:MM).
-
-        .. versionadded:: 0.19
+    meas_file : str | None
+        Raw measurement file (used for source estimation).
     meas_id : dict | None
         The ID assigned to this measurement by the acquisition system or
         during file conversion. Follows the same format as ``file_id``.
+    mri_file : str | None
+        File containing the MRI to head transformation (used for source
+        estimation).
+    mri_head_t : dict | None
+        Transformation from MRI to head coordinates (used for source
+        estimation).
+    mri_id : dict | None
+        MRI unique ID (used for source estimation).
     nchan : int
         Number of channels.
     proc_history : list of dict
@@ -370,19 +517,20 @@ class Info(dict, MontageMixin):
     subject_info : dict | None
         Information about the subject.
         See Notes for details.
-    device_info : dict | None
-        Information about the acquisition device. See Notes for details.
-
-        .. versionadded:: 0.19
-    helium_info : dict | None
-        Information about the device helium. See Notes for details.
-
-        .. versionadded:: 0.19
     temp : object | None
         Can be used to store temporary objects in an Info instance. It will not
         survive an I/O roundtrip.
 
         .. versionadded:: 0.24
+    utc_offset : str
+        "UTC offset of related meas_date (sHH:MM).
+
+        .. versionadded:: 0.19
+    working_dir : str
+        Working directory used when the source space was created (used for
+        source estimation).
+    xplotter_layout : str
+        Layout of the Xplotter (Neuromag system only).
 
     See Also
     --------
@@ -440,6 +588,17 @@ class Info(dict, MontageMixin):
         save_calibrated : bool
             Were the compensation data saved in calibrated form.
 
+    * ``device_info`` dict:
+
+        type : str
+            Device type.
+        model : str
+            Device model.
+        serial : str
+            Device serial.
+        site : str
+            Device site.
+
     * ``dig`` list of dict:
 
         kind : int
@@ -471,6 +630,17 @@ class Info(dict, MontageMixin):
             Time in seconds.
         usecs : int
             Time in microseconds.
+
+    * ``helium_info`` dict:
+
+        he_level_raw : float
+            Helium level (%) before position correction.
+        helium_level : float
+            Helium level (%) after position correction.
+        orig_file_guid : str
+            Original file GUID.
+        meas_date : tuple of int
+            The helium level meas date.
 
     * ``hpi_meas`` list of dict:
 
@@ -535,6 +705,17 @@ class Info(dict, MontageMixin):
             (using the first element of these arrays is typically
             sufficient).
 
+    * ``mri_id`` dict:
+
+        version : int
+            FIF format version, i.e. ``FIFFC_VERSION``.
+        machid : ndarray, shape (2,)
+            Unique machine ID, usually derived from the MAC address.
+        secs : int
+            Time in seconds.
+        usecs : int
+            Time in microseconds.
+
     * ``proc_history`` list of dict:
 
         block_id : dict
@@ -559,7 +740,7 @@ class Info(dict, MontageMixin):
         smartshield : dict
             MaxShield information. This dictionary is (always?) empty,
             but its presence implies that MaxShield was used during
-            acquisiton.
+            acquisition.
 
     * ``subject_info`` dict:
 
@@ -579,35 +760,16 @@ class Info(dict, MontageMixin):
             Subject sex (0=unknown, 1=male, 2=female).
         hand : int
             Handedness (1=right, 2=left, 3=ambidextrous).
-
-    * ``device_info`` dict:
-
-        type : str
-            Device type.
-        model : str
-            Device model.
-        serial : str
-            Device serial.
-        site : str
-            Device site.
-
-    * ``helium_info`` dict:
-
-        he_level_raw : float
-            Helium level (%) before position correction.
-        helium_level : float
-            Helium level (%) after position correction.
-        orig_file_guid : str
-            Original file GUID.
-        meas_date : tuple of int
-            The helium level meas date.
+        weight : float
+            Weight in kilograms.
+        height : float
+            Height in meters.
     """
 
     _attributes = {
         'acq_pars': 'acq_pars cannot be set directly. '
                     'See mne.AcqParserFIF() for details.',
-        'acq_stim': 'acq_stim cannot be set directly. '
-                    'Please use ...',
+        'acq_stim': 'acq_stim cannot be set directly.',
         'bads': _check_bads,
         'ch_names': 'ch_names cannot be set directly. '
                     'Please use methods inst.add_channels(), '
@@ -619,54 +781,57 @@ class Info(dict, MontageMixin):
                'inst.drop_channels(), inst.pick_channels(), '
                'inst.rename_channels(), inst.reorder_channels() '
                'and inst.set_channel_types() instead.',
+        'command_line': 'command_line cannot be set directly.',
         'comps': 'comps cannot be set directly. '
-                 'Please use mne.io.Raw.apply_gradient_compensation() '
+                 'Please use method Raw.apply_gradient_compensation() '
                  'instead.',
         'ctf_head_t': 'ctf_head_t cannot be set directly.',
         'custom_ref_applied': 'custom_ref_applied cannot be set directly. '
-                              'Please use inst.set_eeg_reference() instead.',
+                              'Please use method inst.set_eeg_reference() '
+                              'instead.',
         'description': _check_description,
         'dev_ctf_t': 'dev_ctf_t cannot be set directly.',
         'dev_head_t': _check_dev_head_t,
-        'dig': 'dig cannot be set directly. Please use inst.set_montage() '
-               'instead.',
+        'device_info': _check_device_info,
+        'dig': 'dig cannot be set directly. '
+               'Please use method inst.set_montage() instead.',
         'events': 'events cannot be set directly.',
         'experimenter': _check_experimenter,
         'file_id': 'file_id cannot be set directly.',
+        'gantry_angle': 'gantry_angle cannot be set directly.',
+        'helium_info': _check_helium_info,
         'highpass': 'highpass cannot be set directly. '
-                    'Please use methods inst.filter() instead.',
+                    'Please use method inst.filter() instead.',
         'hpi_meas': 'hpi_meas can not be set directly.',
         'hpi_results': 'hpi_results cannot be set directly.',
         'hpi_subsystem': 'hpi_subsystem cannot be set directly.',
+        'kit_system_id': 'kit_system_id cannot be set directly.',
         'line_freq': _check_line_freq,
-        'gantry_angle': 'gantry_angle cannot be set directly.',
         'lowpass': 'lowpass cannot be set directly. '
                    'Please use method inst.filter() instead.',
+        'maxshield': 'maxshield cannot be set directly.',
         'meas_date': 'meas_date cannot be set directly. '
                      'Please use method inst.set_meas_date() instead.',
-        'utc_offset': 'utc_offset cannot be set directly.',
-        'meas_id': 'meas_id cannot be set directly.',
-        'nchan': 'nchan cannot be set directly.',
-        'proc_history': 'proc_history cannot be set directly.',
-        'proj_id': 'proj_id cannot be set directly.',
-        'proj_name': 'proj_name cannot be set directly.',
-        'projs': 'projs cannot be set directly.',
-        'sfreq': 'sfreq cannot be set directly. '
-                 'Please use method inst.resample() instead.',
-        'subject_info': _check_subject_info,
-        'device_info': _check_device_info,
-        'helium_info': _check_helium_info,
-        # elements missing from docstring
-        'command_line': 'command_line cannot be set directly.',
-        'filename': 'filename cannot be set directly.',  # deprecated?
-        'kit_system_id': 'kit_system_id cannot be set directly.',
-        'maxshield': 'maxshield cannot be set directly.',
         'meas_file': 'meas_file cannot be set directly.',
+        'meas_id': 'meas_id cannot be set directly.',
         'mri_file': 'mri_file cannot be set directly.',
         'mri_head_t': 'mri_head_t cannot be set directly.',
         'mri_id': 'mri_id cannot be set directly.',
-        'working_dir': 'working_dir cannot be set directly.',
+        'nchan': 'nchan cannot be set directly. '
+                 'Please use methods inst.add_channels(), '
+                 'inst.drop_channels(), and inst.pick_channels() instead.',
+        'proc_history': 'proc_history cannot be set directly.',
+        'proj_id': 'proj_id cannot be set directly.',
+        'proj_name': 'proj_name cannot be set directly.',
+        'projs': 'projs cannot be set directly. '
+                 'Please use methods inst.add_proj() and inst.del_proj() '
+                 'instead.',
+        'sfreq': 'sfreq cannot be set directly. '
+                 'Please use method inst.resample() instead.',
+        'subject_info': _check_subject_info,
         'temp': lambda x: x,
+        'utc_offset': 'utc_offset cannot be set directly.',
+        'working_dir': 'working_dir cannot be set directly.',
         'xplotter_layout': 'xplotter_layout cannot be set directly.'
     }
 
@@ -689,7 +854,7 @@ class Info(dict, MontageMixin):
             self['chs'] = _dict_unpack(self['chs'], _CH_CAST)
         for pi, proj in enumerate(self.get('projs', [])):
             if not isinstance(proj, Projection):
-                self['projs'][pi] = Projection(proj)
+                self['projs'][pi] = Projection(**proj)
         # Old files could have meas_date as tuple instead of datetime
         try:
             meas_date = self['meas_date']
@@ -932,6 +1097,12 @@ class Info(dict, MontageMixin):
                 if self.get(key) is not None:
                     self[key] = float(self[key])
 
+        for pi, proj in enumerate(self.get('projs', [])):
+            _validate_type(proj, Projection, f'info["projs"][{pi}]')
+            for key in ('kind', 'active', 'desc', 'data', 'explained_var'):
+                if key not in proj:
+                    raise RuntimeError(f'Projection incomplete, missing {key}')
+
         # Ensure info['chs'] has immutable entries (copies much faster)
         for ci, ch in enumerate(self['chs']):
             _check_ch_keys(ch, ci)
@@ -958,41 +1129,11 @@ class Info(dict, MontageMixin):
             for idx, ch_name in enumerate(self['ch_names']):
                 self['chs'][idx]['ch_name'] = ch_name
 
-        if 'filename' in self:
-            warn('the "filename" key is misleading '
-                 'and info should not have it')
-
     def _update_redundant(self):
         """Update the redundant entries."""
         with self._unlock():
             self['ch_names'] = [ch['ch_name'] for ch in self['chs']]
             self['nchan'] = len(self['chs'])
-
-    def pick_channels(self, ch_names, ordered=False):
-        """Pick channels from this Info object.
-
-        Parameters
-        ----------
-        ch_names : list of str
-            List of channels to keep. All other channels are dropped.
-        ordered : bool
-            If True (default False), ensure that the order of the channels
-            matches the order of ``ch_names``.
-
-        Returns
-        -------
-        info : instance of Info.
-            The modified Info object.
-
-        Notes
-        -----
-        Operates in-place.
-
-        .. versionadded:: 0.20.0
-        """
-        sel = pick_channels(self.ch_names, ch_names, exclude=[],
-                            ordered=ordered)
-        return pick_info(self, sel, copy=False, verbose=False)
 
     @property
     def ch_names(self):
@@ -1035,8 +1176,10 @@ class Info(dict, MontageMixin):
 
         return good_channels, bad_channels, ecg, eog
 
+    @repr_html
     def _repr_html_(self, caption=None):
         """Summarize info for HTML representation."""
+        from ..html_templates import repr_templates_env
         if isinstance(caption, str):
             html = f'<h4>{caption}</h4>'
         else:
@@ -1044,21 +1187,45 @@ class Info(dict, MontageMixin):
 
         good_channels, bad_channels, ecg, eog = self._get_chs_for_repr()
 
+        # TODO
+        # Most of the following checks are to ensure that we get a proper repr
+        # for Forward['info'] (and probably others like
+        # InverseOperator['info']??), which doesn't seem to follow our standard
+        # Info structure used elsewhere.
+        # Proposed solution for a future refactoring:
+        # Forward['info'] should get its own Info subclass (with respective
+        # repr).
+
         # meas date
-        meas_date = self['meas_date']
+        meas_date = self.get('meas_date')
         if meas_date is not None:
             meas_date = meas_date.strftime("%B %d, %Y  %H:%M:%S") + ' GMT'
-        projs = self['projs']
-        if projs:
-            projs = '<br/>'.join(
-                p['desc'] + ': o%s' % {0: 'ff', 1: 'n'}[p['active']]
-                for p in projs)
 
-        html += info_template.substitute(
-            caption=caption, info=self, meas_date=meas_date, ecg=ecg,
-            eog=eog, good_channels=good_channels, bad_channels=bad_channels,
-            projs=projs)
-        return html
+        projs = self.get('projs')
+        if projs:
+            projs = [
+                f'{p["desc"]} : {"on" if p["active"] else "off"}'
+                for p in self['projs']
+            ]
+        else:
+            projs = None
+
+        info_template = repr_templates_env.get_template('info.html.jinja')
+        return html + info_template.render(
+            caption=caption,
+            meas_date=meas_date,
+            projs=projs,
+            ecg=ecg,
+            eog=eog,
+            good_channels=good_channels,
+            bad_channels=bad_channels,
+            dig=self.get('dig'),
+            subject_info=self.get('subject_info'),
+            lowpass=self.get('lowpass'),
+            highpass=self.get('highpass'),
+            sfreq=self.get('sfreq'),
+            experimenter=self.get('experimenter'),
+        )
 
 
 def _simplify_info(info):
@@ -1079,18 +1246,23 @@ def read_fiducials(fname, verbose=None):
 
     Parameters
     ----------
-    fname : str
+    fname : path-like
         The filename to read.
     %(verbose)s
 
     Returns
     -------
-    pts : list of dicts
+    pts : list of dict
         List of digitizer points (each point in a dict).
     coord_frame : int
         The coordinate frame of the points (one of
-        mne.io.constants.FIFF.FIFFV_COORD_...).
+        ``mne.io.constants.FIFF.FIFFV_COORD_...``).
     """
+    fname = _check_fname(
+        fname=fname,
+        overwrite='read',
+        must_exist=True
+    )
     fid, tree, _ = fiff_open(fname)
     with fid:
         isotrak = dir_tree_find(tree, FIFF.FIFFB_ISOTRAK)
@@ -1116,41 +1288,30 @@ def read_fiducials(fname, verbose=None):
 
 
 @verbose
-def write_fiducials(fname, pts, coord_frame=FIFF.FIFFV_COORD_UNKNOWN,
+def write_fiducials(fname, pts, coord_frame='unknown', *, overwrite=False,
                     verbose=None):
     """Write fiducials to a fiff file.
 
     Parameters
     ----------
-    fname : str
+    fname : path-like
         Destination file name.
     pts : iterator of dict
         Iterator through digitizer points. Each point is a dictionary with
         the keys 'kind', 'ident' and 'r'.
-    coord_frame : int
-        The coordinate frame of the points (one of
-        mne.io.constants.FIFF.FIFFV_COORD_...).
+    coord_frame : str | int
+        The coordinate frame of the points. If a string, must be one of
+        ``'meg'``, ``'mri'``, ``'mri_voxel'``, ``'head'``,
+        ``'mri_tal'``, ``'ras'``, ``'fs_tal'``, ``'ctf_head'``,
+        ``'ctf_meg'``, and ``'unknown'``
+        If an integer, must be one of the constants defined as
+        ``mne.io.constants.FIFF.FIFFV_COORD_...``.
+    %(overwrite)s
+
+        .. versionadded:: 1.0
     %(verbose)s
     """
-    _dig_write_dig(fname, pts, coord_frame)
-
-
-def write_dig(fname, pts, coord_frame=None):
-    """Write digitization data to a FIF file.
-
-    Parameters
-    ----------
-    fname : str
-        Destination file name.
-    pts : iterator of dict
-        Iterator through digitizer points. Each point is a dictionary with
-        the keys 'kind', 'ident' and 'r'.
-    coord_frame : int | str | None
-        If all the points have the same coordinate frame, specify the type
-        here. Can be None (default) if the points could have varying
-        coordinate frames.
-    """
-    return _dig_write_dig(fname, pts, coord_frame=coord_frame)
+    write_dig(fname, pts, coord_frame, overwrite=overwrite)
 
 
 @verbose
@@ -2038,11 +2199,10 @@ def write_info(fname, info, data_type=None, reset_range=True):
     reset_range : bool
         If True, info['chs'][k]['range'] will be set to unity.
     """
-    with start_file(fname) as fid:
+    with start_and_end_file(fname) as fid:
         start_block(fid, FIFF.FIFFB_MEAS)
         write_meas_info(fid, info, data_type, reset_range)
         end_block(fid, FIFF.FIFFB_MEAS)
-        end_file(fid)
 
 
 @verbose
@@ -2415,7 +2575,8 @@ def anonymize_info(info, daysback=None, keep_his=False, verbose=None):
     Parameters
     ----------
     %(info_not_none)s
-    %(anonymize_info_parameters)s
+    %(daysback_anonymize_info)s
+    %(keep_his_anonymize_info)s
     %(verbose)s
 
     Returns
@@ -2745,3 +2906,19 @@ def _ensure_infos_match(info1, info2, name, *, on_mismatch='raise'):
                f"runs to a common head position.")
         _on_missing(on_missing=on_mismatch, msg=msg,
                     name='on_mismatch')
+
+
+def _get_fnirs_ch_pos(info):
+    """Return positions of each fNIRS optode.
+
+    fNIRS uses two types of optodes, sources and detectors.
+    There can be multiple connections between each source
+    and detector at different wavelengths. This function
+    returns the location of each source and detector.
+    """
+    from ..preprocessing.nirs import _fnirs_optode_names, _optode_position
+    srcs, dets = _fnirs_optode_names(info)
+    ch_pos = {}
+    for optode in [*srcs, *dets]:
+        ch_pos[optode] = _optode_position(info, optode)
+    return ch_pos

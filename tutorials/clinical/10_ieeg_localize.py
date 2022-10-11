@@ -3,7 +3,7 @@
 .. _tut-ieeg-localize:
 
 ========================================
-Locating Intracranial Electrode Contacts
+Locating intracranial electrode contacts
 ========================================
 
 Analysis of intracranial electrophysiology recordings typically involves
@@ -18,6 +18,14 @@ to MR-space. This accomplishes our goal of obtaining contact locations in
 MR-space (which is where the brain structures are best determined using the
 :ref:`tut-freesurfer-reconstruction`). Contact locations in MR-space can also
 be warped to a template space such as ``fsaverage`` for group comparisons.
+Please note that this tutorial requires ``nibabel``, ``nilearn`` and ``dipy``
+which can be installed using ``pip`` as well as 3D plotting
+(see :ref:`manual-install`).
+
+Support for intracranial electrophysiology analysis in MNE was added after
+the original publication, so please cite :footcite:`RockhillEtAl2022` if you
+use this module in your analysis to support the addition of new projects to
+MNE.
 """
 
 # Authors: Alex Rockhill <aprockhill@mailbox.org>
@@ -26,9 +34,6 @@ be warped to a template space such as ``fsaverage`` for group comparisons.
 # License: BSD-3-Clause
 
 # %%
-
-import os.path as op
-
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -39,14 +44,17 @@ from dipy.align import resample
 import mne
 from mne.datasets import fetch_fsaverage
 
-# paths to mne datasets - sample sEEG and FreeSurfer's fsaverage subject
+# paths to mne datasets: sample sEEG and FreeSurfer's fsaverage subject,
 # which is in MNI space
 misc_path = mne.datasets.misc.data_path()
 sample_path = mne.datasets.sample.data_path()
-subjects_dir = op.join(sample_path, 'subjects')
+subjects_dir = sample_path / 'subjects'
 
 # use mne-python's fsaverage data
 fetch_fsaverage(subjects_dir=subjects_dir, verbose=True)  # downloads if needed
+
+# GUI requires pyvista backend
+mne.viz.set_3d_backend('pyvistaqt')
 
 ###############################################################################
 # Aligning the T1 to ACPC
@@ -60,7 +68,7 @@ fetch_fsaverage(subjects_dir=subjects_dir, verbose=True)  # downloads if needed
 # coordinate frame an ACPC coordinate frame. This can be done using
 # Freesurfer's freeview:
 #
-# .. code-block:: bash
+# .. code-block:: console
 #
 #     $ freeview $MISC_PATH/seeg/sample_seeg_T1.mgz
 #
@@ -69,12 +77,13 @@ fetch_fsaverage(subjects_dir=subjects_dir, verbose=True)  # downloads if needed
 # First, it is recommended to change the cursor style to long, this can be done
 # through the menu options like so:
 #
-#     ``Freeview -> Preferences -> General -> Cursor style -> Long``
+#     :menuselection:`Freeview --> Preferences --> General --> Cursor style
+#     --> Long`
 #
 # Then, the image needs to be aligned to ACPC to look like the image below.
 # This can be done by pulling up the transform popup from the menu like so:
 #
-#     ``Tools -> Transform Volume``
+#     :menuselection:`Tools --> Transform Volume`
 #
 # .. note::
 #     Be sure to set the text entry box labeled RAS (not TkReg RAS) to
@@ -88,7 +97,7 @@ fetch_fsaverage(subjects_dir=subjects_dir, verbose=True)  # downloads if needed
 # after you're finished using ``Save Volume As`` in the transform popup
 # :footcite:`HamiltonEtAl2017`.
 
-T1 = nib.load(op.join(misc_path, 'seeg', 'sample_seeg', 'mri', 'T1.mgz'))
+T1 = nib.load(misc_path / 'seeg' / 'sample_seeg' / 'mri' / 'T1.mgz')
 viewer = T1.orthoview()
 viewer.set_position(0, 9.9, 5.8)
 viewer.figs[0].axes[0].annotate(
@@ -108,8 +117,10 @@ viewer.figs[0].axes[0].annotate(
 # This process segments out the brain from the rest of the MR image and
 # determines which voxels correspond to each brain area based on a template
 # deformation. This process takes approximately 8 hours so plan accordingly.
+# The example dataset contains the data from completed reconstruction so
+# we will proceed using that.
 #
-# .. code-block:: bash
+# .. code-block:: console
 #
 #     $ export SUBJECT=sample_seeg
 #     $ export SUBJECTS_DIR=$MY_DATA_DIRECTORY
@@ -119,7 +130,7 @@ viewer.figs[0].axes[0].annotate(
 # .. note::
 #     You may need to include an additional ``-cw256`` flag which can be added
 #     to the end of the recon-all command if your MR scan is not
-#     ``256 x 256 x 256`` voxels.
+#     ``256 × 256 × 256`` voxels.
 #
 # .. note::
 #     Using the ``-deface`` flag will create a defaced, anonymized T1 image
@@ -133,8 +144,8 @@ viewer.figs[0].axes[0].annotate(
 # =========================
 #
 # Let's load our T1 and CT images and visualize them. You can hardly
-# see the CT, it's so misaligned that it is mostly out of view but there is a
-# part of the skull upsidedown and way off center in the middle plot.
+# see the CT, it's so misaligned that all you can see is part of the
+# stereotactic frame that is anteriolateral to the skull in the middle plot.
 # Clearly, we need to align the CT to the T1 image.
 
 def plot_overlay(image, compare, title, thresh=None):
@@ -159,7 +170,7 @@ def plot_overlay(image, compare, title, thresh=None):
     fig.tight_layout()
 
 
-CT_orig = nib.load(op.join(misc_path, 'seeg', 'sample_seeg_CT.mgz'))
+CT_orig = nib.load(misc_path / 'seeg' / 'sample_seeg_CT.mgz')
 
 # resample to T1's definition of world coordinates
 CT_resampled = resample(moving=np.asarray(CT_orig.dataobj),
@@ -180,16 +191,60 @@ del CT_resampled
 #    reg_affine, _ = mne.transforms.compute_volume_registration(
 #         CT_orig, T1, pipeline='rigids')
 #
-# And instead we just hard-code the resulting 4x4 matrix:
+# Instead we just hard-code the resulting 4x4 matrix:
 
 reg_affine = np.array([
     [0.99270756, -0.03243313, 0.11610254, -133.094156],
     [0.04374389, 0.99439665, -0.09623816, -97.58320673],
     [-0.11233068, 0.10061512, 0.98856381, -84.45551601],
     [0., 0., 0., 1.]])
-CT_aligned = mne.transforms.apply_volume_registration(CT_orig, T1, reg_affine)
+# use a cval='1%' here to make the values outside the domain of the CT
+# the same as the background level during interpolation
+CT_aligned = mne.transforms.apply_volume_registration(
+    CT_orig, T1, reg_affine, cval='1%')
 plot_overlay(T1, CT_aligned, 'Aligned CT Overlaid on T1', thresh=0.95)
 del CT_orig
+
+# %%
+# .. note::
+#     Alignment failures sometimes occur which requires manual pre-alignment.
+#     Freesurfer's ``freeview`` can be used to to align manually
+#
+#     .. code-block:: console
+#
+#         $ freeview $MISC_PATH/seeg/sample_seeg/mri/T1.mgz \
+#            $MISC_PATH/seeg/sample_seeg_CT.mgz:colormap=heat:opacity=0.6
+#
+#     - Navigate to the upper toolbar, go to
+#       :menuselection:`Tools --> Transform Volume`
+#     - Use the rotation and translation slide bars to align the CT
+#       to the MR (be sure to have the CT selected in the upper left menu)
+#     - Save the linear transform array (lta) file using the ``Save Reg...``
+#       button
+#
+#     Since we really require as much precision as possible for the
+#     alignment, we should rerun the algorithm starting with the manual
+#     alignment. This time, we just want to skip to the most exact rigid
+#     alignment, without smoothing, since the manual alignment is already
+#     very close.
+#
+#     .. code-block:: python
+#
+#         # load transform
+#         manual_reg_affine_vox = mne.read_lta(op.join(  # the path used above
+#             misc_path, 'seeg', 'sample_seeg_CT_aligned_manual.mgz.lta'))
+#         # convert from vox->vox to ras->ras
+#         manual_reg_affine = \
+#             CT_orig.affine @ np.linalg.inv(manual_reg_affine_vox) \
+#             @ np.linalg.inv(CT_orig.affine)
+#         reg_affine, _ = mne.transforms.compute_volume_registration(
+#             CT_orig, T1, pipeline=['rigid'],
+#             starting_affine=manual_reg_affine)
+#         CT_aligned = mne.transforms.apply_volume_registration(
+#             CT_orig, T1, reg_affine, cval='1%')
+#
+#     The rest of the tutorial can then be completed using ``CT_aligned``
+#     from this point on.
 
 # %%
 # We can now see how the CT image looks properly aligned to the T1 image.
@@ -239,7 +294,7 @@ del CT_data, T1
 
 # estimate head->mri transform
 subj_trans = mne.coreg.estimate_head_mri_t(
-    'sample_seeg', op.join(misc_path, 'seeg'))
+    'sample_seeg', misc_path / 'seeg')
 
 # %%
 # Marking the Location of Each Electrode Contact
@@ -251,51 +306,55 @@ subj_trans = mne.coreg.estimate_head_mri_t(
 # individual subject's anatomical space (T1-space). To do this, we can use the
 # MNE intracranial electrode location graphical user interface.
 #
-# .. note: The most useful coordinate frame for intracranial electrodes is
-#          generally the ``surface RAS`` coordinate frame because that is
-#          the coordinate frame that all the surface and image files that
-#          Freesurfer outputs are in, see :ref:`tut-freesurfer-mne`. These are
-#          useful for finding the brain structures nearby each contact and
-#          plotting the results.
+# .. note:: The most useful coordinate frame for intracranial electrodes is
+#           generally the ``surface RAS`` coordinate frame because that is
+#           the coordinate frame that all the surface and image files that
+#           Freesurfer outputs are in, see :ref:`tut-freesurfer-mne`. These are
+#           useful for finding the brain structures nearby each contact and
+#           plotting the results.
 #
-# To operate the GUI:
+# See the following video on how to operate the GUI or follow the steps below:
 #
-#   - Click in each image to navigate to each electrode contact
-#   - Select the contact name in the right panel
-#   - Press the "Mark" button or the "m" key to associate that
-#     position with that contact
-#   - Repeat until each contact is marked, they will both appear as circles
-#     in the plots and be colored in the sidebar when marked
+# .. youtube:: 8JWDJhXq0VY
 #
-#   .. note:: The channel locations are saved to the ``raw`` object every time
-#             a location is marked or removed so there is no "Save" button.
+# - Click in each image to navigate to each electrode contact
+# - Select the contact name in the right panel
+# - Press the "Mark" button or the "m" key to associate that
+#   position with that contact
+# - Repeat until each contact is marked, they will both appear as circles
+#   in the plots and be colored in the sidebar when marked
 #
-#   .. note:: Using the scroll or +/- arrow keys you can zoom in and out,
-#             and the up/down, left/right and page up/page down keys allow
-#             you to move one slice in any direction. This information is
-#             available in the help menu, accessible by pressing the "h" key.
+# .. note:: The channel locations are saved to the ``raw`` object every time
+#           a location is marked or removed so there is no "Save" button.
 #
-#   .. note:: If "Snap to Center" is on, this will use the radius so be
-#             sure to set it properly.
+# .. note:: Using the scroll or +/- arrow keys you can zoom in and out,
+#           and the up/down, left/right and page up/page down keys allow
+#           you to move one slice in any direction. This information is
+#           available in the help menu, accessible by pressing the "h" key.
+#
+# .. note:: If "Snap to Center" is on, this will use the radius so be
+#           sure to set it properly.
 
 # sphinx_gallery_thumbnail_number = 5
 
 # load electrophysiology data to find channel locations for
 # (the channels are already located in the example)
-raw = mne.io.read_raw(op.join(misc_path, 'seeg', 'sample_seeg_ieeg.fif'))
 
-gui = mne.gui.locate_ieeg(raw.info, subj_trans, CT_aligned,
-                          subject='sample_seeg',
-                          subjects_dir=op.join(misc_path, 'seeg'))
+raw = mne.io.read_raw(misc_path / 'seeg' / 'sample_seeg_ieeg.fif')
+
+# you may want to add `block=True` to halt execution until you have interacted
+# with the GUI to find the channel positions, that way the raw object can
+# be used later in the script (e.g. saved with channel positions)
+mne.gui.locate_ieeg(raw.info, subj_trans, CT_aligned,
+                    subject='sample_seeg',
+                    subjects_dir=misc_path / 'seeg')
 # The `raw` object is modified to contain the channel locations
-# after closing the GUI and can now be saved
-gui.close()  # close when done
 
 # %%
 # Let's do a quick sidebar and show what this looks like for ECoG as well.
 
-T1_ecog = nib.load(op.join(misc_path, 'ecog', 'sample_ecog', 'mri', 'T1.mgz'))
-CT_orig_ecog = nib.load(op.join(misc_path, 'ecog', 'sample_ecog_CT.mgz'))
+T1_ecog = nib.load(misc_path / 'ecog' / 'sample_ecog' / 'mri' / 'T1.mgz')
+CT_orig_ecog = nib.load(misc_path / 'ecog' / 'sample_ecog_CT.mgz')
 
 # pre-computed affine from `mne.transforms.compute_volume_registration`
 reg_affine = np.array([
@@ -305,18 +364,18 @@ reg_affine = np.array([
     [0., 0., 0., 1.]])
 # align CT
 CT_aligned_ecog = mne.transforms.apply_volume_registration(
-    CT_orig_ecog, T1_ecog, reg_affine)
+    CT_orig_ecog, T1_ecog, reg_affine, cval='1%')
 
-raw_ecog = mne.io.read_raw(op.join(misc_path, 'ecog', 'sample_ecog_ieeg.fif'))
+raw_ecog = mne.io.read_raw(misc_path / 'ecog' / 'sample_ecog_ieeg.fif')
 # use estimated `trans` which was used when the locations were found previously
 subj_trans_ecog = mne.coreg.estimate_head_mri_t(
-    'sample_ecog', op.join(misc_path, 'ecog'))
-gui = mne.gui.locate_ieeg(raw_ecog.info, subj_trans_ecog, CT_aligned_ecog,
-                          subject='sample_ecog',
-                          subjects_dir=op.join(misc_path, 'ecog'))
+    'sample_ecog', misc_path / 'ecog')
+mne.gui.locate_ieeg(raw_ecog.info, subj_trans_ecog, CT_aligned_ecog,
+                    subject='sample_ecog',
+                    subjects_dir=misc_path / 'ecog')
 
 # %%
-# for ECoG, we typically want to account for "brain shift" or shrinking of the
+# For ECoG, we typically want to account for "brain shift" or shrinking of the
 # brain away from the skull/dura due to changes in pressure during the
 # craniotomy
 # Note: this requires the BEM surfaces to have been computed e.g. using
@@ -325,7 +384,7 @@ gui = mne.gui.locate_ieeg(raw_ecog.info, subj_trans_ecog, CT_aligned_ecog,
 
 # plot projected sensors
 brain_kwargs = dict(cortex='low_contrast', alpha=0.2, background='white')
-brain = mne.viz.Brain('sample_ecog', subjects_dir=op.join(misc_path, 'ecog'),
+brain = mne.viz.Brain('sample_ecog', subjects_dir=misc_path / 'ecog',
                       title='Before Projection', **brain_kwargs)
 brain.add_sensors(raw_ecog.info, trans=subj_trans_ecog)
 view_kwargs = dict(azimuth=60, elevation=100, distance=350,
@@ -338,10 +397,10 @@ brain.show_view(**view_kwargs)
 # project sensors to the brain surface
 raw_ecog.info = mne.preprocessing.ieeg.project_sensors_onto_brain(
     raw_ecog.info, subj_trans_ecog, 'sample_ecog',
-    subjects_dir=op.join(misc_path, 'ecog'))
+    subjects_dir=misc_path / 'ecog')
 
 # plot projected sensors
-brain = mne.viz.Brain('sample_ecog', subjects_dir=op.join(misc_path, 'ecog'),
+brain = mne.viz.Brain('sample_ecog', subjects_dir=misc_path / 'ecog',
                       title='After Projection', **brain_kwargs)
 brain.add_sensors(raw_ecog.info, trans=subj_trans_ecog)
 brain.show_view(**view_kwargs)
@@ -359,7 +418,7 @@ brain.show_view(**view_kwargs)
 # when the electrode contacts were localized so we need to use it again here.
 
 # plot the alignment
-brain = mne.viz.Brain('sample_seeg', subjects_dir=op.join(misc_path, 'seeg'),
+brain = mne.viz.Brain('sample_seeg', subjects_dir=misc_path / 'seeg',
                       **brain_kwargs)
 brain.add_sensors(raw.info, trans=subj_trans)
 brain.show_view(**view_kwargs)
@@ -380,9 +439,9 @@ brain.show_view(**view_kwargs)
 
 # load the subject's brain and the Freesurfer "fsaverage" template brain
 subject_brain = nib.load(
-    op.join(misc_path, 'seeg', 'sample_seeg', 'mri', 'brain.mgz'))
+    misc_path / 'seeg' / 'sample_seeg' / 'mri' / 'brain.mgz')
 template_brain = nib.load(
-    op.join(subjects_dir, 'fsaverage', 'mri', 'brain.mgz'))
+    subjects_dir / 'fsaverage' / 'mri' / 'brain.mgz')
 
 plot_overlay(template_brain, subject_brain,
              'Alignment with fsaverage before Affine Registration')
@@ -392,15 +451,13 @@ plot_overlay(template_brain, subject_brain,
 # This aligns the two brains, preparing the subject's brain to be warped
 # to the template.
 #
-# .. warning:: Here we use ``zooms=5`` just for speed, in general we recommend
-#              using ``zooms=None``` (default) for highest accuracy. To deal
-#              with this coarseness, we also use a threshold of 0.1 for the CT
-#              electrodes rather than 0.5. This coarse zoom and low threshold
-#              is useful for getting a quick view of the data, but finalized
-#              pipelines should use ``zooms=None`` instead!
+# .. warning:: Here we use custom ``zooms`` just for speed (this downsamples
+#              the image resolution), in general we recommend using
+#              ``zooms=None`` (default) for highest accuracy!
 
+zooms = dict(translation=10, rigid=10, affine=10, sdr=5)
 reg_affine, sdr_morph = mne.transforms.compute_volume_registration(
-    subject_brain, template_brain, zooms=5, verbose=True)
+    subject_brain, template_brain, zooms=zooms, verbose=True)
 subject_brain_sdr = mne.transforms.apply_volume_registration(
     subject_brain, template_brain, reg_affine, sdr_morph)
 
@@ -426,10 +483,9 @@ del subject_brain, template_brain
 montage = raw.get_montage()
 montage.apply_trans(subj_trans)
 
-# higher thresh such as 0.5 (default) works when `zooms=None`
 montage_warped, elec_image, warped_elec_image = mne.warp_montage_volume(
-    montage, CT_aligned, reg_affine, sdr_morph, thresh=0.1,
-    subject_from='sample_seeg', subjects_dir_from=op.join(misc_path, 'seeg'),
+    montage, CT_aligned, reg_affine, sdr_morph, thresh=0.25,
+    subject_from='sample_seeg', subjects_dir_from=misc_path / 'seeg',
     subject_to='fsaverage', subjects_dir_to=subjects_dir)
 
 fig, axes = plt.subplots(2, 1, figsize=(8, 8))
@@ -449,6 +505,11 @@ del CT_aligned
 # By accounting for the shape of this particular subject's brain using the
 # SDR to warp the positions of the electrode contacts, the position in the
 # template brain is able to be more accurately estimated.
+#
+# .. note:: The accuracy of warping to the template has been degraded by
+#           using ``zooms`` to downsample the image before registration
+#           which makes some of the contacts inaccurately appear outside
+#           the brain.
 
 # first we need to add fiducials so that we can define the "head" coordinate
 # frame in terms of them (with the origin at the center between LPA and RPA)
@@ -470,8 +531,7 @@ brain.show_view(**view_kwargs)
 # %%
 # This pipeline was developed based on previous work
 # :footcite:`HamiltonEtAl2017`.
-
-# %%
+#
 # References
 # ==========
 #
