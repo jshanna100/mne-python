@@ -94,6 +94,8 @@
 
 .. _Daniel Carlström Schad: https://github.com/Dod12
 
+.. _Daniel Hasegan: https://daniel.hasegan.com
+
 .. _Daniel McCloy: http://dan.mccloy.info
 
 .. _Daniel Strohmeier: https://github.com/joewalter
@@ -205,6 +207,8 @@
 .. _Jeroen Van Der Donckt: https://github.com/jvdd
 
 .. _Jesper Duemose Nielsen: https://github.com/jdue
+
+.. _Jevri Hanna: https://github.com/jshanna100
 
 .. _jeythekey: https://github.com/jeythekey
 
