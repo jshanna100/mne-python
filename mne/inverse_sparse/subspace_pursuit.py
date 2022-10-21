@@ -2,7 +2,8 @@ import numpy as np
 from ..utils.numerics import _PCA
 from ..utils import verbose, logger
 from .. import make_forward_solution, convert_forward_solution
-from ..source_space import _set_source_space_vertices, setup_source_space
+from ..source_space import (_set_source_space_vertices, setup_source_space,
+                            setup_volume_source_space)
 from ..io.constants import FIFF
 from ..minimum_norm import make_inverse_operator, apply_inverse
 from ..minimum_norm.inverse import (_log_exp_var, _check_or_prepare,
@@ -55,9 +56,9 @@ def _convert_forward_patch(fwd, new_nns, new_rrs, new_gain, new_verts,
                            copy=True):
     fwd = fwd.copy() if copy else fwd
     # make sure order corresponds to increasing vertices
-    start_inds = [0] + [len(nv) for nv in new_verts[:-1]]
-    ordered_inds = np.concatenate([np.argsort(nv) + start_idx for
-                                   nv, start_idx in zip(new_verts, start_inds)])
+    start_inds = np.cumsum([0] + [len(nv) for nv in new_verts[:-1]])
+    ordered_inds = np.concatenate([np.argsort(nv) + start_idx
+                                   for nv, start_idx in zip(new_verts, start_inds)])
     new_verts = [np.sort(nv) for nv in new_verts]
     fwd["nsource"] = len(new_nns)
     fwd['source_nn'] = new_nns[ordered_inds]
@@ -68,6 +69,9 @@ def _convert_forward_patch(fwd, new_nns, new_rrs, new_gain, new_verts,
     fwd['surf_ori'] = True
     fwd["_orig_sol"] = fwd["sol"]["data"]
     fwd["_orig_source_ori"] = FIFF.FIFFV_MNE_FIXED_ORI
+    if fwd["src"].kind == "volume":
+        for s in fwd["src"]:
+            s["type"] = "discrete"
     _set_source_space_vertices(fwd["src"], new_verts)
     return fwd
 
@@ -175,25 +179,39 @@ def _svd_gain(gain, info, n_components, whiten=False):
     return svd_gain, u, s, v, pca.n_components_
 
 def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
-                       restrict_to=None, patch_comp_n=None, meg=True, eeg=True,
+                       restrict_to=None, volume=False, volume_label=None,
+                       patch_comp_n=.9, meg=True, eeg=True,
                        ignore_ref=False, mindist=0., n_jobs=1):
-    src = setup_source_space(subject, spacing=spacing,
-                             subjects_dir=subjects_dir,
-                             n_jobs=n_jobs, verbose="warning")
+    if volume and not volume_label:
+        raise ValueError("If doing a volume source space, volume labels must "
+                         "also be specified; volume_label is empty.")
+    if volume:
+        src = setup_volume_source_space(subject, bem=bem,
+                                        subjects_dir=subjects_dir,
+                                        mindist=mindist,
+                                        volume_label=volume_label)
+    else:
+        src = setup_source_space(subject, spacing=spacing,
+                                 subjects_dir=subjects_dir,
+                                 n_jobs=n_jobs, verbose="warning")
     if restrict_to:
         _set_source_space_vertices(src, restrict_to)
 
     # make a forward model for each cortical patch
-    pinfos = [np.array(s["pinfo"], dtype=object) for s in src]
     new_nns, new_rrs, new_gain, new_verts = [], [], [], [[] for s in src]
     for sr_idx, sr in enumerate(src):
-        for p_count, p_idx in enumerate(sr["patch_inds"]):
-            pi = sr["pinfo"][p_idx]
-            logger.info(f"Source {sr_idx}, Patch {p_count} of {sr['nuse']}")
+        patch_verts = []
+        if sr["pinfo"]:
+            for pi in sr["patch_inds"]:
+                patch_verts.append(sr["pinfo"][pi])
+        else:
+            patch_verts = [sr["vertno"]]
+        for p_count, pv in enumerate(patch_verts):
+            logger.info(f"Source {sr_idx}, Patch {p_count} of {len(patch_verts)}")
             # restrict source space to patch and calc forward
             p_src = src.copy()
             pinfo_list = [[] for s in src]
-            pinfo_list[sr_idx] = pi.astype(int)
+            pinfo_list[sr_idx] = pv.astype(int)
             _set_source_space_vertices(p_src, pinfo_list)
             fwd = make_forward_solution(info, trans, p_src,
                                         bem, meg=meg, eeg=eeg,
@@ -201,6 +219,7 @@ def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
                                         ignore_ref=ignore_ref,
                                         n_jobs=n_jobs,
                                         verbose="warning")
+
             # reduce gain matrix dimensionality to n best components
             # or components that explain n variance
             gain = fwd["sol"]["data"].copy()
@@ -228,10 +247,11 @@ def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
                 idx = 0
                 sort_inds = np.argsort(dists)
                 closest_idx = sort_inds[idx]
-                while pi[closest_idx] in new_verts[sr_idx]:
+                while pv[closest_idx] in new_verts[sr_idx]:
                     idx += 1
                     closest_idx = sort_inds[idx]
-                new_verts[sr_idx].append(pi[closest_idx])
+                new_verts[sr_idx].append(pv[closest_idx])
+
                 new_rrs.append(rrs[closest_idx])
                 new_nns.append(nn)
             new_gain.append(reduce_gain)
@@ -243,7 +263,6 @@ def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
     new_rrs = np.vstack(new_rrs)
     new_gain = np.hstack(new_gain)
     new_fwd = _convert_forward_patch(fwd, new_nns, new_rrs, new_gain, new_verts)
-
 
     return new_fwd
 
@@ -298,20 +317,21 @@ def subspace_pursuit_level(fwd, evo, cov, s, mu, lambda2, max_iter=200):
     return stc, est_fwd, var_expl
 
 def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
-                     fwd0=None, return_fwd0=False, return_as_dipoles=False,
+                     fwd0=None, return_fwds=False, return_as_dipoles=False,
                      patch_comp_n=.9, max_iter=200, n_jobs=1):
     if isinstance(s, int):
         s = [s] * len(spacings)
     elif len(s) != len(spacings):
         raise ValueError("Length of s must be 1 or equal to # of spacings.")
 
+    fwds = []
     if fwd0:
-        fwd = fwd0.copy()
+        fwd = fwd0
     else:
         fwd = make_patch_forward(subject, spacings[0], bem, evo.info, trans,
                                  patch_comp_n=patch_comp_n, n_jobs=16)
-        if return_fwd0:
-            fwd0 = fwd.copy()
+    if return_fwds:
+        fwds.append(fwd)
 
     for spacing_idx in range(len(spacings)-1):
         stc, _, var_expl = subspace_pursuit_level(fwd, evo, cov, s[spacing_idx],
@@ -325,16 +345,20 @@ def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
         fwd = make_patch_forward(subject, spacings[spacing_idx+1], bem,
                                  evo.info, trans, restrict_to=new_verts,
                                  patch_comp_n=0.9, n_jobs=n_jobs)
+        if return_fwds:
+            fwds.append(fwd.copy())
 
     out, est_fwd, var_expl = subspace_pursuit_level(fwd, evo, cov,
                                                     s[spacing_idx], mu,
                                                     lambda2, max_iter=max_iter)
+    if return_fwds:
+        fwds.append(est_fwd)
 
     logger.info(f"Spacing {spacings[spacing_idx+1]} explained {var_expl:.1f} "
                  " percent variance.")
     if return_as_dipoles:
         out = make_dipoles_from_stc(out, est_fwd)
-    if return_fwd0:
-        return out, fwd0
+    if return_fwds:
+        return out, fwds
     else:
         return out
