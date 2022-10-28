@@ -96,9 +96,28 @@ def _select_s(proxy, confl_mat, s):
     support = np.sort(support)
     return support
 
+def _orthogonal_weighting(inv, gain, weights, coef):
+    source_std = np.sqrt(inv["source_std"]["data"])
+    source_std *= weights * coef
+    # Adjusting Source Covariance matrix to make trace of G*R*G' equal
+    # to number of sensors.
+    logger.info('Adjusting source covariance matrix.')
+    trace_GRGT = np.linalg.norm(gain, ord='fro') ** 2
+    n_nzero = (inv["noise_cov"]['eig'] > 0).sum()
+    scale = np.sqrt(n_nzero / trace_GRGT)
+    source_std *= scale
+    gain *= scale
+
+    source_cov["data"] = source_std ** 2
+    inv.update(source_cov=source_cov)
+    return inv
+
+
 def _proxy_matrix(evo, fwd, cov, lambda2):
     inv_op = make_inverse_operator(evo.info, fwd, cov, loose=0, fixed=True,
                                    depth=None, verbose="warning")
+    inv_op = _orthogonal_weighting(inv_op, fwd["sol"]["data"], weights,
+                                   orth_coef)
     stc, resid = apply_inverse(evo, inv_op, lambda2, method="MNE",
                                return_residual=True, verbose="warning")
     return stc.data, resid
@@ -318,7 +337,8 @@ def subspace_pursuit_level(fwd, evo, cov, s, mu, lambda2, max_iter=200):
 
 def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
                      fwd0=None, return_fwds=False, return_as_dipoles=False,
-                     patch_comp_n=.9, max_iter=200, n_jobs=1):
+                     patch_comp_n=.9, subjects_dir=None, max_iter=200,
+                     n_jobs=1):
     if isinstance(s, int):
         s = [s] * len(spacings)
     elif len(s) != len(spacings):
@@ -329,7 +349,8 @@ def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
         fwd = fwd0
     else:
         fwd = make_patch_forward(subject, spacings[0], bem, evo.info, trans,
-                                 patch_comp_n=patch_comp_n, n_jobs=16)
+                                 patch_comp_n=patch_comp_n,
+                                 subjects_dir=subjects_dir, n_jobs=n_jobs)
     if return_fwds:
         fwds.append(fwd)
 
@@ -341,9 +362,12 @@ def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
                      " percent variance.")
         new_verts = telescope_vertices(subject, spacings[spacing_idx],
                                        spacings[spacing_idx+1],
-                                       stc.vertices, n_jobs=16)
+                                       stc.vertices,
+                                       subjects_dir=subjects_dir,
+                                       n_jobs=n_jobs)
         fwd = make_patch_forward(subject, spacings[spacing_idx+1], bem,
                                  evo.info, trans, restrict_to=new_verts,
+                                 subjects_dir=subjects_dir,
                                  patch_comp_n=0.9, n_jobs=n_jobs)
         if return_fwds:
             fwds.append(fwd.copy())
