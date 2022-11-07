@@ -1159,8 +1159,8 @@ def apply_inverse_raw(raw, inverse_operator, lambda2, method="dSPM",
 
 def _apply_inverse_epochs_gen(epochs, inverse_operator, lambda2, method='dSPM',
                               label=None, nave=1, pick_ori=None,
-                              prepared=False, method_params=None,
-                              use_cps=True, verbose=None):
+                              prepared=False, return_residual=False,
+                              method_params=None, use_cps=True, verbose=None):
     """Generate inverse solutions for epochs. Used in apply_inverse_epochs."""
     _validate_type(epochs, BaseEpochs, 'epochs')
     _check_reference(epochs, inverse_operator['info']['ch_names'])
@@ -1220,13 +1220,27 @@ def _apply_inverse_epochs_gen(epochs, inverse_operator, lambda2, method='dSPM',
                 sol = (K, e[sel])
             else:
                 sol = np.dot(K, e[sel])
+        # x̂(t) = G ĵ(t) = C ** 1/2 U Π w(t)
+        # where the diagonal matrix Π has elements πk = λk γk
+        Pi = inv['sing'] * inv['reginv']
+        data_w = np.dot(inv['whitener'],  # C ** -0.5
+                        np.dot(inv['proj'], e[sel]))
+        w_t = np.dot(inv['eigen_fields']['data'], data_w)  # U.T @ data
+        data_est = np.dot(inv['colorer'],  # C ** 0.5
+                          np.dot(inv['eigen_fields']['data'].T,  # U
+                                 Pi[:, np.newaxis] * w_t))
+        data_est_w = np.dot(inv['whitener'], np.dot(inv['proj'], data_est))
+        _log_exp_var(data_w, data_est_w)
+        if return_residual:
+            residual = e.copy()
+            residual[sel] -= data_est
 
         src_type = _get_src_type(inverse_operator['src'], vertno)
         stc = _make_stc(sol, vertno, tmin=tmin, tstep=tstep, subject=subject,
                         vector=(pick_ori == 'vector'), source_nn=source_nn,
                         src_type=src_type)
 
-        yield stc
+        yield (stc, residual) if return_residual else stc
 
     logger.info('[done]')
 
@@ -1234,8 +1248,9 @@ def _apply_inverse_epochs_gen(epochs, inverse_operator, lambda2, method='dSPM',
 @verbose
 def apply_inverse_epochs(epochs, inverse_operator, lambda2, method="dSPM",
                          label=None, nave=1, pick_ori=None,
-                         return_generator=False, prepared=False,
-                         method_params=None, use_cps=True, verbose=None):
+                         return_generator=False, return_residual=False,
+                         prepared=False, method_params=None, use_cps=True,
+                         verbose=None):
     """Apply inverse operator to Epochs.
 
     Parameters
@@ -1284,7 +1299,8 @@ def apply_inverse_epochs(epochs, inverse_operator, lambda2, method="dSPM",
     stcs = _apply_inverse_epochs_gen(
         epochs, inverse_operator, lambda2, method=method, label=label,
         nave=nave, pick_ori=pick_ori, verbose=verbose, prepared=prepared,
-        method_params=method_params, use_cps=use_cps)
+        return_residual=return_residual, method_params=method_params,
+        use_cps=use_cps)
 
     if not return_generator:
         # return a list

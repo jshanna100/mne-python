@@ -5,12 +5,16 @@ from .. import make_forward_solution, convert_forward_solution
 from ..source_space import (_set_source_space_vertices, setup_source_space,
                             setup_volume_source_space)
 from ..io.constants import FIFF
-from ..minimum_norm import make_inverse_operator, apply_inverse
+from ..minimum_norm import (make_inverse_operator, apply_inverse,
+                            apply_inverse_epochs)
+from ..epochs import BaseEpochs, EpochsArray, concatenate_epochs
+from ..evoked import Evoked
 from ..minimum_norm.inverse import (_log_exp_var, _check_or_prepare,
                                     _pick_channels_inverse_operator)
 from ..dipole import Dipole
 from ..io.pick import pick_types, channel_type, _picks_by_type
 from sklearn.preprocessing import RobustScaler
+from mne_connectivity import spectral_connectivity_epochs
 
 def _expl_var(data, resid, inv):
     sel = _pick_channels_inverse_operator(data.ch_names, inv)
@@ -75,52 +79,6 @@ def _convert_forward_patch(fwd, new_nns, new_rrs, new_gain, new_verts,
     _set_source_space_vertices(fwd["src"], new_verts)
     return fwd
 
-def _union_s(s1, s2):
-    support = np.union1d(s1, s2)
-    support = np.sort(support)
-    return support
-
-def _select_s(proxy, confl_mat, s):
-    """
-    Get s strongest sources, with the constraint that mutual coherence
-    is below threshold
-    """
-    norm_sort_inds = np.argsort(np.linalg.norm(proxy, axis=1))[::-1]
-    support = np.array([norm_sort_inds[0]])
-    for idx in norm_sort_inds[1:]:
-        if len(support) == s:
-            break
-        if sum(confl_mat[support, idx]) == 0:
-            support = np.append(support, idx)
-
-    support = np.sort(support)
-    return support
-
-def _orthogonal_weighting(inv, gain, weights, coef):
-    source_std = np.sqrt(inv["source_std"]["data"])
-    source_std *= weights * coef
-    # Adjusting Source Covariance matrix to make trace of G*R*G' equal
-    # to number of sensors.
-    logger.info('Adjusting source covariance matrix.')
-    trace_GRGT = np.linalg.norm(gain, ord='fro') ** 2
-    n_nzero = (inv["noise_cov"]['eig'] > 0).sum()
-    scale = np.sqrt(n_nzero / trace_GRGT)
-    source_std *= scale
-    gain *= scale
-
-    source_cov["data"] = source_std ** 2
-    inv.update(source_cov=source_cov)
-    return inv
-
-
-def _proxy_matrix(evo, fwd, cov, lambda2):
-    inv_op = make_inverse_operator(evo.info, fwd, cov, loose=0, fixed=True,
-                                   depth=None, verbose="warning")
-    inv_op = _orthogonal_weighting(inv_op, fwd["sol"]["data"], weights,
-                                   orth_coef)
-    stc, resid = apply_inverse(evo, inv_op, lambda2, method="MNE",
-                               return_residual=True, verbose="warning")
-    return stc.data, resid
 
 def telescope_vertices(subject, coarse_spacing, fine_spacing, vertices,
                        subjects_dir=None, n_jobs=1):
@@ -238,6 +196,8 @@ def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
                                         ignore_ref=ignore_ref,
                                         n_jobs=n_jobs,
                                         verbose="warning")
+            if not volume:
+                fwd = convert_forward_solution(fwd, force_fixed=True)
 
             # reduce gain matrix dimensionality to n best components
             # or components that explain n variance
@@ -249,11 +209,14 @@ def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
             # locations and orientations for components
             nn_weights = v[:n_comps,:].T * s[:n_comps].T
             # reduce this to norm of 3 orientations for location weights
-            rr_weights = np.stack([nn_weights[0::3], nn_weights[1::3],
-                                   nn_weights[2::3]])
-            rr_weights = np.linalg.norm(rr_weights, axis=0)
-            nn_weights = nn_weights / sum(nn_weights) # rows sum to 1
-            rr_weights = rr_weights / sum(rr_weights) # rows sum to 1
+            if not volume:
+                rr_weights = nn_weights
+            else:
+                rr_weights = np.stack([nn_weights[0::3], nn_weights[1::3],
+                                       nn_weights[2::3]])
+                rr_weights = np.linalg.norm(rr_weights, axis=0)
+                nn_weights = nn_weights / sum(nn_weights) # rows sum to 1
+                rr_weights = rr_weights / sum(rr_weights) # rows sum to 1
             nns = fwd["source_nn"]
             rrs = fwd["source_rr"]
             # get nn and rr weighted by SVD component contribution
@@ -285,96 +248,204 @@ def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
 
     return new_fwd
 
-def subspace_pursuit_level(fwd, evo, cov, s, mu, lambda2, max_iter=200):
+
+def _union_s(s1, s2):
+    support = np.union1d(s1, s2)
+    support = np.sort(support)
+    return support
+
+
+def _select_s(proxy, confl_mat, s, cnx=None):
+    """
+    Get s strongest sources, with the constraint that mutual coherence
+    is below threshold
+    """
+    if len(proxy.shape) == 3 and cnx is None:
+        proxy = proxy.mean(axis=0)
+    if cnx is not None:
+        # get only pairs where conflict matrix isn't marked
+        inds = list(zip(*np.where(confl_mat==0)))
+        triu_inds = list(zip(*np.triu_indices(len(confl_mat))))
+        new_inds = tuple(zip(*[idx for idx in inds if idx in triu_inds]))
+        con = spectral_connectivity_epochs(proxy, indices=new_inds,
+                                           fmin=cnx["fmin"], fmax=cnx["fmax"],
+                                           faverage=True, sfreq=cnx["sfreq"],
+                                           method=cnx["method"])
+        con_vec = con.get_data()
+        sort_inds = np.argsort(con_vec[:, 0])[-s:]
+        support = []
+        for s_idx in sort_inds:
+            support.append(con.indices[0][s_idx])
+            support.append(con.indices[1][s_idx])
+    else:
+        norm_sort_inds = np.argsort(np.linalg.norm(proxy, axis=1))[::-1]
+        support = np.array([norm_sort_inds[0]])
+        for idx in norm_sort_inds[1:]:
+            if len(support) == s:
+                break
+            if sum(confl_mat[support, idx]) == 0:
+                support = np.append(support, idx)
+
+    support = np.unique(support)
+    return support
+
+
+def _proxy_matrix(inst, fwd, cov, lambda2):
+    inv_op = make_inverse_operator(inst.info, fwd, cov, loose=0, fixed=True,
+                                   depth=None, verbose="warning")
+    if isinstance(inst, BaseEpochs):
+        stc_and_resid = apply_inverse_epochs(inst, inv_op, lambda2,
+                                             method="MNE",
+                                             return_residual=True,
+                                             verbose="warning")
+        stcs, resids = zip(*stc_and_resid)
+        resid = EpochsArray(resids, inst.info)
+        data = np.stack([stc.data for stc in stcs])
+    elif isinstance(inst, Evoked):
+        stc, resid = apply_inverse(inst, inv_op, lambda2, method="MNE",
+                                   return_residual=True, verbose="warning")
+        data = stc.data.copy()
+
+    return data, resid
+
+
+def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
+                           sub_fwd=None, sub_mu=None, max_iter=200):
     # conflict matrix for mutual coherence of gain matrix columns
     gain = fwd["sol"]["data"].copy()
     src_n = gain.shape[1]
     confl_mat = np.zeros((src_n, src_n), dtype=bool)
     wh_gain, _ = _whiten_gain(gain, fwd["info"])
+    norms = np.linalg.norm(wh_gain, axis=0)
+    inner = np.inner(wh_gain.T, wh_gain.T)
     for src_i in range(src_n):
         for src_j in range(src_i+1, src_n):
-            inner = np.inner(wh_gain[:, src_i], wh_gain[:, src_j])
-            if inner > (mu * (np.linalg.norm(wh_gain[:, src_i]) *
-                              np.linalg.norm(wh_gain[:, src_j]))):
+            if inner[src_i, src_j] > (mu * norms[src_i] * norms[src_j]):
                 confl_mat[src_i, src_j] = 1
+    if sub_fwd is not None:
+        # mark cortical sources coherent with subcortical as a conflict
+        sub_mu = mu if sub_mu is None else sub_mu
+        sub_gain = sub_fwd["sol"]["data"].copy()
+        wh_sub_gain, _ = _whiten_gain(sub_gain, fwd["info"])
+        inner = np.abs(np.inner(wh_gain.T, wh_sub_gain.T))
+        wh_gain_norms = np.linalg.norm(wh_gain, axis=0)
+        wh_sub_gain_norms = np.linalg.norm(wh_sub_gain, axis=0)
+        for idx in range(src_n):
+            for s_idx in range(sub_gain.shape[1]):
+                if inner[idx, s_idx] > (sub_mu * wh_gain_norms[idx] *
+                                        wh_sub_gain_norms[s_idx]):
+                    # if any exceed, mark whole row as conflict and go on
+                    confl_mat[idx,] = np.ones(confl_mat.shape[1])
+                    break
+        # set the lower triangle back to 0
+        confl_mat[np.tril_indices(src_n, k=-1)] = 0
+
+        confl_sat = confl_mat.sum() / ((src_n**2 + src_n) / 2)
+        if confl_sat == 1.:
+            raise ValueError("Conflict matrix is saturated. Choose a higher "
+                             "sub_mu.")
+        elif confl_sat > .8:
+            logger.warning("Warning: conflict matrix is >= 80% saturated."
+                           "Consider using a higher sub_mu "
+                           f"(current value: {sub_mu}.")
+
+
     # initial proxy matrix and top s sources
-    proxy, _ = _proxy_matrix(evo, fwd, cov, lambda2)
-    support = _select_s(proxy, confl_mat, s)
+    proxy, _ = _proxy_matrix(inst, fwd, cov, lambda2)
+    support = _select_s(proxy, confl_mat, s, cnx=cnx)
     # initial residual
     proxy_fwd = _restrict_forward_patch(fwd, support)
-    _, resid = _proxy_matrix(evo, proxy_fwd, cov, lambda2)
+    _, resid = _proxy_matrix(inst, proxy_fwd, cov, lambda2)
     # now iterate
     all_supports = [set(support)]
-    support = set([])
     for iter_idx in range(max_iter):
         logger.info(f"Iteration {iter_idx}")
         proxy, _ = _proxy_matrix(resid, fwd, cov, lambda2)
-        proxy_support = _select_s(proxy, confl_mat, s)
+        proxy_support = _select_s(proxy, confl_mat, s, cnx=cnx)
         test_support = _union_s(np.array(list(all_supports[-1])),
                                 proxy_support)
+        test_confl_mat = confl_mat[np.ix_(test_support, test_support)]
         proxy_fwd = _restrict_forward_patch(fwd, test_support)
-        est_proxy, _ = _proxy_matrix(evo, proxy_fwd, cov, lambda2)
-        est_support_inds = _select_s(est_proxy, confl_mat, s)
+        est_proxy, _ = _proxy_matrix(inst, proxy_fwd, cov, lambda2)
+        est_support_inds = _select_s(est_proxy, test_confl_mat, s, cnx=cnx)
         est_support = test_support[est_support_inds]
         est_fwd = _restrict_forward_patch(fwd, est_support)
-        _, resid = _proxy_matrix(evo, est_fwd, cov, lambda2)
+        _, resid = _proxy_matrix(inst, est_fwd, cov, lambda2)
         support = set(est_support)
         if support in all_supports:
             break
         else:
             all_supports.append(set(support))
 
-    inv = make_inverse_operator(evo.info, est_fwd, cov, loose=0, fixed=True,
-                                depth=None, verbose="warning")
-    # run this because we need the explained variance later
-    inv = _check_or_prepare(inv, evo.nave, lambda2, "MNE",
-                            None, False)
-    stc, resid = apply_inverse(evo, inv, lambda2, method="MNE",
-                               return_residual=True, verbose=None,
-                               prepared=True)
-    var_expl = _expl_var(evo, resid, inv)
-    return stc, est_fwd, var_expl
+    inv = make_inverse_operator(inst.info, est_fwd, cov, loose=0,
+                                fixed=True, depth=None, verbose="warning")
+    if isinstance(inst, Evoked):
+        # run this because we want the explained variance later
+        inv = _check_or_prepare(inv, inst.nave, lambda2, "MNE",
+                                None, False)
+        stc, resid = apply_inverse(inst, inv, lambda2, method="MNE",
+                                   return_residual=True, verbose=None,
+                                   prepared=True)
+        var_expl = _expl_var(inst, resid, inv)
+    else:
+        inv = _check_or_prepare(inv, 1, lambda2, "MNE",
+                                None, False)
+        stc_and_resid = apply_inverse_epochs(inst, inv, lambda2, method="MNE",
+                                             return_residual=True, verbose=None,
+                                             prepared=True)
+        stc, resids = zip(*stc_and_resid)
+        resid = EpochsArray(resids, inst.info)
+        var_expl = 0
 
-def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
-                     fwd0=None, return_fwds=False, return_as_dipoles=False,
-                     patch_comp_n=.9, subjects_dir=None, max_iter=200,
-                     n_jobs=1):
+    return stc, est_fwd, var_expl, resid
+
+def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
+                     mu=.5, fwd0=None, return_fwds=False,
+                     return_as_dipoles=False, patch_comp_n=.9,
+                     subjects_dir=None, max_iter=200, cnx=None, sub_fwd=None,
+                     sub_mu=None, n_jobs=1):
     if isinstance(s, int):
         s = [s] * len(spacings)
     elif len(s) != len(spacings):
         raise ValueError("Length of s must be 1 or equal to # of spacings.")
-
     fwds = []
     if fwd0:
         fwd = fwd0
     else:
-        fwd = make_patch_forward(subject, spacings[0], bem, evo.info, trans,
+        fwd = make_patch_forward(subject, spacings[0], bem, inst.info, trans,
                                  patch_comp_n=patch_comp_n,
                                  subjects_dir=subjects_dir, n_jobs=n_jobs)
     if return_fwds:
         fwds.append(fwd)
 
     for spacing_idx in range(len(spacings)-1):
-        stc, _, var_expl = subspace_pursuit_level(fwd, evo, cov, s[spacing_idx],
-                                                  mu, lambda2,
-                                                  max_iter=max_iter)
+        stc, _, var_expl, resid = subspace_pursuit_level(fwd, inst, cov,
+                                                         s[spacing_idx],
+                                                         mu, lambda2, cnx=cnx,
+                                                         sub_fwd=sub_fwd,
+                                                         sub_mu=sub_mu,
+                                                         max_iter=max_iter)
         logger.info(f"Spacing {spacings[spacing_idx]} explained {var_expl:.1f}"
                      " percent variance.")
+        vertices = stc[0].vertices if isinstance(stc, tuple) else stc.vertices
         new_verts = telescope_vertices(subject, spacings[spacing_idx],
                                        spacings[spacing_idx+1],
-                                       stc.vertices,
+                                       vertices,
                                        subjects_dir=subjects_dir,
                                        n_jobs=n_jobs)
         fwd = make_patch_forward(subject, spacings[spacing_idx+1], bem,
-                                 evo.info, trans, restrict_to=new_verts,
+                                 inst.info, trans, restrict_to=new_verts,
                                  subjects_dir=subjects_dir,
-                                 patch_comp_n=0.9, n_jobs=n_jobs)
+                                 patch_comp_n=patch_comp_n, n_jobs=n_jobs)
         if return_fwds:
             fwds.append(fwd.copy())
 
-    out, est_fwd, var_expl = subspace_pursuit_level(fwd, evo, cov,
-                                                    s[spacing_idx], mu,
-                                                    lambda2, max_iter=max_iter)
+    out, est_fwd, var_expl, resid = subspace_pursuit_level(fwd, inst, cov,
+                                                           s[spacing_idx+1], mu,
+                                                           lambda2, cnx=cnx,
+                                                           sub_fwd=sub_fwd,
+                                                           sub_mu = sub_mu,
+                                                           max_iter=max_iter)
     if return_fwds:
         fwds.append(est_fwd)
 
@@ -383,6 +454,6 @@ def subspace_pursuit(subject, spacings, bem, evo, cov, trans, s, lambda2, mu=.5,
     if return_as_dipoles:
         out = make_dipoles_from_stc(out, est_fwd)
     if return_fwds:
-        return out, fwds
+        return out, fwds, resid
     else:
-        return out
+        return out, resid
