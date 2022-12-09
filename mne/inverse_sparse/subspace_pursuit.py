@@ -13,8 +13,8 @@ from ..minimum_norm.inverse import (_log_exp_var, _check_or_prepare,
                                     _pick_channels_inverse_operator)
 from ..dipole import Dipole
 from ..io.pick import pick_types, channel_type, _picks_by_type
-from sklearn.preprocessing import RobustScaler
 from mne_connectivity import spectral_connectivity_epochs
+from dPTE import epo_dPTE
 
 def _expl_var(data, resid, inv):
     sel = _pick_channels_inverse_operator(data.ch_names, inv)
@@ -155,6 +155,16 @@ def _svd_gain(gain, info, n_components, whiten=False):
         svd_gain = u[:, :pca.n_components_] * s[:pca.n_components_]
     return svd_gain, u, s, v, pca.n_components_
 
+def mix_patch_forwards(ctx_fwd, sub_fwd, info, trans, bem):
+    # created a mixed forward solution out of cortical and volume patch forwards
+    mix_src = ctx_fwd["src"] + sub_fwd["src"]
+    mix_fwd = make_forward_solution(info, trans, mix_src, bem)
+    mix_fwd = convert_forward_solution(mix_fwd, force_fixed=True)
+    mix_gain = np.hstack((ctx_fwd["sol"]["data"], sub_fwd["sol"]["data"]))
+    mix_fwd["sol"]["data"] = mix_gain
+
+    return mix_fwd
+
 def make_patch_forward(subject, spacing, bem, info, trans, subjects_dir=None,
                        restrict_to=None, volume=False, volume_label=None,
                        patch_comp_n=.9, meg=True, eeg=True,
@@ -263,20 +273,30 @@ def _select_s(proxy, confl_mat, s, cnx=None):
     if len(proxy.shape) == 3 and cnx is None:
         proxy = proxy.mean(axis=0)
     if cnx is not None:
+        ## dpli
         # get only pairs where conflict matrix isn't marked
-        inds = list(zip(*np.where(confl_mat==0)))
-        triu_inds = list(zip(*np.triu_indices(len(confl_mat))))
-        new_inds = tuple(zip(*[idx for idx in inds if idx in triu_inds]))
-        con = spectral_connectivity_epochs(proxy, indices=new_inds,
-                                           fmin=cnx["fmin"], fmax=cnx["fmax"],
-                                           faverage=True, sfreq=cnx["sfreq"],
-                                           method=cnx["method"])
-        con_vec = con.get_data()
-        sort_inds = np.argsort(con_vec[:, 0])[-s:]
-        support = []
-        for s_idx in sort_inds:
-            support.append(con.indices[0][s_idx])
-            support.append(con.indices[1][s_idx])
+        # inds = list(zip(*np.where(confl_mat==0)))
+        # triu_inds = list(zip(*np.triu_indices(len(confl_mat))))
+        # new_inds = tuple(zip(*[idx for idx in inds if idx in triu_inds]))
+        # con = spectral_connectivity_epochs(proxy, indices=new_inds,
+        #                                    fmin=cnx["fmin"], fmax=cnx["fmax"],
+        #                                    faverage=True, sfreq=cnx["sfreq"],
+        #                                    method=cnx["method"])
+        # con_vec = con.get_data()
+        # sort_inds = np.argsort(con_vec[:, 0])[-s:]
+        # support = []
+        # for s_idx in sort_inds:
+        #     support.append(con.indices[0][s_idx])
+        #     support.append(con.indices[1][s_idx])
+        dpte = epo_dPTE(proxy, cnx["freqs"], cnx["sfreq"],
+                        n_cycles=cnx["cycles"], n_jobs=cnx["n_jobs"])
+        dpte = dpte.mean(axis=0)
+        dpte = dpte*(~confl_mat)
+        dpte[dpte>0] = np.abs(dpte[dpte>0] - 0.5)
+        sort_inds = tuple(zip(*np.unravel_index(np.argsort(dpte, axis=None),
+                                                dpte.shape)))[-s:]
+        support = [s for si in sort_inds for s in si]
+
     else:
         norm_sort_inds = np.argsort(np.linalg.norm(proxy, axis=1))[::-1]
         support = np.array([norm_sort_inds[0]])
