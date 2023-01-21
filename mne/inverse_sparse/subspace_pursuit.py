@@ -288,6 +288,8 @@ def _select_s(proxy, confl_mat, s, cnx=None):
         # for s_idx in sort_inds:
         #     support.append(con.indices[0][s_idx])
         #     support.append(con.indices[1][s_idx])
+        if len(proxy.shape) == 2:
+            proxy = proxy[None,]
         dpte = epo_dPTE(proxy, cnx["freqs"], cnx["sfreq"],
                         n_cycles=cnx["cycles"], n_jobs=cnx["n_jobs"])
         dpte = dpte.mean(axis=0)
@@ -311,9 +313,9 @@ def _select_s(proxy, confl_mat, s, cnx=None):
 
 
 def _proxy_matrix(inst, fwd, cov, lambda2):
-    inv_op = make_inverse_operator(inst.info, fwd, cov, loose=0, fixed=True,
-                                   depth=None, verbose="warning")
     if isinstance(inst, BaseEpochs):
+        inv_op = make_inverse_operator(inst.info, fwd, cov, loose=0, fixed=True,
+                                       depth=None, verbose="warning")
         stc_and_resid = apply_inverse_epochs(inst, inv_op, lambda2,
                                              method="MNE",
                                              return_residual=True,
@@ -322,9 +324,21 @@ def _proxy_matrix(inst, fwd, cov, lambda2):
         resid = EpochsArray(resids, inst.info)
         data = np.stack([stc.data for stc in stcs])
     elif isinstance(inst, Evoked):
+        inv_op = make_inverse_operator(inst.info, fwd, cov, loose=0, fixed=True,
+                                       depth=None, verbose="warning")
         stc, resid = apply_inverse(inst, inv_op, lambda2, method="MNE",
                                    return_residual=True, verbose="warning")
         data = stc.data.copy()
+    elif isinstance(inst, list):
+        data, resid = [], []
+        for evo in inst:
+            inv_op = make_inverse_operator(evo.info, fwd, cov, loose=0,
+                                           fixed=True, depth=None,
+                                           verbose="warning")
+            stc, resid = apply_inverse(evo, inv_op, lambda2, method="MNE",
+                                       return_residual=True, verbose="warning")
+            data.append(stc.data.copy())
+        data = np.array(data)
 
     return data, resid
 
@@ -397,9 +411,10 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
         else:
             all_supports.append(set(support))
 
-    inv = make_inverse_operator(inst.info, est_fwd, cov, loose=0,
-                                fixed=True, depth=None, verbose="warning")
+
     if isinstance(inst, Evoked):
+        inv = make_inverse_operator(inst.info, est_fwd, cov, loose=0,
+                                    fixed=True, depth=None, verbose="warning")
         # run this because we want the explained variance later
         inv = _check_or_prepare(inv, inst.nave, lambda2, "MNE",
                                 None, False)
@@ -407,7 +422,9 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
                                    return_residual=True, verbose=None,
                                    prepared=True)
         var_expl = _expl_var(inst, resid, inv)
-    else:
+    elif isinstance(inst, BaseEpochs):
+        inv = make_inverse_operator(inst.info, est_fwd, cov, loose=0,
+                                    fixed=True, depth=None, verbose="warning")
         inv = _check_or_prepare(inv, 1, lambda2, "MNE",
                                 None, False)
         stc_and_resid = apply_inverse_epochs(inst, inv, lambda2, method="MNE",
@@ -416,6 +433,26 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
         stc, resids = zip(*stc_and_resid)
         resid = EpochsArray(resids, inst.info)
         var_expl = 0
+    elif isinstance(inst, list):
+        stc, resid, var_expl = [], [], []
+        for evo in inst:
+            inv = make_inverse_operator(evo.info, est_fwd, cov, loose=0,
+                                        fixed=True, depth=None,
+                                        verbose="warning")
+            # run this because we want the explained variance later
+            inv = _check_or_prepare(inv, evo.nave, lambda2, "MNE",
+                                    None, False)
+            this_stc, this_resid = apply_inverse(evo, inv, lambda2,
+                                                 method="MNE",
+                                                 return_residual=True,
+                                                 verbose=None,
+                                                 prepared=True)
+            this_var_expl = _expl_var(evo, this_resid, inv)
+            stc.append(this_stc)
+            resid.append(this_resid)
+            var_expl.append(this_var_expl)
+    else:
+        raise ValueError("Unrecognised input.")
 
     return stc, est_fwd, var_expl, resid
 
@@ -428,11 +465,12 @@ def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
         s = [s] * len(spacings)
     elif len(s) != len(spacings):
         raise ValueError("Length of s must be 1 or equal to # of spacings.")
+    info = inst[0].info if len(inst)>1 else inst.info
     fwds = []
     if fwd0:
         fwd = fwd0
     else:
-        fwd = make_patch_forward(subject, spacings[0], bem, inst.info, trans,
+        fwd = make_patch_forward(subject, spacings[0], bem, info, trans,
                                  patch_comp_n=patch_comp_n,
                                  subjects_dir=subjects_dir, n_jobs=n_jobs)
     if return_fwds:
@@ -445,16 +483,17 @@ def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
                                                          sub_fwd=sub_fwd,
                                                          sub_mu=sub_mu,
                                                          max_iter=max_iter)
-        logger.info(f"Spacing {spacings[spacing_idx]} explained {var_expl:.1f}"
-                     " percent variance.")
-        vertices = stc[0].vertices if isinstance(stc, tuple) else stc.vertices
+
+        logger.info(f"Spacing {spacings[spacing_idx]} explained "
+                    f"{np.mean(var_expl):.1f} percent variance.")
+        vertices = stc[0].vertices if len(stc)>1 else stc.vertices
         new_verts = telescope_vertices(subject, spacings[spacing_idx],
                                        spacings[spacing_idx+1],
                                        vertices,
                                        subjects_dir=subjects_dir,
                                        n_jobs=n_jobs)
         fwd = make_patch_forward(subject, spacings[spacing_idx+1], bem,
-                                 inst.info, trans, restrict_to=new_verts,
+                                 info, trans, restrict_to=new_verts,
                                  subjects_dir=subjects_dir,
                                  patch_comp_n=patch_comp_n, n_jobs=n_jobs)
         if return_fwds:
@@ -469,8 +508,8 @@ def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
     if return_fwds:
         fwds.append(est_fwd)
 
-    logger.info(f"Spacing {spacings[spacing_idx+1]} explained {var_expl:.1f} "
-                 " percent variance.")
+    logger.info(f"Spacing {spacings[spacing_idx+1]} explained "
+                f"{np.mean(var_expl):.1f} percent variance.")
     if return_as_dipoles:
         out = make_dipoles_from_stc(out, est_fwd)
     if return_fwds:
