@@ -18,17 +18,16 @@
 
 .. _current:
 
-Current (1.3.dev0)
+Current (1.5.dev0)
 ------------------
 
 Enhancements
 ~~~~~~~~~~~~
-- Mixed, cortical + discrete source spaces with fixed orientations are now allowed. (:gh:`11241` by `Jevri Hanna`_)
+- None yet
 
 Bugs
 ~~~~
-- Fix bug in documentation of :func:`mne.channels.make_dig_montage` (:gh:`11235` by :newcontrib:`Daniel Hasegan`)
-- Fix bug where ``ica.reject_`` was not saved to disk, and the ``ica.reject_`` property was not inherited from ``Epochs`` when doing ``ICA.fit(epochs)`` (:gh:`11244` by `Eric Larson`_)
+- None yet
 
 API changes
 ~~~~~~~~~~~
