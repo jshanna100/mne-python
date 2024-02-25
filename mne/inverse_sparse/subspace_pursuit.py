@@ -13,8 +13,6 @@ from ..minimum_norm.inverse import (_log_exp_var, _check_or_prepare,
                                     _pick_channels_inverse_operator)
 from ..dipole import Dipole
 from ..io.pick import pick_types, channel_type, _picks_by_type
-from mne_connectivity import spectral_connectivity_epochs
-from dPTE import epo_dPTE
 
 def _expl_var(data, resid, inv):
     sel = _pick_channels_inverse_operator(data.ch_names, inv)
@@ -465,7 +463,7 @@ def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
         s = [s] * len(spacings)
     elif len(s) != len(spacings):
         raise ValueError("Length of s must be 1 or equal to # of spacings.")
-    info = inst[0].info if len(inst)>1 else inst.info
+    info = inst[0].info if isinstance(inst, list) else inst.info
     fwds = []
     if fwd0:
         fwd = fwd0
@@ -486,7 +484,7 @@ def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
 
         logger.info(f"Spacing {spacings[spacing_idx]} explained "
                     f"{np.mean(var_expl):.1f} percent variance.")
-        vertices = stc[0].vertices if len(stc)>1 else stc.vertices
+        vertices = stc[0].vertices if isinstance(stc, list) else stc.vertices
         new_verts = telescope_vertices(subject, spacings[spacing_idx],
                                        spacings[spacing_idx+1],
                                        vertices,
