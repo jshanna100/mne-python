@@ -263,50 +263,24 @@ def _union_s(s1, s2):
     return support
 
 
-def _select_s(proxy, confl_mat, s, cnx=None):
+def _select_s(proxy, confl_mat, s):
     """
     Get s strongest sources, with the constraint that mutual coherence
     is below threshold
     """
-    if len(proxy.shape) == 3 and cnx is None:
+    if len(proxy.shape) == 3:
         proxy = proxy.mean(axis=0)
-    if cnx is not None:
-        ## dpli
-        # get only pairs where conflict matrix isn't marked
-        # inds = list(zip(*np.where(confl_mat==0)))
-        # triu_inds = list(zip(*np.triu_indices(len(confl_mat))))
-        # new_inds = tuple(zip(*[idx for idx in inds if idx in triu_inds]))
-        # con = spectral_connectivity_epochs(proxy, indices=new_inds,
-        #                                    fmin=cnx["fmin"], fmax=cnx["fmax"],
-        #                                    faverage=True, sfreq=cnx["sfreq"],
-        #                                    method=cnx["method"])
-        # con_vec = con.get_data()
-        # sort_inds = np.argsort(con_vec[:, 0])[-s:]
-        # support = []
-        # for s_idx in sort_inds:
-        #     support.append(con.indices[0][s_idx])
-        #     support.append(con.indices[1][s_idx])
-        if len(proxy.shape) == 2:
-            proxy = proxy[None,]
-        dpte = epo_dPTE(proxy, cnx["freqs"], cnx["sfreq"],
-                        n_cycles=cnx["cycles"], n_jobs=cnx["n_jobs"])
-        dpte = dpte.mean(axis=0)
-        dpte = dpte*(~confl_mat)
-        dpte[dpte>0] = np.abs(dpte[dpte>0] - 0.5)
-        sort_inds = tuple(zip(*np.unravel_index(np.argsort(dpte, axis=None),
-                                                dpte.shape)))[-s:]
-        support = [s for si in sort_inds for s in si]
 
-    else:
-        norm_sort_inds = np.argsort(np.linalg.norm(proxy, axis=1))[::-1]
-        support = np.array([norm_sort_inds[0]])
-        for idx in norm_sort_inds[1:]:
-            if len(support) == s:
-                break
-            if sum(confl_mat[support, idx]) == 0:
-                support = np.append(support, idx)
+    norm_sort_inds = np.argsort(np.linalg.norm(proxy, axis=1))[::-1]
+    support = np.array([norm_sort_inds[0]])
+    for idx in norm_sort_inds[1:]:
+        if len(support) == s:
+            break
+        if sum(confl_mat[support, idx]) == 0:
+            support = np.append(support, idx)
 
     support = np.unique(support)
+
     return support
 
 
@@ -341,7 +315,7 @@ def _proxy_matrix(inst, fwd, cov, lambda2):
     return data, resid
 
 
-def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
+def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2,
                            sub_fwd=None, sub_mu=None, max_iter=200):
     # conflict matrix for mutual coherence of gain matrix columns
     gain = fwd["sol"]["data"].copy()
@@ -354,6 +328,7 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
         for src_j in range(src_i+1, src_n):
             if inner[src_i, src_j] > (mu * norms[src_i] * norms[src_j]):
                 confl_mat[src_i, src_j] = 1
+    confl_mat += confl_mat.T # make it symmetrical
     if sub_fwd is not None:
         # mark cortical sources coherent with subcortical as a conflict
         sub_mu = mu if sub_mu is None else sub_mu
@@ -369,8 +344,8 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
                     # if any exceed, mark whole row as conflict and go on
                     confl_mat[idx,] = np.ones(confl_mat.shape[1])
                     break
-        # set the lower triangle back to 0
-        confl_mat[np.tril_indices(src_n, k=-1)] = 0
+        # # set the lower triangle back to 0
+        # confl_mat[np.tril_indices(src_n, k=-1)] = 0
 
         confl_sat = confl_mat.sum() / ((src_n**2 + src_n) / 2)
         if confl_sat == 1.:
@@ -384,7 +359,7 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
 
     # initial proxy matrix and top s sources
     proxy, _ = _proxy_matrix(inst, fwd, cov, lambda2)
-    support = _select_s(proxy, confl_mat, s, cnx=cnx)
+    support = _select_s(proxy, confl_mat, s)
     # initial residual
     proxy_fwd = _restrict_forward_patch(fwd, support)
     _, resid = _proxy_matrix(inst, proxy_fwd, cov, lambda2)
@@ -393,13 +368,13 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
     for iter_idx in range(max_iter):
         logger.info(f"Iteration {iter_idx}")
         proxy, _ = _proxy_matrix(resid, fwd, cov, lambda2)
-        proxy_support = _select_s(proxy, confl_mat, s, cnx=cnx)
+        proxy_support = _select_s(proxy, confl_mat, s)
         test_support = _union_s(np.array(list(all_supports[-1])),
                                 proxy_support)
         test_confl_mat = confl_mat[np.ix_(test_support, test_support)]
         proxy_fwd = _restrict_forward_patch(fwd, test_support)
         est_proxy, _ = _proxy_matrix(inst, proxy_fwd, cov, lambda2)
-        est_support_inds = _select_s(est_proxy, test_confl_mat, s, cnx=cnx)
+        est_support_inds = _select_s(est_proxy, test_confl_mat, s)
         est_support = test_support[est_support_inds]
         est_fwd = _restrict_forward_patch(fwd, est_support)
         _, resid = _proxy_matrix(inst, est_fwd, cov, lambda2)
@@ -408,7 +383,6 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
             break
         else:
             all_supports.append(set(support))
-
 
     if isinstance(inst, Evoked):
         inv = make_inverse_operator(inst.info, est_fwd, cov, loose=0,
@@ -457,7 +431,7 @@ def subspace_pursuit_level(fwd, inst, cov, s, mu, lambda2, cnx=None,
 def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
                      mu=.5, fwd0=None, return_fwds=False,
                      return_as_dipoles=False, patch_comp_n=.9,
-                     subjects_dir=None, max_iter=200, cnx=None, sub_fwd=None,
+                     subjects_dir=None, max_iter=200, sub_fwd=None,
                      sub_mu=None, n_jobs=1):
     if isinstance(s, int):
         s = [s] * len(spacings)
@@ -477,7 +451,7 @@ def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
     for spacing_idx in range(len(spacings)-1):
         stc, _, var_expl, resid = subspace_pursuit_level(fwd, inst, cov,
                                                          s[spacing_idx],
-                                                         mu, lambda2, cnx=cnx,
+                                                         mu, lambda2,
                                                          sub_fwd=sub_fwd,
                                                          sub_mu=sub_mu,
                                                          max_iter=max_iter)
@@ -499,7 +473,7 @@ def subspace_pursuit(subject, spacings, bem, inst, cov, trans, s, lambda2,
 
     out, est_fwd, var_expl, resid = subspace_pursuit_level(fwd, inst, cov,
                                                            s[spacing_idx+1], mu,
-                                                           lambda2, cnx=cnx,
+                                                           lambda2,
                                                            sub_fwd=sub_fwd,
                                                            sub_mu = sub_mu,
                                                            max_iter=max_iter)
